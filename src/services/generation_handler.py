@@ -211,6 +211,33 @@ MODEL_CONFIG = {
         "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K"
     },
 
+    # 图片生成 - HARBOR_SEAL (Nano Banana 2 Lite)
+    "gemini-3.1-flash-image-lite-landscape": {
+        "type": "image",
+        "model_name": "HARBOR_SEAL",
+        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE"
+    },
+    "gemini-3.1-flash-image-lite-portrait": {
+        "type": "image",
+        "model_name": "HARBOR_SEAL",
+        "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT"
+    },
+    "gemini-3.1-flash-image-lite-square": {
+        "type": "image",
+        "model_name": "HARBOR_SEAL",
+        "aspect_ratio": "IMAGE_ASPECT_RATIO_SQUARE"
+    },
+    "gemini-3.1-flash-image-lite-four-three": {
+        "type": "image",
+        "model_name": "HARBOR_SEAL",
+        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE"
+    },
+    "gemini-3.1-flash-image-lite-three-four": {
+        "type": "image",
+        "model_name": "HARBOR_SEAL",
+        "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR"
+    },
+
     # ========== 文生视频 (T2V - Text to Video) ==========
     # 不支持上传图片，只使用文本提示词生成
 
@@ -694,6 +721,7 @@ MODEL_CONFIG = {
         "max_images": 3,
         "use_v2_model_config": True,
         "allow_tier_upgrade": False,
+        "output_resolution": "VIDEO_RESOLUTION_720P",
         "reference_model_key": "abra_r2v_8s",
         "reference_duration": 8,
         "reference_model_display_name": "Omni Flash",
@@ -708,6 +736,37 @@ MODEL_CONFIG = {
         "max_images": 3,
         "use_v2_model_config": True,
         "allow_tier_upgrade": False,
+        "output_resolution": "VIDEO_RESOLUTION_720P",
+        "reference_model_key": "abra_r2v_8s",
+        "reference_duration": 8,
+        "reference_model_display_name": "Omni Flash",
+    },
+    "omni-flash-landscape": {
+        "type": "video",
+        "video_type": "omni",
+        "model_key": "abra_t2v_8s",
+        "aspect_ratio": "VIDEO_ASPECT_RATIO_LANDSCAPE",
+        "supports_images": True,
+        "min_images": 0,
+        "max_images": 3,
+        "use_v2_model_config": True,
+        "allow_tier_upgrade": False,
+        "output_resolution": "VIDEO_RESOLUTION_720P",
+        "reference_model_key": "abra_r2v_8s",
+        "reference_duration": 8,
+        "reference_model_display_name": "Omni Flash",
+    },
+    "omni-flash-portrait": {
+        "type": "video",
+        "video_type": "omni",
+        "model_key": "abra_t2v_8s",
+        "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
+        "supports_images": True,
+        "min_images": 0,
+        "max_images": 3,
+        "use_v2_model_config": True,
+        "allow_tier_upgrade": False,
+        "output_resolution": "VIDEO_RESOLUTION_720P",
         "reference_model_key": "abra_r2v_8s",
         "reference_duration": 8,
         "reference_model_display_name": "Omni Flash",
@@ -1903,7 +1962,7 @@ class GenerationHandler:
         self,
         token,
         project_id: str,
-        model_config: dict,
+        model_config: Dict[str, Any],
         prompt: str,
         images: Optional[List[bytes]],
         stream: bool,
@@ -2164,6 +2223,7 @@ class GenerationHandler:
                     prompt=prompt,
                     model_key=model_config["model_key"],
                     aspect_ratio=model_config["aspect_ratio"],
+                    output_resolution=model_config.get("output_resolution"),
                     use_v2_model_config=use_v2_model_config,
                     user_paygate_tier=normalized_tier,
                     token_id=token.id,

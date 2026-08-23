@@ -192,6 +192,12 @@ Prometheus 可直接抓 `/metrics`。如果部署到 Kubernetes，建议只在�
 | `gemini-3.1-flash-image-square` | 图/文生图 | 方图 |
 | `gemini-3.1-flash-image-four-three` | 图/文生图 | 横屏 4:3 |
 | `gemini-3.1-flash-image-three-four` | 图/文生图 | 竖屏 3:4 |
+| `nano-banana-2-lite` | 图/文生图 | 按 `generationConfig` 选择比例 |
+| `gemini-3.1-flash-image-lite-landscape` | 图/文生图 | 横屏 |
+| `gemini-3.1-flash-image-lite-portrait` | 图/文生图 | 竖屏 |
+| `gemini-3.1-flash-image-lite-square` | 图/文生图 | 方图 |
+| `gemini-3.1-flash-image-lite-four-three` | 图/文生图 | 横屏 4:3 |
+| `gemini-3.1-flash-image-lite-three-four` | 图/文生图 | 竖屏 3:4 |
 | `gemini-3.1-flash-image-landscape-2k` | 图/文生图(2K) | 横屏 |
 | `gemini-3.1-flash-image-portrait-2k` | 图/文生图(2K) | 竖屏 |
 | `gemini-3.1-flash-image-square-2k` | 图/文生图(2K) | 方图 |
@@ -220,6 +226,9 @@ Prometheus 可直接抓 `/metrics`。如果部署到 Kubernetes，建议只在�
 | `veo_3_1_t2v_landscape` | 文生视频 | 横屏 |
 | `veo_3_1_t2v_landscape_4s` | 文生视频 4秒 | 横屏 |
 | `veo_3_1_t2v_portrait_4s` | 文生视频 4秒 | 竖屏 |
+| `omni-flash` | 文/图生视频 8秒 | 按 `generationConfig` 选择横竖屏 |
+| `omni-flash-landscape` | 文/图生视频 8秒 | 横屏 720p |
+| `omni-flash-portrait` | 文/图生视频 8秒 | 竖屏 720p |
 | `veo_3_1_t2v_landscape_6s` | 文生视频 6秒 | 横屏 |
 | `veo_3_1_t2v_portrait_6s` | 文生视频 6秒 | 竖屏 |
 | `veo_3_1_t2v_fast_landscape_4s` | 文生视频 Fast 4秒 | 横屏 |

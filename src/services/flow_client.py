@@ -2126,6 +2126,7 @@ class FlowClient:
         prompt: str,
         model_key: str,
         aspect_ratio: str,
+        output_resolution: Optional[str] = None,
         use_v2_model_config: bool = False,
         user_paygate_tier: str = "PAYGATE_TIER_ONE",
         token_id: Optional[int] = None,
@@ -2139,6 +2140,7 @@ class FlowClient:
             prompt: 提示词
             model_key: veo_3_1_t2v_fast 等
             aspect_ratio: 视频宽高比
+            output_resolution: 可选的上游输出分辨率
             user_paygate_tier: 用户等级
 
         Returns:
@@ -2224,6 +2226,8 @@ class FlowClient:
                 "videoModelKey": model_key,
                 "metadata": {}
             }
+            if output_resolution:
+                request_data["outputSpec"] = {"resolution": output_resolution}
             json_data = {
                 "mediaGenerationContext": self._build_video_media_generation_context(batch_id),
                 "clientContext": client_context,
