@@ -297,6 +297,15 @@ class Config:
         """Set admin password from database"""
         self._admin_password = password
 
+    @property
+    def admin_session_ttl_days(self) -> int:
+        """Dashboard session lifetime in days."""
+        try:
+            value = int(self._config.get("global", {}).get("admin_session_ttl_days", 30))
+        except (TypeError, ValueError):
+            value = 30
+        return max(1, min(365, value))
+
     def set_debug_enabled(self, enabled: bool):
         """Set debug mode enabled/disabled"""
         if "debug" not in self._config:

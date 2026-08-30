@@ -2,6 +2,7 @@
 api_key = "han1234"
 admin_username = "admin"
 admin_password = "admin"
+admin_session_ttl_days = 30  # Dashboard login retention period
 
 [flow]
 labs_base_url = "https://labs.google/fx/api"

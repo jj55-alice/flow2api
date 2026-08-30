@@ -1,7 +1,9 @@
 """Database storage layer for Flow2API"""
 import asyncio
 import aiosqlite
+import hashlib
 import json
+import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from typing import Optional, List, Dict, Any
@@ -432,6 +434,16 @@ class Database:
                     )
                 """)
 
+            if not await self._table_exists(db, "admin_sessions"):
+                print("  ✓ Creating missing table: admin_sessions")
+                await db.execute("""
+                    CREATE TABLE admin_sessions (
+                        token_hash TEXT PRIMARY KEY,
+                        created_at INTEGER NOT NULL,
+                        expires_at INTEGER NOT NULL
+                    )
+                """)
+
             # ========== Step 2: Add missing columns to existing tables ==========
             # Check and add missing columns to tokens table
             if await self._table_exists(db, "tokens"):
@@ -784,6 +796,16 @@ class Database:
                 )
             """)
 
+            # Persistent dashboard sessions. Only a one-way hash of each
+            # bearer token is stored so a database read cannot recover it.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS admin_sessions (
+                    token_hash TEXT PRIMARY KEY,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL
+                )
+            """)
+
             # Proxy config table
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS proxy_config (
@@ -900,6 +922,7 @@ class Database:
             await db.execute("CREATE INDEX IF NOT EXISTS idx_project_id ON projects(project_id)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_tokens_email ON tokens(email)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_tokens_is_active_last_used_at ON tokens(is_active, last_used_at)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at)")
 
             # Migrate request_logs table if needed
             await self._migrate_request_logs(db)
@@ -1387,6 +1410,73 @@ class Database:
             await db.commit()
 
     # Config operations
+    @staticmethod
+    def _hash_admin_session_token(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    async def create_admin_session(self, token: str, ttl_seconds: int) -> int:
+        """Persist a hashed admin session token and return its expiry epoch."""
+        normalized = str(token or "").strip()
+        if not normalized:
+            raise ValueError("Admin session token must not be empty")
+
+        try:
+            normalized_ttl = max(1, int(ttl_seconds))
+        except (TypeError, ValueError):
+            normalized_ttl = 1
+
+        now = int(time.time())
+        expires_at = now + normalized_ttl
+        token_hash = self._hash_admin_session_token(normalized)
+        async with self._connect(write=True) as db:
+            await db.execute("DELETE FROM admin_sessions WHERE expires_at <= ?", (now,))
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO admin_sessions (token_hash, created_at, expires_at)
+                VALUES (?, ?, ?)
+                """,
+                (token_hash, now, expires_at),
+            )
+            await db.commit()
+        return expires_at
+
+    async def is_admin_session_valid(self, token: Optional[str]) -> bool:
+        """Return whether a persisted admin session exists and has not expired."""
+        normalized = str(token or "").strip()
+        if not normalized:
+            return False
+
+        token_hash = self._hash_admin_session_token(normalized)
+        now = int(time.time())
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "SELECT expires_at FROM admin_sessions WHERE token_hash = ?",
+                (token_hash,),
+            )
+            row = await cursor.fetchone()
+
+        if row is not None and int(row[0]) > now:
+            return True
+        if row is not None:
+            await self.delete_admin_session(normalized)
+        return False
+
+    async def delete_admin_session(self, token: Optional[str]) -> None:
+        """Revoke one admin session."""
+        normalized = str(token or "").strip()
+        if not normalized:
+            return
+        token_hash = self._hash_admin_session_token(normalized)
+        async with self._connect(write=True) as db:
+            await db.execute("DELETE FROM admin_sessions WHERE token_hash = ?", (token_hash,))
+            await db.commit()
+
+    async def delete_all_admin_sessions(self) -> None:
+        """Revoke every admin session, for example after a password change."""
+        async with self._connect(write=True) as db:
+            await db.execute("DELETE FROM admin_sessions")
+            await db.commit()
+
     async def get_admin_config(self) -> Optional[AdminConfig]:
         """Get admin configuration"""
         async with self._connect() as db:

@@ -44,8 +44,6 @@ db: Database = None
 concurrency_manager: Optional[ConcurrencyManager] = None
 captcha_runtime_prepare_tasks: Dict[str, asyncio.Task] = {}
 
-# Store active admin session tokens (in production, use Redis or database)
-active_admin_tokens = set()
 ADMIN_SESSION_COOKIE_NAME = "admin_session"
 SUPPORTED_API_CAPTCHA_METHODS = {"yescaptcha", "capmonster", "ezcaptcha", "capsolver"}
 
@@ -779,10 +777,10 @@ async def verify_admin_token(request: Request, authorization: str = Header(None)
 
     cookie_token = get_admin_token_from_cookie(request) or ""
 
-    if header_token and header_token in active_admin_tokens:
+    if header_token and await db.is_admin_session_valid(header_token):
         return header_token
 
-    if cookie_token and cookie_token in active_admin_tokens:
+    if cookie_token and await db.is_admin_session_valid(cookie_token):
         return cookie_token
 
     if header_token or cookie_token:
@@ -796,9 +794,8 @@ def get_admin_token_from_cookie(request: Request) -> Optional[str]:
     return token or None
 
 
-def is_admin_session_token_valid(token: Optional[str]) -> bool:
-    normalized = str(token or "").strip()
-    return bool(normalized) and normalized in active_admin_tokens
+async def is_admin_session_token_valid(token: Optional[str]) -> bool:
+    return await db.is_admin_session_valid(token)
 
 
 # ========== Auth Endpoints ==========
@@ -814,8 +811,8 @@ async def admin_login(request: LoginRequest, response: Response):
     # Generate independent session token
     session_token = f"admin-{secrets.token_urlsafe(32)}"
 
-    # Store in active tokens
-    active_admin_tokens.add(session_token)
+    session_ttl_seconds = config.admin_session_ttl_days * 24 * 60 * 60
+    expires_at = await db.create_admin_session(session_token, session_ttl_seconds)
 
     response.set_cookie(
         key=ADMIN_SESSION_COOKIE_NAME,
@@ -824,6 +821,8 @@ async def admin_login(request: LoginRequest, response: Response):
         samesite="lax",
         secure=False,
         path="/",
+        max_age=session_ttl_seconds,
+        expires=datetime.fromtimestamp(expires_at, timezone.utc),
     )
 
     return {
@@ -836,7 +835,7 @@ async def admin_login(request: LoginRequest, response: Response):
 @router.post("/api/admin/logout")
 async def admin_logout(response: Response, token: str = Depends(verify_admin_token)):
     """Admin logout - invalidate session token"""
-    active_admin_tokens.discard(token)
+    await db.delete_admin_session(token)
     response.delete_cookie(ADMIN_SESSION_COOKIE_NAME, path="/")
     return {"success": True, "message": "退出登录成功"}
 
@@ -864,7 +863,7 @@ async def change_password(
     await db.reload_config_to_memory()
 
     # 🔑 Invalidate all admin session tokens (force re-login for security)
-    active_admin_tokens.clear()
+    await db.delete_all_admin_sessions()
 
     return {"success": True, "message": "密码修改成功,请重新登录"}
 

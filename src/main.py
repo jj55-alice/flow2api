@@ -312,7 +312,7 @@ async def login_page():
 @app.get("/manage", response_class=HTMLResponse)
 async def manage_page(request: Request):
     """Management console page"""
-    guard_response = _ensure_admin_page_session(request)
+    guard_response = await _ensure_admin_page_session(request)
     if guard_response is not None:
         return guard_response
     manage_file = static_path / "manage.html"
@@ -324,7 +324,7 @@ async def manage_page(request: Request):
 @app.get("/test", response_class=HTMLResponse)
 async def test_page(request: Request):
     """Model testing page"""
-    guard_response = _ensure_admin_page_session(request)
+    guard_response = await _ensure_admin_page_session(request)
     if guard_response is not None:
         return guard_response
     test_file = static_path / "test.html"
@@ -338,8 +338,10 @@ async def metrics():
     """Prometheus metrics endpoint for the main Flow2API service."""
     payload = await render_main_metrics(db, concurrency_manager=concurrency_manager)
     return Response(content=payload, media_type=CONTENT_TYPE_LATEST)
-def _ensure_admin_page_session(request: Request):
+
+
+async def _ensure_admin_page_session(request: Request):
     token = admin.get_admin_token_from_cookie(request)
-    if not admin.is_admin_session_token_valid(token):
+    if not await admin.is_admin_session_token_valid(token):
         return RedirectResponse(url="/login", status_code=302)
     return None
