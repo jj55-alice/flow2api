@@ -752,6 +752,24 @@ class TokenManager:
 
             # 仅在 personal 模式下支持 ST 自动刷新
             if config.captcha_method != "personal":
+                if config.captcha_method == "extension":
+                    from .browser_captcha_extension import ExtensionCaptchaService
+                    debug_logger.log_info(f"[ST_REFRESH] extension 模式：从对应 Chrome 配置文件读取 ST...")
+                    service = await ExtensionCaptchaService.get_instance(self.db)
+                    new_st = await service.get_session_token(token_id, timeout=15)
+                    if new_st and new_st != token.st:
+                        await self.db.update_token(
+                            token_id,
+                            st=new_st,
+                            last_st_refresh_at=datetime.now(timezone.utc),
+                            last_st_refresh_result="success",
+                        )
+                        record_token_refresh("st", "success")
+                        debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: extension에서 ST 자동 갱신 성공")
+                        return new_st
+                    debug_logger.log_warning(f"[ST_REFRESH] Token {token_id}: extension에서 새 ST를 받지 못함")
+                    record_token_refresh("st", "failure")
+                    return None
                 debug_logger.log_info(f"[ST_REFRESH] 非 personal 模式，跳过 ST 自动刷新")
                 return None
 

@@ -465,11 +465,47 @@ class Config:
     @property
     def browser_captcha_generation_retries(self) -> int:
         """生成接口因 reCAPTCHA 评估失败时允许的总重试次数。"""
-        value = self._config.get("captcha", {}).get("browser_captcha_generation_retries", 6)
+        value = self._config.get("captcha", {}).get("browser_captcha_generation_retries", 2)
         try:
             return max(1, min(20, int(value)))
         except Exception:
-            return 6
+            return 2
+
+    @property
+    def captcha_failure_threshold(self) -> int:
+        """连续多少个验证码终局失败后临时隔离账号。"""
+        value = self._config.get("captcha", {}).get("captcha_failure_threshold", 1)
+        try:
+            return max(1, min(10, int(value)))
+        except Exception:
+            return 1
+
+    @property
+    def captcha_failure_cooldown_seconds(self) -> int:
+        """验证码回路断开后账号的冷却时间。"""
+        value = self._config.get("captcha", {}).get("captcha_failure_cooldown_seconds", 900)
+        try:
+            return max(30, min(86400, int(value)))
+        except Exception:
+            return 900
+
+    @property
+    def extension_route_min_interval_seconds(self) -> float:
+        """同一扩展路由两次验证码请求之间的最小间隔。"""
+        value = self._config.get("captcha", {}).get("extension_route_min_interval_seconds", 3.0)
+        try:
+            return max(0.0, min(30.0, float(value)))
+        except Exception:
+            return 3.0
+
+    @property
+    def extension_global_min_interval_seconds(self) -> float:
+        """所有扩展路由之间的最小发车间隔，用于平滑同一出口 IP 的突发。"""
+        value = self._config.get("captcha", {}).get("extension_global_min_interval_seconds", 1.0)
+        try:
+            return max(0.0, min(10.0, float(value)))
+        except Exception:
+            return 1.0
 
     @property
     def personal_max_resident_tabs(self) -> int:

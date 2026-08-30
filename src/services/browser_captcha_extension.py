@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 
 from fastapi import WebSocket
 
+from ..core.config import config
 from ..core.logger import debug_logger
 
 
@@ -26,6 +27,13 @@ class ExtensionCaptchaService:
         self.db = db
         self.active_connections: list[ExtensionConnection] = []
         self.pending_requests: dict[str, tuple[asyncio.Future, WebSocket]] = {}
+        # A Chrome profile represents one Google account. Serialize requests
+        # per route and space them out so a burst cannot open many hidden Flow
+        # tabs for the same account at once.
+        self._route_locks: dict[str, asyncio.Lock] = {}
+        self._route_last_dispatch_at: dict[str, float] = {}
+        self._global_dispatch_lock = asyncio.Lock()
+        self._global_last_dispatch_at = 0.0
 
     @classmethod
     async def get_instance(cls, db=None) -> "ExtensionCaptchaService":
@@ -173,6 +181,102 @@ class ExtensionCaptchaService:
                 f"Available route keys: {available}"
             )
 
+        route_guard_key = route_key or "(empty)"
+        route_lock = self._route_locks.setdefault(route_guard_key, asyncio.Lock())
+
+        async with route_lock:
+            min_interval = config.extension_route_min_interval_seconds
+            last_dispatch_at = self._route_last_dispatch_at.get(route_guard_key, 0.0)
+            wait_seconds = max(0.0, min_interval - (time.monotonic() - last_dispatch_at))
+            if wait_seconds > 0:
+                debug_logger.log_info(
+                    f"[Extension Captcha] Throttling route_key={route_key or '-'} "
+                    f"for {wait_seconds:.2f}s"
+                )
+                await asyncio.sleep(wait_seconds)
+
+            # The browser may have disconnected while this request waited for
+            # the previous request on the same route to finish.
+            conn = self._select_connection(route_key)
+            if conn is None:
+                available = self._describe_routes() or "none"
+                raise RuntimeError(
+                    f"Chrome Extension disconnected while waiting for route_key='{route_key}'. "
+                    f"Available route keys: {available}"
+                )
+
+            return await self._dispatch_token_request(
+                conn=conn,
+                route_key=route_key,
+                route_guard_key=route_guard_key,
+                project_id=project_id,
+                action=action,
+                timeout=timeout,
+            )
+
+    async def get_session_token(self, token_id: Optional[int], timeout: int = 15) -> Optional[str]:
+        """Read the current labs.google session cookie from the mapped profile."""
+        if not self.active_connections:
+            raise RuntimeError("Chrome Extension not connected")
+
+        route_key = await self._resolve_route_key(token_id)
+        conn = self._select_connection(route_key)
+        if conn is None:
+            raise RuntimeError(
+                f"No Chrome Extension connection matches token_id={token_id} route_key='{route_key}'"
+            )
+
+        route_guard_key = route_key or "(empty)"
+        route_lock = self._route_locks.setdefault(route_guard_key, asyncio.Lock())
+        async with route_lock:
+            conn = self._select_connection(route_key)
+            if conn is None:
+                raise RuntimeError(f"Chrome Extension disconnected for route_key='{route_key}'")
+
+            req_id = f"req_{uuid.uuid4().hex}"
+            future = asyncio.get_running_loop().create_future()
+            self.pending_requests[req_id] = (future, conn.websocket)
+            try:
+                async with self._global_dispatch_lock:
+                    global_interval = config.extension_global_min_interval_seconds
+                    wait_seconds = max(
+                        0.0,
+                        global_interval - (time.monotonic() - self._global_last_dispatch_at),
+                    )
+                    if wait_seconds > 0:
+                        await asyncio.sleep(wait_seconds)
+                    self._global_last_dispatch_at = time.monotonic()
+
+                await conn.websocket.send_text(json.dumps({
+                    "type": "get_session_cookie",
+                    "req_id": req_id,
+                    "route_key": route_key,
+                }))
+                result = await asyncio.wait_for(future, timeout=timeout)
+                if result.get("status") == "success":
+                    return str(result.get("session_token") or "").strip() or None
+                debug_logger.log_warning(
+                    f"[Extension Captcha] Session cookie request failed: {result.get('error')}"
+                )
+                return None
+            except asyncio.TimeoutError:
+                debug_logger.log_warning("[Extension Captcha] Session cookie request timed out")
+                return None
+            finally:
+                self.pending_requests.pop(req_id, None)
+
+    async def _dispatch_token_request(
+        self,
+        *,
+        conn: ExtensionConnection,
+        route_key: str,
+        route_guard_key: str,
+        project_id: str,
+        action: str,
+        timeout: int,
+    ) -> Optional[str]:
+        """Dispatch one request while the caller holds the per-route lock."""
+
         req_id = f"req_{uuid.uuid4().hex}"
         future = asyncio.get_running_loop().create_future()
         self.pending_requests[req_id] = (future, conn.websocket)
@@ -186,10 +290,24 @@ class ExtensionCaptchaService:
         }
 
         try:
+            async with self._global_dispatch_lock:
+                global_interval = config.extension_global_min_interval_seconds
+                global_wait = max(
+                    0.0,
+                    global_interval - (time.monotonic() - self._global_last_dispatch_at),
+                )
+                if global_wait > 0:
+                    debug_logger.log_info(
+                        f"[Extension Captcha] Smoothing global dispatch for {global_wait:.2f}s"
+                    )
+                    await asyncio.sleep(global_wait)
+                self._global_last_dispatch_at = time.monotonic()
+
             debug_logger.log_info(
                 f"[Extension Captcha] Dispatching token request via route_key={route_key or '-'}, "
                 f"label={conn.client_label or '-'}, project_id={project_id}, action={action}"
             )
+            self._route_last_dispatch_at[route_guard_key] = time.monotonic()
             await conn.websocket.send_text(json.dumps(request_data))
             result = await asyncio.wait_for(future, timeout=timeout)
 

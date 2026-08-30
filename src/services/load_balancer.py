@@ -1,6 +1,8 @@
 """Load balancing module for Flow2API"""
 import asyncio
 import random
+import time
+from dataclasses import dataclass
 from typing import Optional, Dict
 from ..core.models import Token
 from ..core.config import config
@@ -14,6 +16,14 @@ from .concurrency_manager import ConcurrencyManager
 from ..core.logger import debug_logger
 
 
+@dataclass
+class CaptchaCircuitState:
+    """Runtime-only reCAPTCHA circuit state for one account."""
+
+    consecutive_failures: int = 0
+    cooldown_until: float = 0.0
+
+
 class LoadBalancer:
     """Token load balancer with load-aware selection"""
 
@@ -25,6 +35,60 @@ class LoadBalancer:
         self._pending_lock = asyncio.Lock()
         self._round_robin_state: Dict[str, Optional[int]] = {"image": None, "video": None, "default": None}
         self._rr_lock = asyncio.Lock()
+        self._captcha_circuits: Dict[int, CaptchaCircuitState] = {}
+        self._captcha_circuit_lock = asyncio.Lock()
+
+    async def record_captcha_failure(self, token_id: int, error: Optional[Exception] = None) -> float:
+        """Record a terminal CAPTCHA failure and return the active cooldown in seconds."""
+        if not token_id:
+            return 0.0
+
+        threshold = config.captcha_failure_threshold
+        cooldown_seconds = config.captcha_failure_cooldown_seconds
+        now = time.monotonic()
+        async with self._captcha_circuit_lock:
+            state = self._captcha_circuits.setdefault(token_id, CaptchaCircuitState())
+            state.consecutive_failures += 1
+            if state.consecutive_failures >= threshold:
+                state.cooldown_until = max(state.cooldown_until, now + cooldown_seconds)
+            remaining = max(0.0, state.cooldown_until - now)
+
+        error_text = str(error or "")[:160]
+        if remaining > 0:
+            debug_logger.log_warning(
+                f"[CAPTCHA_CIRCUIT] Token {token_id} temporarily isolated for "
+                f"{remaining:.0f}s after {state.consecutive_failures} terminal CAPTCHA failure(s): {error_text}"
+            )
+        else:
+            debug_logger.log_warning(
+                f"[CAPTCHA_CIRCUIT] Token {token_id} CAPTCHA failure "
+                f"{state.consecutive_failures}/{threshold}: {error_text}"
+            )
+        return remaining
+
+    async def record_captcha_success(self, token_id: int):
+        """Close the circuit immediately after a successful generation."""
+        if not token_id:
+            return
+        async with self._captcha_circuit_lock:
+            previous = self._captcha_circuits.pop(token_id, None)
+        if previous is not None:
+            debug_logger.log_info(f"[CAPTCHA_CIRCUIT] Token {token_id} recovered; circuit reset")
+
+    async def get_captcha_cooldown_remaining(self, token_id: int) -> float:
+        if not token_id:
+            return 0.0
+        now = time.monotonic()
+        async with self._captcha_circuit_lock:
+            state = self._captcha_circuits.get(token_id)
+            if state is None:
+                return 0.0
+            remaining = max(0.0, state.cooldown_until - now)
+            if state.cooldown_until > 0 and remaining <= 0:
+                # Keep the failure count until the next success so a repeated
+                # failure after cooldown trips the circuit again immediately.
+                state.cooldown_until = 0.0
+            return remaining
 
     async def _get_pending_count(self, token_id: int, for_image_generation: bool, for_video_generation: bool) -> int:
         async with self._pending_lock:
@@ -185,6 +249,11 @@ class LoadBalancer:
             normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
             if model and not supports_model_for_tier(model, normalized_tier):
                 filtered_reasons[token.id] = '账号等级不足，需要 ' + get_paygate_tier_label(required_tier)
+                continue
+
+            captcha_cooldown = await self.get_captcha_cooldown_remaining(token.id)
+            if captcha_cooldown > 0:
+                filtered_reasons[token.id] = f"reCAPTCHA 保护冷却中 ({captcha_cooldown:.0f}秒)"
                 continue
             if for_image_generation:
                 if not token.image_enabled:

@@ -931,7 +931,10 @@ class FlowClient:
         error_str = str(error)
         error_lower = error_str.lower()
         if "recaptcha evaluation failed" in error_lower or "recaptcha 验证失败" in error_str:
-            return max(effective_max_retries, int(config.browser_captcha_generation_retries or 6))
+            # reCAPTCHA failures are a risk signal. Retrying aggressively makes
+            # the account look worse, so use the dedicated (usually smaller)
+            # budget instead of inheriting the generic upstream retry count.
+            return max(1, int(config.browser_captcha_generation_retries or 2))
         return effective_max_retries
 
     def _build_realistic_video_submit_headers(self) -> Dict[str, str]:
@@ -4913,5 +4916,4 @@ class FlowClient:
         except Exception as e:
             debug_logger.log_error(f"[reCAPTCHA {method}] error: {str(e)}")
             return None
-
 

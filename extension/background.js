@@ -123,6 +123,12 @@ async function connectWS() {
                 console.error("[Flow2API] Queue Error:", err);
             });
         }
+
+        if (data.type === "get_session_cookie") {
+            tokenQueue = tokenQueue.then(() => handleGetSessionCookie(data)).catch(err => {
+                console.error("[Flow2API] Session cookie queue error:", err);
+            });
+        }
     };
 
     ws.onclose = () => {
@@ -136,6 +142,35 @@ async function connectWS() {
     ws.onerror = (e) => {
         console.log("[Flow2API] WebSocket Error", e);
     };
+}
+
+async function handleGetSessionCookie(data) {
+    try {
+        const cookie = await chrome.cookies.get({
+            url: "https://labs.google/fx/tools/flow",
+            name: "__Secure-next-auth.session-token"
+        });
+
+        if (cookie && cookie.value) {
+            ws.send(JSON.stringify({
+                req_id: data.req_id,
+                status: "success",
+                session_token: cookie.value
+            }));
+        } else {
+            ws.send(JSON.stringify({
+                req_id: data.req_id,
+                status: "error",
+                error: "labs.google 세션 쿠키를 찾을 수 없습니다. 이 Chrome 프로필에서 Flow에 로그인되어 있는지 확인하세요."
+            }));
+        }
+    } catch (err) {
+        ws.send(JSON.stringify({
+            req_id: data.req_id,
+            status: "error",
+            error: err.message || "세션 쿠키 읽기 실패"
+        }));
+    }
 }
 
 async function handleGetToken(data) {

@@ -1029,7 +1029,7 @@ async def refresh_at(
 ):
     """手动刷新Token的AT (使用ST转换) 🆕
     
-    如果 AT 刷新失败且处于 personal 模式，会自动尝试通过浏览器刷新 ST
+    如果 AT 刷新失败，会根据 captcha 模式自动尝试刷新 ST
     """
     from ..core.logger import debug_logger
     from ..core.config import config
@@ -1045,7 +1045,7 @@ async def refresh_at(
             updated_token = await token_manager.get_token(token_id)
             
             message = "AT刷新成功"
-            if config.captcha_method == "personal":
+            if config.captcha_method in ("personal", "extension", "protocol"):
                 message += "（支持ST自动刷新）"
             
             debug_logger.log_info(f"[API] AT 刷新成功: token_id={token_id}")

@@ -1522,6 +1522,7 @@ class GenerationHandler:
 
             # 重置错误计数 (请求成功时清空连续错误计数)
             await self.token_manager.record_success(token.id)
+            await self.load_balancer.record_captcha_success(token.id)
 
             debug_logger.log_info(f"[GENERATION] ✅ 生成成功完成")
 
@@ -1597,7 +1598,9 @@ class GenerationHandler:
             error_msg = f"生成失败: {str(e)}"
             debug_logger.log_error(f"[GENERATION] 生成失败: {error_msg}")
             if token:
-                if self._should_count_token_error(e):
+                if self._is_captcha_evaluation_error(e):
+                    await self.load_balancer.record_captcha_failure(token.id, e)
+                elif self._should_count_token_error(e):
                     await self.token_manager.record_error(token.id)
                 else:
                     debug_logger.log_info(
@@ -1674,6 +1677,15 @@ class GenerationHandler:
             return False
 
         return True
+
+    @staticmethod
+    def _is_captcha_evaluation_error(error: Exception) -> bool:
+        """Only upstream risk-evaluation failures trip the account circuit."""
+        error_text = str(error or "").strip().lower()
+        return any(marker in error_text for marker in (
+            "recaptcha evaluation failed",
+            "public_error_unusual_activity",
+        ))
 
     async def _handle_image_generation(
         self,
