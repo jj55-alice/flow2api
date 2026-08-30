@@ -4545,13 +4545,56 @@ class FlowClient:
                 from .browser_captcha_extension import ExtensionCaptchaService
                 service = await ExtensionCaptchaService.get_instance(self.db)
                 extension_timeout = 45 if action == "VIDEO_GENERATION" else 25
-                token = await service.get_token(
-                    project_id,
-                    action,
-                    timeout=extension_timeout,
-                    token_id=token_id
-                )
-                self._set_request_fingerprint(None)
+                get_token_bundle = getattr(service, "get_token_bundle", None)
+                if callable(get_token_bundle):
+                    solve_bundle = await get_token_bundle(
+                        project_id,
+                        action,
+                        timeout=extension_timeout,
+                        token_id=token_id,
+                    )
+                    token = str((solve_bundle or {}).get("token") or "").strip() or None
+                    fingerprint = (
+                        solve_bundle.get("fingerprint")
+                        if isinstance(solve_bundle, dict)
+                        and isinstance(solve_bundle.get("fingerprint"), dict)
+                        else None
+                    )
+                else:
+                    token = await service.get_token(
+                        project_id,
+                        action,
+                        timeout=extension_timeout,
+                        token_id=token_id,
+                    )
+                    fingerprint = None
+
+                if token and not str((fingerprint or {}).get("user_agent") or "").strip():
+                    fallback_user_agent = config.extension_fallback_user_agent
+                    if fallback_user_agent:
+                        fingerprint = self._build_fingerprint_from_user_agent(
+                            fallback_user_agent,
+                            accept_language=self._get_primary_accept_language(),
+                        )
+                        debug_logger.log_warning(
+                            "[reCAPTCHA Extension] 扩展尚未回传浏览器指纹，"
+                            "临时使用 extension_fallback_user_agent；请重载扩展完成迁移"
+                        )
+                    else:
+                        debug_logger.log_warning(
+                            "[reCAPTCHA Extension] 已拿到 token，但缺少浏览器指纹 UA；"
+                            "为避免 solve/submit 环境失配，丢弃本次 token"
+                        )
+                        self._set_request_fingerprint(None)
+                        return None, None
+
+                if token:
+                    next_fingerprint = dict(fingerprint or {})
+                    next_fingerprint["project_id"] = project_id
+                    next_fingerprint.setdefault("origin", "https://labs.google")
+                    next_fingerprint.setdefault("referer", self._build_flow_project_page_url(project_id))
+                    fingerprint = next_fingerprint
+                self._set_request_fingerprint(fingerprint if token else None)
                 return token, None
             except Exception as e:
                 debug_logger.log_error(f"[reCAPTCHA Extension] 错误: {str(e)}")

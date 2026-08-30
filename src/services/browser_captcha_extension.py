@@ -16,6 +16,7 @@ class ExtensionConnection:
     websocket: WebSocket
     route_key: str = ""
     client_label: str = ""
+    fingerprint: Dict[str, str] = field(default_factory=dict)
     connected_at: float = field(default_factory=time.time)
 
 
@@ -102,6 +103,29 @@ class ExtensionCaptchaService:
     def describe_routes(self) -> str:
         return self._describe_routes()
 
+    @staticmethod
+    def _normalize_fingerprint(value: Any) -> Dict[str, str]:
+        if not isinstance(value, dict):
+            return {}
+
+        limits = {
+            "user_agent": 512,
+            "language": 64,
+            "accept_language": 256,
+            "sec_ch_ua": 512,
+            "sec_ch_ua_mobile": 8,
+            "sec_ch_ua_platform": 64,
+        }
+        normalized: Dict[str, str] = {}
+        for key, limit in limits.items():
+            raw = value.get(key)
+            if raw is None:
+                continue
+            text = str(raw).strip()
+            if text:
+                normalized[key] = text[:limit]
+        return normalized
+
     async def _send_ack(self, websocket: WebSocket, payload: Dict[str, Any]):
         try:
             await websocket.send_text(json.dumps(payload))
@@ -140,9 +164,13 @@ class ExtensionCaptchaService:
                 if conn:
                     conn.route_key = (payload.get("route_key") or conn.route_key or "").strip()
                     conn.client_label = (payload.get("client_label") or conn.client_label or "").strip()
+                    registered_fingerprint = self._normalize_fingerprint(payload.get("fingerprint"))
+                    if registered_fingerprint:
+                        conn.fingerprint = registered_fingerprint
                     debug_logger.log_info(
                         f"[Extension Captcha] Client registered route_key={conn.route_key or '-'}, "
-                        f"label={conn.client_label or '-'}"
+                        f"label={conn.client_label or '-'}, "
+                        f"fingerprint={'yes' if conn.fingerprint.get('user_agent') else 'no'}"
                     )
                     await self._send_ack(
                         websocket,
@@ -172,6 +200,23 @@ class ExtensionCaptchaService:
         timeout: int = 20,
         token_id: Optional[int] = None,
     ) -> Optional[str]:
+        bundle = await self.get_token_bundle(
+            project_id,
+            action,
+            timeout=timeout,
+            token_id=token_id,
+        )
+        if not isinstance(bundle, dict):
+            return None
+        return str(bundle.get("token") or "").strip() or None
+
+    async def get_token_bundle(
+        self,
+        project_id: str,
+        action: str = "IMAGE_GENERATION",
+        timeout: int = 20,
+        token_id: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
         if not self.active_connections:
             debug_logger.log_warning("[Extension Captcha] No active extension connections available.")
             raise RuntimeError("Chrome Extension not connected or Google Labs tab not open.")
@@ -278,7 +323,7 @@ class ExtensionCaptchaService:
         project_id: str,
         action: str,
         timeout: int,
-    ) -> Optional[str]:
+    ) -> Optional[Dict[str, Any]]:
         """Dispatch one request while the caller holds the per-route lock."""
 
         req_id = f"req_{uuid.uuid4().hex}"
@@ -316,7 +361,18 @@ class ExtensionCaptchaService:
             result = await asyncio.wait_for(future, timeout=timeout)
 
             if result.get("status") == "success":
-                return result.get("token")
+                token = str(result.get("token") or "").strip()
+                if not token:
+                    return None
+                fingerprint = self._normalize_fingerprint(result.get("fingerprint"))
+                if fingerprint:
+                    conn.fingerprint = fingerprint
+                elif conn.fingerprint:
+                    fingerprint = dict(conn.fingerprint)
+                return {
+                    "token": token,
+                    "fingerprint": fingerprint,
+                }
 
             error_msg = result.get("error")
             debug_logger.log_error(f"[Extension Captcha] Error from extension: {error_msg}")

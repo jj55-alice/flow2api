@@ -87,6 +87,11 @@ class _ImmediateExtensionSocket:
                 "req_id": payload["req_id"],
                 "status": "success",
                 "token": f"captcha-{len(self.dispatch_times)}",
+                "fingerprint": {
+                    "user_agent": "Mozilla/5.0 Chrome/150.0.0.0 Safari/537.36",
+                    "accept_language": "ko-KR,ko;q=0.9",
+                    "sec_ch_ua_platform": '"macOS"',
+                },
             }),
         )
 
@@ -277,6 +282,19 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
         session_token = await service.get_session_token(token_id=1)
 
         self.assertEqual(session_token, "labs-session-token")
+
+    async def test_token_bundle_preserves_browser_fingerprint(self):
+        service = ExtensionCaptchaService(db=_RouteDbStub())
+        websocket = _ImmediateExtensionSocket(service)
+        service.active_connections.append(
+            ExtensionConnection(websocket=websocket, route_key="google-1")
+        )
+
+        bundle = await service.get_token_bundle("project-a", token_id=1)
+
+        self.assertEqual(bundle["token"], "captcha-1")
+        self.assertIn("Chrome/150", bundle["fingerprint"]["user_agent"])
+        self.assertEqual(bundle["fingerprint"]["sec_ch_ua_platform"], '"macOS"')
 
 
 class RecaptchaRetryBudgetTests(unittest.TestCase):

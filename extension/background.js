@@ -41,6 +41,45 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function buildBrowserFingerprint(browserNavigator = navigator) {
+    const languages = Array.from(
+        new Set(
+            (Array.isArray(browserNavigator.languages) ? browserNavigator.languages : [browserNavigator.language])
+                .map(value => String(value || "").trim())
+                .filter(Boolean)
+        )
+    );
+    const acceptLanguage = languages
+        .map((language, index) => {
+            if (index === 0) return language;
+            const quality = Math.max(0.1, 1 - (index * 0.1)).toFixed(1);
+            return `${language};q=${quality}`;
+        })
+        .join(",");
+
+    const userAgentData = browserNavigator.userAgentData;
+    const brands = Array.isArray(userAgentData?.brands) ? userAgentData.brands : [];
+    const secChUa = brands
+        .map(item => {
+            const brand = String(item?.brand || "").replace(/["\\]/g, "");
+            const version = String(item?.version || "").replace(/[^0-9.]/g, "");
+            return brand && version ? `"${brand}";v="${version}"` : "";
+        })
+        .filter(Boolean)
+        .join(", ");
+
+    return {
+        user_agent: String(browserNavigator.userAgent || "").trim(),
+        language: String(browserNavigator.language || languages[0] || "").trim(),
+        accept_language: acceptLanguage,
+        sec_ch_ua: secChUa,
+        sec_ch_ua_mobile: userAgentData?.mobile ? "?1" : "?0",
+        sec_ch_ua_platform: userAgentData?.platform
+            ? JSON.stringify(String(userAgentData.platform))
+            : ""
+    };
+}
+
 function waitForTabReady(tabId, timeoutMs = 12000) {
     return new Promise((resolve) => {
         let settled = false;
@@ -93,7 +132,8 @@ async function connectWS() {
         ws.send(JSON.stringify({
             type: "register",
             route_key: settings.routeKey,
-            client_label: settings.clientLabel
+            client_label: settings.clientLabel,
+            fingerprint: buildBrowserFingerprint()
         }));
         if (heartbeatInterval) clearInterval(heartbeatInterval);
         heartbeatInterval = setInterval(() => {
@@ -194,6 +234,40 @@ async function handleGetToken(data) {
                 func: async (action, timeoutMs) => {
                     return new Promise((resolve, reject) => {
                         let settled = false;
+                        const browserFingerprint = () => {
+                            const languages = Array.from(
+                                new Set(
+                                    (Array.isArray(navigator.languages) ? navigator.languages : [navigator.language])
+                                        .map(value => String(value || "").trim())
+                                        .filter(Boolean)
+                                )
+                            );
+                            const acceptLanguage = languages
+                                .map((language, index) => index === 0
+                                    ? language
+                                    : `${language};q=${Math.max(0.1, 1 - (index * 0.1)).toFixed(1)}`)
+                                .join(",");
+                            const userAgentData = navigator.userAgentData;
+                            const brands = Array.isArray(userAgentData?.brands) ? userAgentData.brands : [];
+                            const secChUa = brands
+                                .map(item => {
+                                    const brand = String(item?.brand || "").replace(/["\\]/g, "");
+                                    const version = String(item?.version || "").replace(/[^0-9.]/g, "");
+                                    return brand && version ? `"${brand}";v="${version}"` : "";
+                                })
+                                .filter(Boolean)
+                                .join(", ");
+                            return {
+                                user_agent: String(navigator.userAgent || "").trim(),
+                                language: String(navigator.language || languages[0] || "").trim(),
+                                accept_language: acceptLanguage,
+                                sec_ch_ua: secChUa,
+                                sec_ch_ua_mobile: userAgentData?.mobile ? "?1" : "?0",
+                                sec_ch_ua_platform: userAgentData?.platform
+                                    ? JSON.stringify(String(userAgentData.platform))
+                                    : ""
+                            };
+                        };
                         const finish = (fn, value) => {
                             if (settled) return;
                             settled = true;
@@ -203,7 +277,10 @@ async function handleGetToken(data) {
                             function run() {
                                 grecaptcha.enterprise.ready(function() {
                                     grecaptcha.enterprise.execute("6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV", { action: action })
-                                        .then(token => finish(resolve, token))
+                                        .then(token => finish(resolve, {
+                                            token,
+                                            fingerprint: browserFingerprint()
+                                        }))
                                         .catch(err => finish(reject, err.message || "reCAPTCHA evaluation failed internally"));
                                 });
                             }
@@ -228,7 +305,20 @@ async function handleGetToken(data) {
             });
 
             if (results && results[0] && results[0].result) {
-                successResponse = { status: "success", token: results[0].result };
+                const solveResult = results[0].result;
+                if (typeof solveResult === "string") {
+                    successResponse = {
+                        status: "success",
+                        token: solveResult,
+                        fingerprint: buildBrowserFingerprint()
+                    };
+                } else if (solveResult.token) {
+                    successResponse = {
+                        status: "success",
+                        token: solveResult.token,
+                        fingerprint: solveResult.fingerprint || buildBrowserFingerprint()
+                    };
+                }
             }
         } catch (e) {
             lastErrorMsg = e.message || "Script execution failed";
@@ -238,7 +328,8 @@ async function handleGetToken(data) {
             ws.send(JSON.stringify({
                 req_id: data.req_id,
                 status: successResponse.status,
-                token: successResponse.token
+                token: successResponse.token,
+                fingerprint: successResponse.fingerprint
             }));
         } else {
             ws.send(JSON.stringify({

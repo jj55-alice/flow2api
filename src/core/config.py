@@ -508,6 +508,12 @@ class Config:
             return 1.0
 
     @property
+    def extension_fallback_user_agent(self) -> str:
+        """旧版扩展未回传浏览器指纹时使用的临时兼容 User-Agent。"""
+        value = self._config.get("captcha", {}).get("extension_fallback_user_agent", "")
+        return str(value or "").strip()[:512]
+
+    @property
     def personal_max_resident_tabs(self) -> int:
         """内置浏览器打码单实例共享标签页上限"""
         value = self._config.get("captcha", {}).get("personal_max_resident_tabs", 5)
