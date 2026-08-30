@@ -15,6 +15,9 @@ from .proxy_manager import ProxyManager
 class TokenManager:
     """Token lifecycle manager with AT auto-refresh"""
 
+    _PROACTIVE_AT_REFRESH_WINDOW = timedelta(hours=1)
+    _PROACTIVE_AT_RETRY_DELAY_SECONDS = 600
+
     def __init__(self, db: Database, flow_client: FlowClient):
         self.db = db
         self.flow_client = flow_client
@@ -24,6 +27,7 @@ class TokenManager:
         self._project_locks: dict[int, asyncio.Lock] = {}
         self._refresh_futures: dict[int, asyncio.Task] = {}
         self._at_validation_cache: dict[int, float] = {}
+        self._proactive_at_retry_after: dict[int, float] = {}
         self._protocol_refresher_task: Optional[asyncio.Task] = None
 
     async def _get_token_lock(
@@ -258,13 +262,50 @@ class TokenManager:
     async def enable_token(self, token_id: int):
         """Enable a token and reset error count"""
         # Enable the token
-        await self.db.update_token(token_id, is_active=True, ban_reason=None, banned_at=None)
+        await self.db.update_token(
+            token_id,
+            is_active=True,
+            ban_reason=None,
+            banned_at=None,
+            captcha_failure_count=0,
+            captcha_cooldown_until=None,
+            captcha_circuit_opened_at=None,
+            captcha_last_failure_at=None,
+        )
         # Reset error count when enabling (only reset total error_count, keep today_error_count)
         await self.db.reset_error_count(token_id)
 
     async def disable_token(self, token_id: int):
         """Disable a token"""
         await self.db.update_token(token_id, is_active=False)
+
+    async def update_captcha_circuit(
+        self,
+        token_id: int,
+        *,
+        failure_count: int,
+        cooldown_until: Optional[datetime],
+        circuit_opened_at: Optional[datetime],
+        last_failure_at: Optional[datetime],
+    ) -> None:
+        """Persist one account's reCAPTCHA circuit state."""
+        await self.db.update_token(
+            token_id,
+            captcha_failure_count=max(0, int(failure_count)),
+            captcha_cooldown_until=cooldown_until,
+            captcha_circuit_opened_at=circuit_opened_at,
+            captcha_last_failure_at=last_failure_at,
+        )
+
+    async def reset_captcha_circuit(self, token_id: int) -> None:
+        """Clear persisted reCAPTCHA circuit state after a valid recovery probe."""
+        await self.update_captcha_circuit(
+            token_id,
+            failure_count=0,
+            cooldown_until=None,
+            circuit_opened_at=None,
+            last_failure_at=None,
+        )
 
     # ========== Token添加 (支持Project创建) ==========
 
@@ -561,7 +602,7 @@ class TokenManager:
         return valid_token is not None
 
 
-    async def _refresh_at_inner(self, token_id: int) -> bool:
+    async def _refresh_at_inner(self, token_id: int, *, disable_on_failure: bool = True) -> bool:
         """Perform exactly one real AT refresh attempt."""
         refresh_lock = await self._get_token_lock(
             self._refresh_locks,
@@ -586,8 +627,14 @@ class TokenManager:
                 if result:
                     return True
 
-            debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: all refresh attempts failed, disabling token")
-            await self.disable_token(token_id)
+            if disable_on_failure:
+                debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: all refresh attempts failed, disabling token")
+                await self.disable_token(token_id)
+            else:
+                debug_logger.log_warning(
+                    f"[AT_REFRESH] Token {token_id}: proactive refresh failed; "
+                    "keeping token active for a later retry"
+                )
             self._clear_at_validation_cache(token_id)
             return False
 
@@ -876,18 +923,20 @@ class TokenManager:
                 debug_logger.log_error(f"[PROTOCOL_REFRESH] Token {token_id}: 协议 ST 转 AT 失败 - {e}")
 
     async def run_protocol_refresh_once(self) -> None:
-        """Refresh protocol-mode tokens whose ST refresh interval is due."""
+        """Run proactive extension AT refresh and scheduled protocol ST refresh."""
         try:
             refresh_config = await self.db.get_token_refresh_config()
         except Exception as e:
             debug_logger.log_warning(f"[PROTOCOL_REFRESH] 读取刷新配置失败: {e}")
             return
 
+        tokens = await self.db.get_active_tokens()
+        now = datetime.now(timezone.utc)
+        await self._refresh_expiring_extension_tokens(tokens, now)
+
         if not refresh_config or not refresh_config.enabled:
             return
 
-        tokens = await self.db.get_active_tokens()
-        now = datetime.now(timezone.utc)
         for token in tokens:
             try:
                 if not token.auto_refresh_enabled:
@@ -906,6 +955,49 @@ class TokenManager:
                 await self._refresh_protocol_token(token, now)
             except Exception as e:
                 debug_logger.log_error(f"[PROTOCOL_REFRESH] Token {getattr(token, 'id', '?')}: 后台刷新异常 - {e}")
+
+    def _is_proactive_extension_refresh_due(self, token: Token, now: datetime) -> bool:
+        """Return True only before expiry so already-expired accounts remain manual recovery cases."""
+        if config.captcha_method != "extension":
+            return False
+        if not token.auto_refresh_enabled:
+            return False
+        if self._normalize_protocol_mode(token.protocol_mode) != "session":
+            return False
+
+        expires_at = self._as_utc(token.at_expires)
+        if expires_at is None or expires_at <= now:
+            return False
+        return expires_at - now <= self._PROACTIVE_AT_REFRESH_WINDOW
+
+    async def _refresh_expiring_extension_tokens(self, tokens: List[Token], now: datetime) -> None:
+        """Refresh extension/session ATs before expiry without disabling on transient failure."""
+        monotonic_now = time.monotonic()
+        for token in tokens:
+            if not token.id or not self._is_proactive_extension_refresh_due(token, now):
+                continue
+
+            retry_after = self._proactive_at_retry_after.get(token.id, 0.0)
+            if retry_after > monotonic_now:
+                continue
+
+            try:
+                refreshed = await self._refresh_at_inner(token.id, disable_on_failure=False)
+            except Exception as e:
+                refreshed = False
+                debug_logger.log_error(
+                    f"[AT_REFRESH] Token {token.id}: proactive background refresh error - {e}"
+                )
+
+            if refreshed:
+                self._proactive_at_retry_after.pop(token.id, None)
+                debug_logger.log_info(
+                    f"[AT_REFRESH] Token {token.id}: proactive extension AT refresh succeeded"
+                )
+            else:
+                self._proactive_at_retry_after[token.id] = (
+                    time.monotonic() + self._PROACTIVE_AT_RETRY_DELAY_SECONDS
+                )
 
     async def _protocol_refresh_loop(self) -> None:
         while True:

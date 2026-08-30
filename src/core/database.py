@@ -435,6 +435,7 @@ class Database:
             # ========== Step 2: Add missing columns to existing tables ==========
             # Check and add missing columns to tokens table
             if await self._table_exists(db, "tokens"):
+                captcha_circuit_columns_added = False
                 columns_to_add = [
                     ("at", "TEXT"),  # Access Token
                     ("at_expires", "TIMESTAMP"),  # AT expiration time
@@ -459,6 +460,10 @@ class Database:
                     ("last_st_refresh_result", "TEXT DEFAULT ''"),
                     ("ban_reason", "TEXT"),  # 禁用原因
                     ("banned_at", "TIMESTAMP"),  # 禁用时间
+                    ("captcha_failure_count", "INTEGER DEFAULT 0"),
+                    ("captcha_cooldown_until", "TIMESTAMP"),
+                    ("captcha_circuit_opened_at", "TIMESTAMP"),
+                    ("captcha_last_failure_at", "TIMESTAMP"),
                 ]
 
                 for col_name, col_type in columns_to_add:
@@ -466,8 +471,52 @@ class Database:
                         try:
                             await db.execute(f"ALTER TABLE tokens ADD COLUMN {col_name} {col_type}")
                             print(f"  ✓ Added column '{col_name}' to tokens table")
+                            if col_name.startswith("captcha_"):
+                                captcha_circuit_columns_added = True
                         except Exception as e:
                             print(f"  ✗ Failed to add column '{col_name}': {e}")
+
+                if captcha_circuit_columns_added and await self._table_exists(db, "request_logs"):
+                    captcha_config = (config_dict or {}).get("captcha", {})
+                    try:
+                        base_cooldown_seconds = max(
+                            30,
+                            min(86400, int(captcha_config.get("captcha_failure_cooldown_seconds", 7200))),
+                        )
+                    except Exception:
+                        base_cooldown_seconds = 7200
+
+                    # Preserve the first-stage cooldown for accounts whose latest
+                    # completed event is a recent UNUSUAL_ACTIVITY failure. This
+                    # prevents the upgrade restart itself from immediately
+                    # re-exposing an account that was already supposed to rest.
+                    latest_failure = """
+                        (SELECT MAX(rl.updated_at)
+                         FROM request_logs rl
+                         WHERE rl.token_id = tokens.id
+                           AND rl.status_code >= 400
+                           AND rl.response_body LIKE '%PUBLIC_ERROR_UNUSUAL_ACTIVITY%')
+                    """
+                    latest_success = """
+                        (SELECT MAX(rl.updated_at)
+                         FROM request_logs rl
+                         WHERE rl.token_id = tokens.id
+                           AND rl.status_code = 200
+                           AND rl.status_text = 'completed')
+                    """
+                    await db.execute(
+                        f"""
+                        UPDATE tokens
+                        SET captcha_failure_count = 1,
+                            captcha_last_failure_at = {latest_failure},
+                            captcha_circuit_opened_at = {latest_failure},
+                            captcha_cooldown_until = datetime({latest_failure}, '+' || ? || ' seconds')
+                        WHERE {latest_failure} IS NOT NULL
+                          AND datetime({latest_failure}) > datetime('now', '-' || ? || ' seconds')
+                          AND ({latest_success} IS NULL OR datetime({latest_success}) < datetime({latest_failure}))
+                        """,
+                        (base_cooldown_seconds, base_cooldown_seconds),
+                    )
 
             # Check and add missing columns to admin_config table
             if await self._table_exists(db, "admin_config"):
@@ -644,7 +693,11 @@ class Database:
                     last_st_refresh_at TIMESTAMP,
                     last_st_refresh_result TEXT DEFAULT '',
                     ban_reason TEXT,
-                    banned_at TIMESTAMP
+                    banned_at TIMESTAMP,
+                    captcha_failure_count INTEGER DEFAULT 0,
+                    captcha_cooldown_until TIMESTAMP,
+                    captcha_circuit_opened_at TIMESTAMP,
+                    captcha_last_failure_at TIMESTAMP
                 )
             """)
 

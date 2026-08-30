@@ -1292,6 +1292,7 @@ class GenerationHandler:
         """
         start_time = time.time()
         token = None
+        token_attempt_started_at = None
         generation_type = None
         pending_token_state = {"active": False}
         request_id = f"gen-{int(start_time * 1000)}-{id(asyncio.current_task())}"
@@ -1397,6 +1398,7 @@ class GenerationHandler:
             return
 
         debug_logger.log_info(f"[GENERATION] 已选择Token: {token.id} ({token.email})")
+        token_attempt_started_at = time.time()
         pending_token_state["active"] = True
         await self._update_request_log_progress(
             request_log_state,
@@ -1522,7 +1524,10 @@ class GenerationHandler:
 
             # 重置错误计数 (请求成功时清空连续错误计数)
             await self.token_manager.record_success(token.id)
-            await self.load_balancer.record_captcha_success(token.id)
+            await self.load_balancer.record_captcha_success(
+                token.id,
+                attempt_started_at=token_attempt_started_at,
+            )
 
             debug_logger.log_info(f"[GENERATION] ✅ 生成成功完成")
 
@@ -1599,7 +1604,11 @@ class GenerationHandler:
             debug_logger.log_error(f"[GENERATION] 生成失败: {error_msg}")
             if token:
                 if self._is_captcha_evaluation_error(e):
-                    await self.load_balancer.record_captcha_failure(token.id, e)
+                    await self.load_balancer.record_captcha_failure(
+                        token.id,
+                        e,
+                        attempt_started_at=token_attempt_started_at,
+                    )
                 elif self._should_count_token_error(e):
                     await self.token_manager.record_error(token.id)
                 else:

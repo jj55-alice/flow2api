@@ -122,6 +122,10 @@ class ExtensionCaptchaService:
     def _has_connection_for_route_key(self, route_key: str) -> bool:
         return self._select_connection(route_key) is not None
 
+    def has_connection_for_route_key(self, route_key: str) -> bool:
+        """Expose a read-only route health check for admin/health reporting."""
+        return self._has_connection_for_route_key(route_key)
+
     async def has_connection_for_token(self, token_id: Optional[int]) -> tuple[bool, str]:
         route_key = await self._resolve_route_key(token_id)
         return self._has_connection_for_route_key(route_key), route_key

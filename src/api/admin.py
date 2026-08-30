@@ -113,6 +113,88 @@ def _extract_error_summary(payload: Any) -> str:
     return _truncate_text(payload)
 
 
+def _normalize_utc_datetime(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if getattr(value, "tzinfo", None) is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+async def _annotate_token_runtime_status(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Add scheduler-facing availability and persisted CAPTCHA cooldown state."""
+    extension_service = None
+    if config.captcha_method == "extension":
+        from ..services.browser_captcha_extension import ExtensionCaptchaService
+        extension_service = await ExtensionCaptchaService.get_instance(db)
+
+    now = datetime.now(timezone.utc)
+    annotated = []
+    for raw_row in rows:
+        row = dict(raw_row)
+        at_value = str(row.get("at") or "").strip()
+        at_expires = _normalize_utc_datetime(row.get("at_expires"))
+        at_expired = bool(at_expires and at_expires <= now)
+        cooldown_until = _normalize_utc_datetime(row.get("captcha_cooldown_until"))
+        cooldown_remaining = max(
+            0,
+            int((cooldown_until - now).total_seconds() + 0.999),
+        ) if cooldown_until else 0
+        cooling = cooldown_remaining > 0
+        failure_count = max(0, int(row.get("captcha_failure_count") or 0))
+        route_key = str(row.get("extension_route_key") or "").strip()
+        extension_connected = None
+        if extension_service is not None:
+            extension_connected = extension_service.has_connection_for_route_key(route_key)
+
+        capability_enabled = bool(row.get("image_enabled")) or bool(row.get("video_enabled"))
+        is_available = (
+            bool(row.get("is_active"))
+            and bool(at_value)
+            and not at_expired
+            and not cooling
+            and capability_enabled
+            and extension_connected is not False
+        )
+
+        if not bool(row.get("is_active")):
+            availability_status = "inactive"
+        elif not at_value:
+            availability_status = "at_missing"
+        elif at_expired:
+            availability_status = "at_expired"
+        elif cooling:
+            availability_status = "captcha_cooling"
+        elif not capability_enabled:
+            availability_status = "capability_disabled"
+        elif extension_connected is False:
+            availability_status = "extension_disconnected"
+        else:
+            availability_status = "available"
+
+        row.update({
+            "at_expired": at_expired,
+            "at_expiring_within_1h": bool(
+                at_expires and at_expires > now and (at_expires - now).total_seconds() < 3600
+            ),
+            "captcha_failure_count": failure_count,
+            "captcha_cooldown_until": cooldown_until,
+            "captcha_cooldown_remaining_seconds": cooldown_remaining,
+            "captcha_cooldown_stage": min(3, failure_count) if failure_count else 0,
+            "captcha_cooling": cooling,
+            "extension_connected": extension_connected,
+            "is_available": is_available,
+            "availability_status": availability_status,
+        })
+        annotated.append(row)
+    return annotated
+
+
 def _guess_client_hints_from_user_agent(user_agent: str) -> Dict[str, str]:
     """根据 UA 补全常见的 sec-ch-* 头。"""
     ua = (user_agent or "").strip()
@@ -792,33 +874,16 @@ async def change_password(
 @router.get("/api/tokens")
 async def get_tokens(token: str = Depends(verify_admin_token)):
     """Get all tokens with statistics"""
-    token_rows = await db.get_all_tokens_with_stats()
+    token_rows = await _annotate_token_runtime_status(await db.get_all_tokens_with_stats())
     to_iso = lambda value: value.isoformat() if hasattr(value, "isoformat") else value
-    now = datetime.now(timezone.utc)
-
-    def normalize_dt(value):
-        if not value:
-            return None
-        if isinstance(value, str):
-            try:
-                value = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            except Exception:
-                return None
-        if getattr(value, "tzinfo", None) is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc)
 
     return [{
         "id": row.get("id"),
         "st": row.get("st"),  # Session Token for editing
         "at": row.get("at"),  # Access Token for editing (从ST转换而来)
         "at_expires": to_iso(row.get("at_expires")) if row.get("at_expires") else None,  # 🆕 AT过期时间
-        "at_expired": bool(normalize_dt(row.get("at_expires")) and normalize_dt(row.get("at_expires")) <= now),
-        "at_expiring_within_1h": bool(
-            normalize_dt(row.get("at_expires"))
-            and normalize_dt(row.get("at_expires")) > now
-            and (normalize_dt(row.get("at_expires")) - now).total_seconds() < 3600
-        ),
+        "at_expired": bool(row.get("at_expired")),
+        "at_expiring_within_1h": bool(row.get("at_expiring_within_1h")),
         "token": row.get("at"),  # 兼容前端 token.token 的访问方式
         "email": row.get("email"),
         "name": row.get("name"),
@@ -854,6 +919,15 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
         "last_error_at": to_iso(row.get("last_error_at")) if row.get("last_error_at") else None,
         "ban_reason": row.get("ban_reason"),
         "banned_at": to_iso(row.get("banned_at")) if row.get("banned_at") else None,
+        "captcha_failure_count": row.get("captcha_failure_count", 0),
+        "captcha_cooldown_until": to_iso(row.get("captcha_cooldown_until")) if row.get("captcha_cooldown_until") else None,
+        "captcha_cooldown_remaining_seconds": row.get("captcha_cooldown_remaining_seconds", 0),
+        "captcha_cooldown_stage": row.get("captcha_cooldown_stage", 0),
+        "captcha_cooling": bool(row.get("captcha_cooling")),
+        "captcha_last_failure_at": to_iso(row.get("captcha_last_failure_at")) if row.get("captcha_last_failure_at") else None,
+        "extension_connected": row.get("extension_connected"),
+        "is_available": bool(row.get("is_available")),
+        "availability_status": row.get("availability_status") or "unavailable",
     } for row in token_rows]  # 直接返回数组,兼容前端
 
 
@@ -1469,7 +1543,14 @@ async def health_check():
 @router.get("/api/stats")
 async def get_stats(token: str = Depends(verify_admin_token)):
     """Get statistics for dashboard"""
-    return await db.get_dashboard_stats()
+    stats = await db.get_dashboard_stats()
+    rows = await _annotate_token_runtime_status(await db.get_all_tokens_with_stats())
+    stats["available_tokens"] = sum(1 for row in rows if row.get("is_available"))
+    stats["captcha_cooling_tokens"] = sum(1 for row in rows if row.get("captcha_cooling"))
+    stats["extension_connected_tokens"] = sum(
+        1 for row in rows if row.get("extension_connected") is True
+    )
+    return stats
 
 
 @router.get("/api/logs")
