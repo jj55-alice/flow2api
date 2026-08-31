@@ -3,7 +3,7 @@ import json
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Iterable, Optional
 
 from fastapi import WebSocket
 
@@ -18,6 +18,7 @@ class ExtensionConnection:
     client_label: str = ""
     fingerprint: Dict[str, str] = field(default_factory=dict)
     connected_at: float = field(default_factory=time.time)
+    notified_route_key: str = ""
 
 
 class ExtensionCaptchaService:
@@ -35,6 +36,8 @@ class ExtensionCaptchaService:
         self._route_last_dispatch_at: dict[str, float] = {}
         self._global_dispatch_lock = asyncio.Lock()
         self._global_last_dispatch_at = 0.0
+        self._disabled_route_keys: set[str] = set()
+        self._route_connected_callback: Optional[Callable[[str], Awaitable[None]]] = None
 
     @classmethod
     async def get_instance(cls, db=None) -> "ExtensionCaptchaService":
@@ -58,6 +61,8 @@ class ExtensionCaptchaService:
             f"[Extension Captcha] Client connected. Total: {len(self.active_connections)}, "
             f"route_key={conn.route_key or '-'}, label={conn.client_label or '-'}"
         )
+        await self._send_connection_state(conn)
+        self._notify_route_connected(conn)
 
     def disconnect(self, websocket: WebSocket):
         for conn in list(self.active_connections):
@@ -75,7 +80,7 @@ class ExtensionCaptchaService:
                 return conn
         return None
 
-    def _select_connection(self, route_key: str) -> Optional[ExtensionConnection]:
+    def _select_raw_connection(self, route_key: str) -> Optional[ExtensionConnection]:
         normalized_key = (route_key or "").strip()
         if normalized_key:
             for conn in self.active_connections:
@@ -91,9 +96,80 @@ class ExtensionCaptchaService:
                 return conn
         return None
 
+    def _select_connection(self, route_key: str) -> Optional[ExtensionConnection]:
+        normalized_key = (route_key or "").strip()
+        if normalized_key and normalized_key in self._disabled_route_keys:
+            return None
+        return self._select_raw_connection(normalized_key)
+
+    def configure_route_states(self, tokens: Iterable[Any]) -> None:
+        """Load persisted manual browser switches before extensions reconnect."""
+        self._disabled_route_keys = {
+            str(getattr(token, "extension_route_key", "") or "").strip()
+            for token in tokens
+            if not bool(getattr(token, "browser_enabled", True))
+            and str(getattr(token, "extension_route_key", "") or "").strip()
+        }
+
+    def set_route_connected_callback(
+        self,
+        callback: Optional[Callable[[str], Awaitable[None]]],
+    ) -> None:
+        self._route_connected_callback = callback
+
+    def is_route_enabled(self, route_key: str) -> bool:
+        normalized_key = str(route_key or "").strip()
+        return not normalized_key or normalized_key not in self._disabled_route_keys
+
+    async def set_route_enabled(self, route_key: str, enabled: bool) -> None:
+        normalized_key = str(route_key or "").strip()
+        if not normalized_key:
+            return
+        if enabled:
+            self._disabled_route_keys.discard(normalized_key)
+        else:
+            self._disabled_route_keys.add(normalized_key)
+
+        conn = self._select_raw_connection(normalized_key)
+        if conn is not None:
+            await self._send_connection_state(conn)
+            if enabled:
+                self._notify_route_connected(conn, force=True)
+
+    async def _send_connection_state(self, conn: ExtensionConnection) -> None:
+        await self._send_ack(
+            conn.websocket,
+            {
+                "type": "connection_state",
+                "route_key": conn.route_key,
+                "enabled": self.is_route_enabled(conn.route_key),
+            },
+        )
+
+    def _notify_route_connected(self, conn: ExtensionConnection, *, force: bool = False) -> None:
+        route_key = str(conn.route_key or "").strip()
+        callback = self._route_connected_callback
+        if not route_key or callback is None or not self.is_route_enabled(route_key):
+            return
+        if not force and conn.notified_route_key == route_key:
+            return
+        conn.notified_route_key = route_key
+
+        async def runner() -> None:
+            try:
+                await callback(route_key)
+            except Exception as e:
+                debug_logger.log_warning(
+                    f"[Extension Captcha] Route connect callback failed for {route_key}: {e}"
+                )
+
+        asyncio.create_task(runner())
+
     def _describe_routes(self) -> str:
         labels = []
         for conn in self.active_connections:
+            if not self.is_route_enabled(conn.route_key):
+                continue
             label = conn.route_key or "(empty)"
             if conn.client_label:
                 label = f"{label}:{conn.client_label}"
@@ -178,8 +254,11 @@ class ExtensionCaptchaService:
                             "type": "register_ack",
                             "route_key": conn.route_key,
                             "client_label": conn.client_label,
+                            "browser_enabled": self.is_route_enabled(conn.route_key),
                         },
                     )
+                    await self._send_connection_state(conn)
+                    self._notify_route_connected(conn)
                 return
 
             req_id = payload.get("req_id")

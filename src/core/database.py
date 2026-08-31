@@ -461,6 +461,8 @@ class Database:
                     ("video_concurrency", "INTEGER DEFAULT -1"),
                     ("captcha_proxy_url", "TEXT"),  # token级打码代理
                     ("extension_route_key", "TEXT"),  # extension 模式路由键
+                    ("browser_enabled", "BOOLEAN DEFAULT 1"),  # extension 계정 수동 사용 스위치
+                    ("browser_session_sync_pending", "BOOLEAN DEFAULT 0"),
                     ("protocol_mode", "TEXT DEFAULT 'session'"),  # ST 刷新模式
                     ("google_cookies", "TEXT DEFAULT ''"),  # 协议登录 Google Cookies
                     ("login_account", "TEXT DEFAULT ''"),  # 协议登录账号提示
@@ -695,6 +697,8 @@ class Database:
                     video_concurrency INTEGER DEFAULT -1,
                     captcha_proxy_url TEXT,
                     extension_route_key TEXT,
+                    browser_enabled BOOLEAN DEFAULT 1,
+                    browser_session_sync_pending BOOLEAN DEFAULT 0,
                     protocol_mode TEXT DEFAULT 'session',
                     google_cookies TEXT DEFAULT '',
                     login_account TEXT DEFAULT '',
@@ -1010,16 +1014,18 @@ class Database:
                                    credits, user_paygate_tier, current_project_id, current_project_name,
                                    image_enabled, video_enabled, image_concurrency, video_concurrency,
                                    captcha_proxy_url, extension_route_key,
+                                   browser_enabled, browser_session_sync_pending,
                                    protocol_mode, google_cookies, login_account, login_password,
                                    proxy_url, auto_refresh_enabled, refresh_interval_minutes,
                                    last_st_refresh_at, last_st_refresh_result)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (token.st, token.at, token.at_expires, token.email, token.name, token.remark,
                   token.is_active, token.credits, token.user_paygate_tier,
                   token.current_project_id, token.current_project_name,
                   token.image_enabled, token.video_enabled,
                   token.image_concurrency, token.video_concurrency,
                   token.captcha_proxy_url, token.extension_route_key,
+                  token.browser_enabled, token.browser_session_sync_pending,
                   token.protocol_mode, token.google_cookies, token.login_account,
                   token.login_password, token.proxy_url, token.auto_refresh_enabled,
                   token.refresh_interval_minutes, token.last_st_refresh_at,
@@ -1064,6 +1070,20 @@ class Database:
             if row:
                 return Token(**dict(row))
             return None
+
+    async def get_token_by_extension_route_key(self, route_key: str) -> Optional[Token]:
+        """Get the token mapped to one extension browser route."""
+        normalized_key = str(route_key or "").strip()
+        if not normalized_key:
+            return None
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM tokens WHERE extension_route_key = ? ORDER BY id LIMIT 1",
+                (normalized_key,),
+            )
+            row = await cursor.fetchone()
+            return Token(**dict(row)) if row else None
 
     async def get_all_tokens(self) -> List[Token]:
         """Get all tokens"""

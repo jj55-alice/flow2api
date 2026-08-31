@@ -110,6 +110,23 @@ function waitForTabReady(tabId, timeoutMs = 12000) {
     });
 }
 
+function closeFlowTabs() {
+    return new Promise((resolve) => {
+        chrome.tabs.query({ url: ["https://labs.google/fx/*"] }, (tabs) => {
+            if (chrome.runtime.lastError || !Array.isArray(tabs) || tabs.length === 0) {
+                resolve();
+                return;
+            }
+            const tabIds = tabs.map(tab => tab.id).filter(id => Number.isInteger(id));
+            if (tabIds.length === 0) {
+                resolve();
+                return;
+            }
+            chrome.tabs.remove(tabIds, () => resolve());
+        });
+    });
+}
+
 async function connectWS() {
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
@@ -155,6 +172,16 @@ async function connectWS() {
 
         if (data.type === "register_ack") {
             console.log("[Flow2API] Registered route key:", data.route_key || "(empty)");
+            return;
+        }
+
+        if (data.type === "connection_state") {
+            if (data.enabled === false) {
+                console.log("[Flow2API] Browser route paused by dashboard; closing Flow tabs.");
+                await closeFlowTabs();
+            } else {
+                console.log("[Flow2API] Browser route enabled by dashboard.");
+            }
             return;
         }
 

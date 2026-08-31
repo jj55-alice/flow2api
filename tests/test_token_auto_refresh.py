@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from src.core.config import config
 from src.core.models import Token
@@ -22,6 +22,12 @@ class _RefreshDbStub:
     async def get_token(self, token_id):
         return next((token for token in self.tokens if token.id == token_id), None)
 
+    async def get_token_by_extension_route_key(self, route_key):
+        return next(
+            (token for token in self.tokens if token.extension_route_key == route_key),
+            None,
+        )
+
     async def update_token(self, token_id, **updates):
         self.updates.append((token_id, updates))
         token = await self.get_token(token_id)
@@ -35,6 +41,7 @@ class _RecordingTokenManager(TokenManager):
         super().__init__(db, flow_client=SimpleNamespace())
         self.refresh_result = refresh_result
         self.refresh_calls = []
+        self.sync_calls = []
         self.disabled_tokens = []
 
     async def _refresh_at_inner(self, token_id, *, disable_on_failure=True):
@@ -43,6 +50,10 @@ class _RecordingTokenManager(TokenManager):
 
     async def disable_token(self, token_id):
         self.disabled_tokens.append(token_id)
+
+    async def sync_extension_browser_session(self, token_id):
+        self.sync_calls.append(token_id)
+        return self.refresh_result
 
 
 class ExtensionAtAutoRefreshTests(unittest.IsolatedAsyncioTestCase):
@@ -106,6 +117,84 @@ class ExtensionAtAutoRefreshTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(manager.refresh_calls, [(1, False), (1, False)])
         self.assertEqual(manager._proactive_at_failure_counts[1], 2)
+
+    async def test_paused_browser_is_excluded_from_background_refresh(self):
+        now = datetime.now(timezone.utc)
+        token = self._token(1, now - timedelta(minutes=30))
+        token.browser_enabled = False
+        manager = _RecordingTokenManager(_RefreshDbStub([token]))
+
+        await manager.run_protocol_refresh_once()
+
+        self.assertEqual(manager.refresh_calls, [])
+        self.assertEqual(manager.sync_calls, [])
+
+    async def test_pending_browser_session_uses_sync_path(self):
+        now = datetime.now(timezone.utc)
+        token = self._token(1, now + timedelta(hours=2))
+        token.browser_session_sync_pending = True
+        manager = _RecordingTokenManager(_RefreshDbStub([token]))
+
+        await manager.run_protocol_refresh_once()
+
+        self.assertEqual(manager.sync_calls, [1])
+        self.assertEqual(manager.refresh_calls, [])
+
+    async def test_browser_toggle_persists_pending_sync_and_updates_route(self):
+        token = self._token(1, datetime.now(timezone.utc) + timedelta(hours=2))
+        token.extension_route_key = "google-1"
+        db = _RefreshDbStub([token])
+        manager = TokenManager(db, flow_client=SimpleNamespace())
+        extension_service = SimpleNamespace(
+            set_route_enabled=AsyncMock(),
+            has_connection_for_route_key=Mock(return_value=False),
+        )
+
+        with patch(
+            "src.services.browser_captcha_extension.ExtensionCaptchaService.get_instance",
+            new=AsyncMock(return_value=extension_service),
+        ):
+            updated, connected = await manager.set_browser_connection_enabled(1, False)
+
+        self.assertFalse(updated.browser_enabled)
+        self.assertTrue(updated.browser_session_sync_pending)
+        self.assertFalse(connected)
+        extension_service.set_route_enabled.assert_awaited_once_with("google-1", False)
+
+    async def test_browser_session_sync_refreshes_st_and_at_then_clears_pending(self):
+        token = self._token(1, datetime.now(timezone.utc) + timedelta(hours=2))
+        token.current_project_id = "project-1"
+        token.extension_route_key = "google-1"
+        token.browser_session_sync_pending = True
+        db = _RefreshDbStub([token])
+        manager = TokenManager(db, flow_client=SimpleNamespace())
+        manager._do_refresh_at = AsyncMock(return_value=True)
+        extension_service = SimpleNamespace(
+            get_token_bundle=AsyncMock(return_value={"token": "captcha-token"}),
+            get_session_token=AsyncMock(return_value="fresh-session-token"),
+        )
+
+        with patch(
+            "src.services.browser_captcha_extension.ExtensionCaptchaService.get_instance",
+            new=AsyncMock(return_value=extension_service),
+        ):
+            synchronized = await manager.sync_extension_browser_session(1)
+
+        self.assertTrue(synchronized)
+        self.assertEqual(token.st, "fresh-session-token")
+        self.assertFalse(token.browser_session_sync_pending)
+        manager._do_refresh_at.assert_awaited_once_with(1, "fresh-session-token", token)
+
+    async def test_route_reconnect_completes_only_pending_enabled_session(self):
+        token = self._token(1, datetime.now(timezone.utc) + timedelta(hours=2))
+        token.extension_route_key = "google-1"
+        token.browser_session_sync_pending = True
+        manager = TokenManager(_RefreshDbStub([token]), flow_client=SimpleNamespace())
+        manager.sync_extension_browser_session = AsyncMock(return_value=True)
+
+        await manager.handle_extension_route_connected("google-1")
+
+        manager.sync_extension_browser_session.assert_awaited_once_with(1)
 
     async def test_refresh_inner_keeps_token_active_when_background_refresh_fails(self):
         now = datetime.now(timezone.utc)

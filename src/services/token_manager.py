@@ -283,6 +283,118 @@ class TokenManager:
         """Disable a token"""
         await self.db.update_token(token_id, is_active=False)
 
+    async def set_browser_connection_enabled(self, token_id: int, enabled: bool) -> tuple[Token, bool]:
+        """Persist the manual extension-browser switch and apply it immediately."""
+        token = await self.db.get_token(token_id)
+        if token is None:
+            raise ValueError(f"Token {token_id} not found")
+
+        normalized_enabled = bool(enabled)
+        await self.db.update_token(
+            token_id,
+            browser_enabled=normalized_enabled,
+            # Turning a browser off makes the next enable fetch its current
+            # session. Keeping this flag persisted also survives restarts.
+            browser_session_sync_pending=True,
+        )
+        token.browser_enabled = normalized_enabled
+        token.browser_session_sync_pending = True
+        self._proactive_at_retry_after.pop(token_id, None)
+        self._proactive_at_failure_counts.pop(token_id, None)
+
+        connected = False
+        if config.captcha_method == "extension":
+            from .browser_captcha_extension import ExtensionCaptchaService
+
+            service = await ExtensionCaptchaService.get_instance(self.db)
+            await service.set_route_enabled(token.extension_route_key or "", normalized_enabled)
+            connected = service.has_connection_for_route_key(token.extension_route_key or "")
+        return token, connected
+
+    async def sync_extension_browser_session(self, token_id: int) -> bool:
+        """Fetch the enabled profile's current ST and exchange it for a verified AT."""
+        refresh_lock = await self._get_token_lock(
+            self._refresh_locks,
+            self._refresh_lock_guard,
+            token_id,
+        )
+        async with refresh_lock:
+            token = await self.db.get_token(token_id)
+            if token is None or not token.browser_enabled:
+                return False
+            if not token.browser_session_sync_pending:
+                return True
+
+            try:
+                from .browser_captcha_extension import ExtensionCaptchaService
+
+                service = await ExtensionCaptchaService.get_instance(self.db)
+                project_id = str(token.current_project_id or "").strip()
+                if project_id:
+                    try:
+                        await service.get_token_bundle(
+                            project_id,
+                            action="IMAGE_GENERATION",
+                            timeout=30,
+                            token_id=token_id,
+                        )
+                    except Exception as e:
+                        debug_logger.log_warning(
+                            f"[BROWSER_SYNC] Token {token_id}: session warmup failed - {e}"
+                        )
+
+                session_token = await service.get_session_token(token_id, timeout=15)
+                if not session_token:
+                    await self._record_extension_st_refresh_failure(
+                        token_id,
+                        "enabled browser did not return a session cookie",
+                    )
+                    return False
+
+                await self.db.update_token(
+                    token_id,
+                    st=session_token,
+                    last_st_refresh_at=datetime.now(timezone.utc),
+                    last_st_refresh_result="success: browser enabled",
+                )
+                token.st = session_token
+                record_token_refresh("st", "success")
+
+                refreshed = await self._do_refresh_at(token_id, session_token, token)
+                if not refreshed:
+                    await self._record_extension_st_refresh_failure(
+                        token_id,
+                        "browser session did not produce a valid access token",
+                    )
+                    return False
+
+                await self.db.update_token(
+                    token_id,
+                    browser_session_sync_pending=False,
+                    last_st_refresh_result="success: browser session synchronized",
+                )
+                self._proactive_at_retry_after.pop(token_id, None)
+                self._proactive_at_failure_counts.pop(token_id, None)
+                debug_logger.log_info(
+                    f"[BROWSER_SYNC] Token {token_id}: browser ST/AT synchronized"
+                )
+                return True
+            except Exception as e:
+                await self._record_extension_st_refresh_failure(token_id, str(e))
+                return False
+
+    async def handle_extension_route_connected(self, route_key: str) -> None:
+        """Complete a pending session sync when an enabled Chrome profile reconnects."""
+        token = await self.db.get_token_by_extension_route_key(route_key)
+        if (
+            token is None
+            or not token.browser_enabled
+            or not token.browser_session_sync_pending
+            or not token.id
+        ):
+            return
+        await self.sync_extension_browser_session(token.id)
+
     async def update_captcha_circuit(
         self,
         token_id: int,
@@ -325,6 +437,7 @@ class TokenManager:
         video_concurrency: int = -1,
         captcha_proxy_url: Optional[str] = None,
         extension_route_key: Optional[str] = None,
+        browser_enabled: bool = True,
         protocol_mode: str = "session",
         google_cookies: Optional[str] = None,
         login_account: Optional[str] = None,
@@ -408,6 +521,8 @@ class TokenManager:
             video_concurrency=video_concurrency,
             captcha_proxy_url=captcha_proxy_url,
             extension_route_key=extension_route_key,
+            browser_enabled=bool(browser_enabled),
+            browser_session_sync_pending=not bool(browser_enabled),
             protocol_mode=self._normalize_protocol_mode(protocol_mode),
             google_cookies=(google_cookies or "").strip(),
             login_account=(login_account or "").strip(),
@@ -419,6 +534,12 @@ class TokenManager:
 
         token_id = await self.db.add_token(token)
         token.id = token_id
+
+        if config.captcha_method == "extension" and token.extension_route_key:
+            from .browser_captcha_extension import ExtensionCaptchaService
+
+            service = await ExtensionCaptchaService.get_instance(self.db)
+            await service.set_route_enabled(token.extension_route_key, token.browser_enabled)
 
         pooled_projects[0].token_id = token_id
         pooled_projects[0].id = await self.db.add_project(pooled_projects[0])
@@ -446,6 +567,7 @@ class TokenManager:
         video_concurrency: Optional[int] = None,
         captcha_proxy_url: Optional[str] = None,
         extension_route_key: Optional[str] = None,
+        browser_enabled: Optional[bool] = None,
         protocol_mode: Optional[str] = None,
         google_cookies: Optional[str] = None,
         login_account: Optional[str] = None,
@@ -485,6 +607,8 @@ class TokenManager:
             update_fields["captcha_proxy_url"] = captcha_proxy_url
         if extension_route_key is not None:
             update_fields["extension_route_key"] = extension_route_key
+        if browser_enabled is not None:
+            update_fields["browser_enabled"] = bool(browser_enabled)
         if protocol_mode is not None:
             update_fields["protocol_mode"] = self._normalize_protocol_mode(protocol_mode)
         if google_cookies is not None:
@@ -502,6 +626,13 @@ class TokenManager:
 
         # 检查token是否因429被禁用，如果是且未过期，则清空429状态
         token = await self.db.get_token(token_id)
+        browser_state_changed = bool(
+            browser_enabled is not None
+            and token is not None
+            and token.browser_enabled != bool(browser_enabled)
+        )
+        if browser_state_changed:
+            update_fields["browser_session_sync_pending"] = True
         if credential_updated and token and not token.is_active:
             debug_logger.log_info(f"[UPDATE_TOKEN] Token {token_id} 已更新凭证，自动恢复为启用状态")
             update_fields["is_active"] = True
@@ -529,6 +660,13 @@ class TokenManager:
             if credential_updated:
                 self._clear_at_validation_cache(token_id)
             await self.db.update_token(token_id, **update_fields)
+
+            if browser_state_changed and config.captcha_method == "extension" and token:
+                from .browser_captcha_extension import ExtensionCaptchaService
+
+                service = await ExtensionCaptchaService.get_instance(self.db)
+                route_key = extension_route_key if extension_route_key is not None else token.extension_route_key
+                await service.set_route_enabled(route_key or "", bool(browser_enabled))
 
     # ========== AT自动刷新逻辑 (核心) ==========
 
@@ -1021,8 +1159,13 @@ class TokenManager:
             return False
         if not token.auto_refresh_enabled:
             return False
+        if not token.browser_enabled:
+            return False
         if self._normalize_protocol_mode(token.protocol_mode) != "session":
             return False
+
+        if token.browser_session_sync_pending:
+            return True
 
         if not (token.at or "").strip():
             return True
@@ -1048,7 +1191,10 @@ class TokenManager:
                 continue
 
             try:
-                refreshed = await self._refresh_at_inner(token.id, disable_on_failure=False)
+                if token.browser_session_sync_pending:
+                    refreshed = await self.sync_extension_browser_session(token.id)
+                else:
+                    refreshed = await self._refresh_at_inner(token.id, disable_on_failure=False)
             except Exception as e:
                 refreshed = False
                 debug_logger.log_error(

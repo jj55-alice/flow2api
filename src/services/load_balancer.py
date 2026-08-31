@@ -309,6 +309,9 @@ class LoadBalancer:
         required_tier = get_required_paygate_tier_for_model(model)
 
         for token in active_tokens:
+            if config.captcha_method == "extension" and not token.browser_enabled:
+                filtered_reasons[token.id] = "브라우저 사용이 수동으로 꺼져 있음"
+                continue
             normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
             if model and not supports_model_for_tier(model, normalized_tier):
                 filtered_reasons[token.id] = '账号等级不足，需要 ' + get_paygate_tier_label(required_tier)
@@ -461,6 +464,8 @@ class LoadBalancer:
         required_tier = get_required_paygate_tier_for_model(model)
         supported_tokens = []
         for token in active_tokens:
+            if config.captcha_method == "extension" and not token.browser_enabled:
+                continue
             normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
             if model and not supports_model_for_tier(model, normalized_tier):
                 continue

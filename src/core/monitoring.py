@@ -533,9 +533,13 @@ async def build_public_health_snapshot(db: Any) -> dict[str, Any]:
     banned_429_tokens = 0
     captcha_cooling_tokens = 0
     extension_connected_tokens = 0
+    browser_enabled_tokens = 0
 
     for row in rows:
         is_active = bool(row.get("is_active"))
+        browser_enabled = bool(row.get("browser_enabled", True))
+        if browser_enabled:
+            browser_enabled_tokens += 1
         at_value = str(row.get("at") or "").strip()
         if is_active:
             active_tokens += 1
@@ -566,6 +570,7 @@ async def build_public_health_snapshot(db: Any) -> dict[str, Any]:
         capability_enabled = bool(row.get("image_enabled")) or bool(row.get("video_enabled"))
         if (
             is_active
+            and browser_enabled
             and bool(at_value)
             and not at_expired
             and not captcha_cooling
@@ -586,6 +591,7 @@ async def build_public_health_snapshot(db: Any) -> dict[str, Any]:
         "available_tokens": available_tokens,
         "captcha_cooling_tokens": captcha_cooling_tokens,
         "extension_connected_tokens": extension_connected_tokens,
+        "browser_enabled_tokens": browser_enabled_tokens,
         "tokens_missing_at": missing_at_tokens,
         "tokens_expired": expired_tokens,
         "tokens_expiring_within_1h": expiring_soon_tokens,

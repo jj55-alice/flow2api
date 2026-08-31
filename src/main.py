@@ -173,6 +173,19 @@ async def lifespan(app: FastAPI):
         browser_service = await BrowserCaptchaService.get_instance(db)
         await browser_service.warmup_browser_slots()
         print("Browser captcha service initialized (headed mode)")
+    elif captcha_config.captcha_method == "extension":
+        from .services.browser_captcha_extension import ExtensionCaptchaService
+
+        extension_service = await ExtensionCaptchaService.get_instance(db)
+        extension_service.configure_route_states(tokens)
+        extension_service.set_route_connected_callback(
+            token_manager.handle_extension_route_connected
+        )
+        enabled_routes = sum(1 for token in tokens if token.browser_enabled)
+        print(
+            f"Extension browser routes initialized "
+            f"({enabled_routes}/{len(tokens)} enabled)"
+        )
 
     # Initialize concurrency manager
     await concurrency_manager.initialize(tokens)

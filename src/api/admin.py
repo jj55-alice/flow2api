@@ -151,8 +151,11 @@ async def _annotate_token_runtime_status(rows: List[Dict[str, Any]]) -> List[Dic
             extension_connected = extension_service.has_connection_for_route_key(route_key)
 
         capability_enabled = bool(row.get("image_enabled")) or bool(row.get("video_enabled"))
+        browser_enabled = bool(row.get("browser_enabled", True))
+        browser_sync_pending = bool(row.get("browser_session_sync_pending", False))
         is_available = (
             bool(row.get("is_active"))
+            and browser_enabled
             and bool(at_value)
             and not at_expired
             and not cooling
@@ -162,6 +165,10 @@ async def _annotate_token_runtime_status(rows: List[Dict[str, Any]]) -> List[Dic
 
         if not bool(row.get("is_active")):
             availability_status = "inactive"
+        elif not browser_enabled:
+            availability_status = "browser_paused"
+        elif browser_sync_pending:
+            availability_status = "browser_syncing"
         elif not at_value:
             availability_status = "at_missing"
         elif at_expired:
@@ -186,6 +193,8 @@ async def _annotate_token_runtime_status(rows: List[Dict[str, Any]]) -> List[Dic
             "captcha_cooldown_stage": min(3, failure_count) if failure_count else 0,
             "captcha_cooling": cooling,
             "extension_connected": extension_connected,
+            "browser_enabled": browser_enabled,
+            "browser_session_sync_pending": browser_sync_pending,
             "is_available": is_available,
             "availability_status": availability_status,
         })
@@ -649,6 +658,7 @@ class AddTokenRequest(BaseModel):
     remark: Optional[str] = None
     captcha_proxy_url: Optional[str] = None
     extension_route_key: Optional[str] = None
+    browser_enabled: bool = True
     image_enabled: bool = True
     video_enabled: bool = True
     image_concurrency: int = -1
@@ -669,6 +679,7 @@ class UpdateTokenRequest(BaseModel):
     remark: Optional[str] = None
     captcha_proxy_url: Optional[str] = None
     extension_route_key: Optional[str] = None
+    browser_enabled: Optional[bool] = None
     image_enabled: Optional[bool] = None
     video_enabled: Optional[bool] = None
     image_concurrency: Optional[int] = None
@@ -744,6 +755,7 @@ class ImportTokenItem(BaseModel):
     is_active: bool = True
     captcha_proxy_url: Optional[str] = None
     extension_route_key: Optional[str] = None
+    browser_enabled: Optional[bool] = None
     image_enabled: bool = True
     video_enabled: bool = True
     image_concurrency: int = -1
@@ -765,6 +777,10 @@ class ImportTokensRequest(BaseModel):
 class TokenRefreshConfigRequest(BaseModel):
     enabled: Optional[bool] = None
     refresh_interval_minutes: Optional[int] = None
+
+
+class BrowserConnectionRequest(BaseModel):
+    enabled: bool
 
 
 # ========== Auth Middleware ==========
@@ -897,6 +913,8 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
         "current_project_name": row.get("current_project_name"),  # 🆕 项目名称
         "captcha_proxy_url": row.get("captcha_proxy_url") or "",
         "extension_route_key": row.get("extension_route_key") or "",
+        "browser_enabled": bool(row.get("browser_enabled", True)),
+        "browser_session_sync_pending": bool(row.get("browser_session_sync_pending", False)),
         "protocol_mode": row.get("protocol_mode") or "session",
         "google_cookies": row.get("google_cookies") or "",
         "login_account": row.get("login_account") or "",
@@ -944,6 +962,7 @@ async def add_token(
             remark=request.remark,
             captcha_proxy_url=request.captcha_proxy_url.strip() if request.captcha_proxy_url is not None else None,
             extension_route_key=request.extension_route_key.strip() if request.extension_route_key is not None else None,
+            browser_enabled=request.browser_enabled,
             image_enabled=request.image_enabled,
             video_enabled=request.video_enabled,
             image_concurrency=request.image_concurrency,
@@ -1015,6 +1034,7 @@ async def update_token(
             remark=request.remark,
             captcha_proxy_url=request.captcha_proxy_url.strip() if request.captcha_proxy_url is not None else None,
             extension_route_key=request.extension_route_key.strip() if request.extension_route_key is not None else None,
+            browser_enabled=request.browser_enabled,
             image_enabled=request.image_enabled,
             video_enabled=request.video_enabled,
             image_concurrency=request.image_concurrency,
@@ -1076,6 +1096,37 @@ async def disable_token(
     """Disable token"""
     await token_manager.disable_token(token_id)
     return {"success": True, "message": "Token已禁用"}
+
+
+@router.put("/api/tokens/{token_id}/browser-connection")
+async def set_browser_connection(
+    token_id: int,
+    request: BrowserConnectionRequest,
+    token: str = Depends(verify_admin_token),
+):
+    """Manually include or park one extension-backed browser account."""
+    try:
+        updated_token, connected = await token_manager.set_browser_connection_enabled(
+            token_id,
+            request.enabled,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    if request.enabled and connected:
+        message = "브라우저 사용을 켰습니다. 현재 세션을 동기화하고 있습니다."
+    elif request.enabled:
+        message = "브라우저 사용을 켰습니다. 해당 Chrome 프로필이 연결되면 세션을 자동으로 가져옵니다."
+    else:
+        message = "브라우저 사용을 껐습니다. 이 계정은 작업과 자동갱신에서 제외됩니다."
+
+    return {
+        "success": True,
+        "message": message,
+        "browser_enabled": bool(updated_token.browser_enabled),
+        "extension_connected": bool(connected),
+        "session_sync_pending": bool(updated_token.browser_session_sync_pending),
+    }
 
 
 @router.post("/api/tokens/{token_id}/refresh-credits")
@@ -1226,6 +1277,7 @@ async def import_tokens(
                         at_expires=at_expires,
                         captcha_proxy_url=item.captcha_proxy_url.strip() if item.captcha_proxy_url is not None else None,
                         extension_route_key=item.extension_route_key.strip() if item.extension_route_key is not None else None,
+                        browser_enabled=item.browser_enabled,
                         image_enabled=item.image_enabled,
                         video_enabled=item.video_enabled,
                         image_concurrency=item.image_concurrency,
@@ -1247,6 +1299,8 @@ async def import_tokens(
                     existing.at_expires = at_expires
                     existing.captcha_proxy_url = item.captcha_proxy_url
                     existing.extension_route_key = item.extension_route_key
+                    if item.browser_enabled is not None:
+                        existing.browser_enabled = item.browser_enabled
                     existing.image_enabled = item.image_enabled
                     existing.video_enabled = item.video_enabled
                     existing.image_concurrency = item.image_concurrency
@@ -1265,6 +1319,7 @@ async def import_tokens(
                         st=st,
                         captcha_proxy_url=item.captcha_proxy_url.strip() if item.captcha_proxy_url is not None else None,
                         extension_route_key=item.extension_route_key.strip() if item.extension_route_key is not None else None,
+                        browser_enabled=True if item.browser_enabled is None else item.browser_enabled,
                         image_enabled=item.image_enabled,
                         video_enabled=item.video_enabled,
                         image_concurrency=item.image_concurrency,

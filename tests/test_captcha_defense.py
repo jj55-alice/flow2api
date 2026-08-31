@@ -252,6 +252,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
         self.original = dict(self.captcha_config)
         self.captcha_config["extension_route_min_interval_seconds"] = 0.05
         self.captcha_config["extension_global_min_interval_seconds"] = 0.0
+        self.captcha_config["captcha_method"] = "extension"
 
     async def asyncTearDown(self):
         self.captcha_config.clear()
@@ -295,6 +296,42 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bundle["token"], "captcha-1")
         self.assertIn("Chrome/150", bundle["fingerprint"]["user_agent"])
         self.assertEqual(bundle["fingerprint"]["sec_ch_ua_platform"], '"macOS"')
+
+    async def test_disabled_browser_route_is_logically_disconnected(self):
+        service = ExtensionCaptchaService(db=_RouteDbStub())
+        websocket = _ImmediateExtensionSocket(service)
+        service.active_connections.append(
+            ExtensionConnection(websocket=websocket, route_key="google-1")
+        )
+        service.configure_route_states([
+            SimpleNamespace(extension_route_key="google-1", browser_enabled=False),
+        ])
+
+        self.assertFalse(service.has_connection_for_route_key("google-1"))
+        with self.assertRaisesRegex(RuntimeError, "No Chrome Extension connection"):
+            await service.get_token_bundle("project-a", token_id=1)
+
+        await service.set_route_enabled("google-1", True)
+        self.assertTrue(service.has_connection_for_route_key("google-1"))
+
+    async def test_load_balancer_skips_manually_paused_browser(self):
+        paused = Token(
+            id=1,
+            st="st-1",
+            at="at-1",
+            email="paused@example.com",
+            browser_enabled=False,
+        )
+        enabled = Token(
+            id=2,
+            st="st-2",
+            at="at-2",
+            email="enabled@example.com",
+            browser_enabled=True,
+        )
+        selected = await LoadBalancer(_TokenManagerStub([paused, enabled])).select_token()
+
+        self.assertEqual(selected.id, 2)
 
 
 class RecaptchaRetryBudgetTests(unittest.TestCase):
