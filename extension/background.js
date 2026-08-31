@@ -1,6 +1,7 @@
 let ws = null;
 let reconnectTimeout = null;
 let heartbeatInterval = null;
+let routeEnabled = true;
 
 const DEFAULT_SETTINGS = {
     serverUrl: "ws://127.0.0.1:8000/captcha_ws",
@@ -176,9 +177,13 @@ async function connectWS() {
         }
 
         if (data.type === "connection_state") {
-            if (data.enabled === false) {
+            routeEnabled = data.enabled !== false;
+            if (!routeEnabled) {
                 console.log("[Flow2API] Browser route paused by dashboard; closing Flow tabs.");
                 await closeFlowTabs();
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    ws.close(4001, "browser route paused");
+                }
             } else {
                 console.log("[Flow2API] Browser route enabled by dashboard.");
             }
@@ -198,12 +203,16 @@ async function connectWS() {
         }
     };
 
-    ws.onclose = () => {
-        console.log("[Flow2API] WebSocket Closed. Reconnecting in 2s...");
+    ws.onclose = (event) => {
+        if (event && event.code === 4001) {
+            routeEnabled = false;
+        }
+        const reconnectDelay = routeEnabled ? 2000 : 10000;
+        console.log(`[Flow2API] WebSocket Closed. Reconnecting in ${reconnectDelay / 1000}s...`);
         ws = null;
         if (heartbeatInterval) clearInterval(heartbeatInterval);
         if (reconnectTimeout) clearTimeout(reconnectTimeout);
-        reconnectTimeout = setTimeout(connectWS, 2000);
+        reconnectTimeout = setTimeout(connectWS, reconnectDelay);
     };
 
     ws.onerror = (e) => {
@@ -387,6 +396,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName !== "local") return;
     if (changes.routeKey || changes.serverUrl || changes.apiKey || changes.clientLabel) {
         console.log("[Flow2API] Extension settings changed, reconnecting WebSocket...");
+        routeEnabled = true;
         closeSocket();
         connectWS();
     }

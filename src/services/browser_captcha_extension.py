@@ -49,7 +49,7 @@ class ExtensionCaptchaService:
             cls._instance.db = db
         return cls._instance
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, websocket: WebSocket) -> bool:
         await websocket.accept()
         conn = ExtensionConnection(
             websocket=websocket,
@@ -62,7 +62,11 @@ class ExtensionCaptchaService:
             f"route_key={conn.route_key or '-'}, label={conn.client_label or '-'}"
         )
         await self._send_connection_state(conn)
+        if not self.is_route_enabled(conn.route_key):
+            await self._close_connection(websocket)
+            return False
         self._notify_route_connected(conn)
+        return True
 
     def disconnect(self, websocket: WebSocket):
         for conn in list(self.active_connections):
@@ -72,6 +76,11 @@ class ExtensionCaptchaService:
                     f"[Extension Captcha] Client disconnected. Total: {len(self.active_connections)}, "
                     f"route_key={conn.route_key or '-'}, label={conn.client_label or '-'}"
                 )
+                for req_id, (future, owner_websocket) in list(self.pending_requests.items()):
+                    if owner_websocket is websocket:
+                        self.pending_requests.pop(req_id, None)
+                        if not future.done():
+                            future.set_exception(RuntimeError("Chrome Extension disconnected"))
                 return
 
     def _find_connection(self, websocket: WebSocket) -> Optional[ExtensionConnection]:
@@ -79,6 +88,16 @@ class ExtensionCaptchaService:
             if conn.websocket is websocket:
                 return conn
         return None
+
+    async def _close_connection(self, websocket: WebSocket) -> None:
+        try:
+            await websocket.close(code=4001)
+        except Exception:
+            # The extension may close immediately after receiving the paused
+            # state, so cleanup must not depend on which side wins that race.
+            pass
+        finally:
+            self.disconnect(websocket)
 
     def _select_raw_connection(self, route_key: str) -> Optional[ExtensionConnection]:
         normalized_key = (route_key or "").strip()
@@ -130,11 +149,16 @@ class ExtensionCaptchaService:
         else:
             self._disabled_route_keys.add(normalized_key)
 
-        conn = self._select_raw_connection(normalized_key)
-        if conn is not None:
+        matching_connections = [
+            conn for conn in list(self.active_connections)
+            if conn.route_key == normalized_key
+        ]
+        for conn in matching_connections:
             await self._send_connection_state(conn)
             if enabled:
                 self._notify_route_connected(conn, force=True)
+            else:
+                await self._close_connection(conn.websocket)
 
     async def _send_connection_state(self, conn: ExtensionConnection) -> None:
         await self._send_ack(
@@ -258,6 +282,9 @@ class ExtensionCaptchaService:
                         },
                     )
                     await self._send_connection_state(conn)
+                    if not self.is_route_enabled(conn.route_key):
+                        await self._close_connection(websocket)
+                        return
                     self._notify_route_connected(conn)
                 return
 

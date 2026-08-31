@@ -64,6 +64,7 @@ class _ImmediateExtensionSocket:
     def __init__(self, service):
         self.service = service
         self.dispatch_times = []
+        self.closed_codes = []
 
     async def send_text(self, data):
         payload = json.loads(data)
@@ -94,6 +95,19 @@ class _ImmediateExtensionSocket:
                 },
             }),
         )
+
+    async def close(self, code=1000):
+        self.closed_codes.append(code)
+
+
+class _ConnectExtensionSocket(_ImmediateExtensionSocket):
+    def __init__(self, service, route_key):
+        super().__init__(service)
+        self.query_params = {"route_key": route_key, "client_label": "test-profile"}
+        self.accepted = False
+
+    async def accept(self):
+        self.accepted = True
 
 
 class CaptchaCircuitBreakerTests(unittest.IsolatedAsyncioTestCase):
@@ -313,6 +327,32 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
 
         await service.set_route_enabled("google-1", True)
         self.assertTrue(service.has_connection_for_route_key("google-1"))
+
+    async def test_turning_browser_off_closes_its_extension_connection(self):
+        service = ExtensionCaptchaService(db=_RouteDbStub())
+        websocket = _ImmediateExtensionSocket(service)
+        service.active_connections.append(
+            ExtensionConnection(websocket=websocket, route_key="google-1")
+        )
+
+        await service.set_route_enabled("google-1", False)
+
+        self.assertEqual(websocket.closed_codes, [4001])
+        self.assertFalse(service.active_connections)
+
+    async def test_disabled_route_is_rejected_during_websocket_connect(self):
+        service = ExtensionCaptchaService(db=_RouteDbStub())
+        service.configure_route_states([
+            SimpleNamespace(extension_route_key="google-1", browser_enabled=False),
+        ])
+        websocket = _ConnectExtensionSocket(service, "google-1")
+
+        connected = await service.connect(websocket)
+
+        self.assertFalse(connected)
+        self.assertTrue(websocket.accepted)
+        self.assertEqual(websocket.closed_codes, [4001])
+        self.assertFalse(service.active_connections)
 
     async def test_load_balancer_skips_manually_paused_browser(self):
         paused = Token(
