@@ -4,6 +4,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Iterable, Optional
+from urllib.parse import urlparse
 
 from fastapi import WebSocket
 
@@ -16,6 +17,7 @@ class ExtensionConnection:
     websocket: WebSocket
     route_key: str = ""
     client_label: str = ""
+    extension_version: str = ""
     fingerprint: Dict[str, str] = field(default_factory=dict)
     connected_at: float = field(default_factory=time.time)
     notified_route_key: str = ""
@@ -200,6 +202,16 @@ class ExtensionCaptchaService:
             labels.append(label)
         return ", ".join(labels)
 
+    @staticmethod
+    def _supports_browser_submit(extension_version: str) -> bool:
+        try:
+            version_parts = tuple(
+                int(part) for part in str(extension_version or "").split(".")[:3]
+            )
+        except (TypeError, ValueError):
+            return False
+        return (version_parts + (0, 0, 0))[:3] >= (1, 2, 0)
+
     def describe_routes(self) -> str:
         return self._describe_routes()
 
@@ -264,12 +276,16 @@ class ExtensionCaptchaService:
                 if conn:
                     conn.route_key = (payload.get("route_key") or conn.route_key or "").strip()
                     conn.client_label = (payload.get("client_label") or conn.client_label or "").strip()
+                    conn.extension_version = str(
+                        payload.get("extension_version") or conn.extension_version or ""
+                    ).strip()[:32]
                     registered_fingerprint = self._normalize_fingerprint(payload.get("fingerprint"))
                     if registered_fingerprint:
                         conn.fingerprint = registered_fingerprint
                     debug_logger.log_info(
                         f"[Extension Captcha] Client registered route_key={conn.route_key or '-'}, "
                         f"label={conn.client_label or '-'}, "
+                        f"version={conn.extension_version or 'legacy'}, "
                         f"fingerprint={'yes' if conn.fingerprint.get('user_agent') else 'no'}"
                     )
                     await self._send_ack(
@@ -278,6 +294,7 @@ class ExtensionCaptchaService:
                             "type": "register_ack",
                             "route_key": conn.route_key,
                             "client_label": conn.client_label,
+                            "extension_version": conn.extension_version,
                             "browser_enabled": self.is_route_enabled(conn.route_key),
                         },
                     )
@@ -335,7 +352,6 @@ class ExtensionCaptchaService:
                 f"No Chrome Extension connection matches token_id={token_id} route_key='{route_key}'. "
                 f"Available route keys: {available}"
             )
-
         route_guard_key = route_key or "(empty)"
         route_lock = self._route_locks.setdefault(route_guard_key, asyncio.Lock())
 
@@ -387,7 +403,6 @@ class ExtensionCaptchaService:
             conn = self._select_connection(route_key)
             if conn is None:
                 raise RuntimeError(f"Chrome Extension disconnected for route_key='{route_key}'")
-
             req_id = f"req_{uuid.uuid4().hex}"
             future = asyncio.get_running_loop().create_future()
             self.pending_requests[req_id] = (future, conn.websocket)
@@ -417,6 +432,135 @@ class ExtensionCaptchaService:
             except asyncio.TimeoutError:
                 debug_logger.log_warning("[Extension Captcha] Session cookie request timed out")
                 return None
+            finally:
+                self.pending_requests.pop(req_id, None)
+
+    async def submit_flow_request(
+        self,
+        *,
+        project_id: str,
+        action: str,
+        token_id: Optional[int],
+        url: str,
+        at_token: str,
+        json_data: Dict[str, Any],
+        timeout: int,
+    ) -> Dict[str, Any]:
+        """Solve and submit one Flow request inside the mapped Chrome profile.
+
+        reCAPTCHA Enterprise evaluates more than the token itself. Keeping the
+        solve and the API fetch in the same real Flow page preserves the Chrome
+        network stack, cookies, origin, IP, and client hints as one context.
+        """
+        parsed_url = urlparse(str(url or ""))
+        if (
+            parsed_url.scheme.lower() != "https"
+            or parsed_url.netloc.lower() != "aisandbox-pa.googleapis.com"
+            or not parsed_url.path.startswith("/v1/")
+        ):
+            raise ValueError("Extension Flow submit only allows the Google Flow v1 API")
+        if not isinstance(json_data, dict):
+            raise ValueError("Extension Flow submit requires a JSON object body")
+        if not str(at_token or "").strip():
+            raise ValueError("Extension Flow submit requires an access token")
+
+        route_key = await self._resolve_route_key(token_id)
+        conn = self._select_connection(route_key)
+        if conn is None:
+            available = self._describe_routes() or "none"
+            raise RuntimeError(
+                f"No Chrome Extension connection matches token_id={token_id} route_key='{route_key}'. "
+                f"Available route keys: {available}"
+            )
+        if not self._supports_browser_submit(conn.extension_version):
+            raise RuntimeError(
+                f"Chrome Extension route_key='{route_key}' must be reloaded "
+                f"(connected version: {conn.extension_version or 'legacy'}, required: 1.2.0+)"
+            )
+
+        route_guard_key = route_key or "(empty)"
+        route_lock = self._route_locks.setdefault(route_guard_key, asyncio.Lock())
+        async with route_lock:
+            min_interval = config.extension_route_min_interval_seconds
+            last_dispatch_at = self._route_last_dispatch_at.get(route_guard_key, 0.0)
+            wait_seconds = max(0.0, min_interval - (time.monotonic() - last_dispatch_at))
+            if wait_seconds > 0:
+                debug_logger.log_info(
+                    f"[Extension Captcha] Throttling browser submit route_key={route_key or '-'} "
+                    f"for {wait_seconds:.2f}s"
+                )
+                await asyncio.sleep(wait_seconds)
+
+            conn = self._select_connection(route_key)
+            if conn is None:
+                raise RuntimeError(f"Chrome Extension disconnected for route_key='{route_key}'")
+            if not self._supports_browser_submit(conn.extension_version):
+                raise RuntimeError(
+                    f"Chrome Extension route_key='{route_key}' must be reloaded "
+                    f"(connected version: {conn.extension_version or 'legacy'}, required: 1.2.0+)"
+                )
+
+            req_id = f"req_{uuid.uuid4().hex}"
+            future = asyncio.get_running_loop().create_future()
+            self.pending_requests[req_id] = (future, conn.websocket)
+            try:
+                async with self._global_dispatch_lock:
+                    global_interval = config.extension_global_min_interval_seconds
+                    global_wait = max(
+                        0.0,
+                        global_interval - (time.monotonic() - self._global_last_dispatch_at),
+                    )
+                    if global_wait > 0:
+                        await asyncio.sleep(global_wait)
+                    self._global_last_dispatch_at = time.monotonic()
+
+                request_data = {
+                    "type": "submit_flow_request",
+                    "req_id": req_id,
+                    "route_key": route_key,
+                    "project_id": str(project_id or "").strip(),
+                    "action": str(action or "IMAGE_GENERATION").strip(),
+                    "url": url,
+                    "access_token": at_token,
+                    "body": json_data,
+                    "timeout_ms": max(5000, int(timeout * 1000)),
+                }
+                debug_logger.log_info(
+                    f"[Extension Captcha] Dispatching browser Flow submit via "
+                    f"route_key={route_key or '-'}, project_id={project_id}, action={action}"
+                )
+                self._route_last_dispatch_at[route_guard_key] = time.monotonic()
+                await conn.websocket.send_text(json.dumps(request_data))
+                result = await asyncio.wait_for(
+                    future,
+                    timeout=max(60, int(timeout) + 45),
+                )
+
+                if result.get("status") != "success":
+                    error_message = str(result.get("error") or "Chrome extension Flow submit failed")
+                    raise RuntimeError(error_message)
+
+                fingerprint = self._normalize_fingerprint(result.get("fingerprint"))
+                if fingerprint:
+                    conn.fingerprint = fingerprint
+                elif conn.fingerprint:
+                    fingerprint = dict(conn.fingerprint)
+
+                try:
+                    http_status = int(result.get("http_status") or 0)
+                except (TypeError, ValueError):
+                    http_status = 0
+                if http_status <= 0:
+                    raise RuntimeError("Chrome extension returned an invalid Flow HTTP status")
+
+                return {
+                    "status": http_status,
+                    "text": str(result.get("response_text") or ""),
+                    "headers": result.get("response_headers") or {},
+                    "fingerprint": fingerprint,
+                }
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError("Chrome extension Flow submit timed out") from exc
             finally:
                 self.pending_requests.pop(req_id, None)
 

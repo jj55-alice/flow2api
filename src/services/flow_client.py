@@ -1042,6 +1042,40 @@ class FlowClient:
         """保留接口形状，当前无需释放任何本地发车状态。"""
         return
 
+    @staticmethod
+    def _decode_browser_flow_response(response_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize a browser/extension fetch response and preserve Flow errors."""
+        status_code = int(response_payload.get("status") or 0)
+        response_text = str(response_payload.get("text") or "")
+        if status_code >= 400:
+            error_reason = f"HTTP Error {status_code}"
+            parsed_body = None
+            try:
+                parsed_body = json.loads(response_text) if response_text else None
+            except Exception:
+                parsed_body = None
+            if isinstance(parsed_body, dict) and "error" in parsed_body:
+                error_info = parsed_body["error"] or {}
+                error_message = error_info.get("message", "")
+                details = error_info.get("details", [])
+                for detail in details or []:
+                    if isinstance(detail, dict) and detail.get("reason"):
+                        error_reason = detail.get("reason")
+                        break
+                if error_message:
+                    error_reason = f"{error_reason}: {error_message}"
+            elif response_text:
+                error_reason = f"HTTP Error {status_code}: {response_text[:200]}"
+            raise Exception(error_reason)
+        if status_code <= 0:
+            raise Exception("Browser Flow submit returned an invalid HTTP status")
+        try:
+            return json.loads(response_text) if response_text else {}
+        except json.JSONDecodeError as exc:
+            raise Exception(
+                f"Browser Flow submit returned invalid JSON: {response_text[:200]}"
+            ) from exc
+
     async def _make_image_generation_request(
         self,
         url: str,
@@ -1100,7 +1134,25 @@ class FlowClient:
                     "used_media_proxy": bool(prefer_media_proxy),
                 }
             try:
-                if config.captcha_method == "browser" and project_id:
+                if config.captcha_method == "extension" and project_id:
+                    from .browser_captcha_extension import ExtensionCaptchaService
+
+                    service = await ExtensionCaptchaService.get_instance(self.db)
+                    response_payload = await service.submit_flow_request(
+                        project_id=project_id,
+                        action="IMAGE_GENERATION",
+                        token_id=token_id,
+                        url=url,
+                        at_token=at,
+                        json_data=json_data,
+                        timeout=request_timeout,
+                    )
+                    response_fingerprint = response_payload.get("fingerprint")
+                    self._set_request_fingerprint(
+                        response_fingerprint if isinstance(response_fingerprint, dict) else None
+                    )
+                    result = self._decode_browser_flow_response(response_payload)
+                elif config.captcha_method == "browser" and project_id:
                     from .browser_captcha import BrowserCaptchaService
 
                     service = await BrowserCaptchaService.get_instance(self.db)
@@ -1115,30 +1167,7 @@ class FlowClient:
                     )
                     self._set_request_fingerprint(fingerprint if fingerprint else None)
 
-                    status_code = int(response_payload.get("status") or 0)
-                    response_text = response_payload.get("text") or ""
-                    if status_code >= 400:
-                        error_reason = f"HTTP Error {status_code}"
-                        parsed_body = None
-                        try:
-                            parsed_body = json.loads(response_text) if response_text else None
-                        except Exception:
-                            parsed_body = None
-                        if isinstance(parsed_body, dict) and "error" in parsed_body:
-                            error_info = parsed_body["error"] or {}
-                            error_message = error_info.get("message", "")
-                            details = error_info.get("details", [])
-                            for detail in details or []:
-                                if isinstance(detail, dict) and detail.get("reason"):
-                                    error_reason = detail.get("reason")
-                                    break
-                            if error_message:
-                                error_reason = f"{error_reason}: {error_message}"
-                        elif response_text:
-                            error_reason = f"HTTP Error {status_code}: {response_text[:200]}"
-                        raise Exception(error_reason)
-
-                    result = json.loads(response_text) if response_text else {}
+                    result = self._decode_browser_flow_response(response_payload)
                 else:
                     result = await self._make_request(
                         method="POST",
@@ -1641,15 +1670,25 @@ class FlowClient:
                 raise last_error
 
             launch_gate_acquired = True
-            try:
-                recaptcha_token, browser_id = await self._get_recaptcha_token(
-                    project_id,
-                    action="IMAGE_GENERATION",
-                    token_id=token_id
-                )
-            finally:
-                if launch_gate_acquired:
-                    await self._release_image_launch_gate(token_id)
+            if config.captcha_method == "extension":
+                # The mapped extension solves reCAPTCHA and performs fetch() in
+                # one real Flow page. A placeholder keeps the payload shape
+                # valid until the extension replaces every token immediately
+                # before submission.
+                recaptcha_token = "__FLOW2API_EXTENSION_BROWSER_SUBMIT__"
+                browser_id = None
+                attempt_trace["captcha_via_browser_submit"] = True
+                await self._release_image_launch_gate(token_id)
+            else:
+                try:
+                    recaptcha_token, browser_id = await self._get_recaptcha_token(
+                        project_id,
+                        action="IMAGE_GENERATION",
+                        token_id=token_id
+                    )
+                finally:
+                    if launch_gate_acquired:
+                        await self._release_image_launch_gate(token_id)
             attempt_trace["recaptcha_ms"] = int((time.time() - recaptcha_started_at) * 1000)
             attempt_trace["recaptcha_ok"] = bool(recaptcha_token)
             if not recaptcha_token:

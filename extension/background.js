@@ -42,6 +42,13 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function sendSocketMessage(payload) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        throw new Error("Flow2API WebSocket is not connected");
+    }
+    ws.send(JSON.stringify(payload));
+}
+
 function buildBrowserFingerprint(browserNavigator = navigator) {
     const languages = Array.from(
         new Set(
@@ -151,6 +158,7 @@ async function connectWS() {
             type: "register",
             route_key: settings.routeKey,
             client_label: settings.clientLabel,
+            extension_version: chrome.runtime.getManifest().version,
             fingerprint: buildBrowserFingerprint()
         }));
         if (heartbeatInterval) clearInterval(heartbeatInterval);
@@ -161,7 +169,7 @@ async function connectWS() {
         }, 20000);
     };
 
-    let tokenQueue = Promise.resolve();
+    let requestQueue = Promise.resolve();
 
     ws.onmessage = async (event) => {
         let data;
@@ -191,14 +199,20 @@ async function connectWS() {
         }
 
         if (data.type === "get_token") {
-            tokenQueue = tokenQueue.then(() => handleGetToken(data)).catch(err => {
+            requestQueue = requestQueue.then(() => handleGetToken(data)).catch(err => {
                 console.error("[Flow2API] Queue Error:", err);
             });
         }
 
         if (data.type === "get_session_cookie") {
-            tokenQueue = tokenQueue.then(() => handleGetSessionCookie(data)).catch(err => {
+            requestQueue = requestQueue.then(() => handleGetSessionCookie(data)).catch(err => {
                 console.error("[Flow2API] Session cookie queue error:", err);
+            });
+        }
+
+        if (data.type === "submit_flow_request") {
+            requestQueue = requestQueue.then(() => handleSubmitFlowRequest(data)).catch(err => {
+                console.error("[Flow2API] Flow submit queue error:", err);
             });
         }
     };
@@ -249,11 +263,196 @@ async function handleGetSessionCookie(data) {
     }
 }
 
+async function handleSubmitFlowRequest(data) {
+    let newTabId = null;
+    try {
+        const targetUrl = new URL(String(data.url || ""));
+        if (
+            targetUrl.protocol !== "https:" ||
+            targetUrl.host !== "aisandbox-pa.googleapis.com" ||
+            !targetUrl.pathname.startsWith("/v1/")
+        ) {
+            throw new Error("Blocked non-Flow browser submit URL");
+        }
+
+        const projectId = String(data.project_id || "").trim();
+        if (!projectId) {
+            throw new Error("Missing Flow project ID");
+        }
+        const flowPageUrl = `https://labs.google/fx/tools/flow/project/${encodeURIComponent(projectId)}`;
+        console.log("[Flow2API] Opening mapped Flow project for browser-side submit...");
+        const newTab = await chrome.tabs.create({ url: flowPageUrl, active: false });
+        newTabId = newTab.id;
+
+        await waitForTabReady(newTabId);
+        await sleep(1200);
+
+        const results = await chrome.scripting.executeScript({
+            target: { tabId: newTabId },
+            world: "MAIN",
+            func: async (action, requestUrl, accessToken, requestBody, timeoutMs) => {
+                const websiteKey = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
+                const browserFingerprint = () => {
+                    const languages = Array.from(
+                        new Set(
+                            (Array.isArray(navigator.languages) ? navigator.languages : [navigator.language])
+                                .map(value => String(value || "").trim())
+                                .filter(Boolean)
+                        )
+                    );
+                    const acceptLanguage = languages
+                        .map((language, index) => index === 0
+                            ? language
+                            : `${language};q=${Math.max(0.1, 1 - (index * 0.1)).toFixed(1)}`)
+                        .join(",");
+                    const userAgentData = navigator.userAgentData;
+                    const brands = Array.isArray(userAgentData?.brands) ? userAgentData.brands : [];
+                    const secChUa = brands
+                        .map(item => {
+                            const brand = String(item?.brand || "").replace(/["\\]/g, "");
+                            const version = String(item?.version || "").replace(/[^0-9.]/g, "");
+                            return brand && version ? `"${brand}";v="${version}"` : "";
+                        })
+                        .filter(Boolean)
+                        .join(", ");
+                    return {
+                        user_agent: String(navigator.userAgent || "").trim(),
+                        language: String(navigator.language || languages[0] || "").trim(),
+                        accept_language: acceptLanguage,
+                        sec_ch_ua: secChUa,
+                        sec_ch_ua_mobile: userAgentData?.mobile ? "?1" : "?0",
+                        sec_ch_ua_platform: userAgentData?.platform
+                            ? JSON.stringify(String(userAgentData.platform))
+                            : ""
+                    };
+                };
+
+                const ensureRecaptcha = () => new Promise((resolve, reject) => {
+                    const finishWhenReady = () => {
+                        try {
+                            grecaptcha.enterprise.ready(resolve);
+                        } catch (error) {
+                            reject(error);
+                        }
+                    };
+                    if (typeof grecaptcha !== "undefined" && grecaptcha.enterprise) {
+                        finishWhenReady();
+                        return;
+                    }
+                    const script = document.createElement("script");
+                    script.src = `https://www.google.com/recaptcha/enterprise.js?render=${websiteKey}`;
+                    script.onload = finishWhenReady;
+                    script.onerror = () => reject(new Error("Failed to load reCAPTCHA Enterprise"));
+                    document.head.appendChild(script);
+                });
+
+                const patchToken = (value, token) => {
+                    if (!value) return;
+                    if (Array.isArray(value)) {
+                        value.forEach(item => patchToken(item, token));
+                        return;
+                    }
+                    if (typeof value !== "object") return;
+                    if (value.recaptchaContext && typeof value.recaptchaContext === "object") {
+                        value.recaptchaContext.token = token;
+                        value.recaptchaContext.applicationType = "RECAPTCHA_APPLICATION_TYPE_WEB";
+                    }
+                    Object.values(value).forEach(item => patchToken(item, token));
+                };
+
+                await ensureRecaptcha();
+                const token = await Promise.race([
+                    grecaptcha.enterprise.execute(websiteKey, { action }),
+                    new Promise((_, reject) => setTimeout(
+                        () => reject(new Error("Timeout generating reCAPTCHA locally")),
+                        25000
+                    )),
+                ]);
+                const body = typeof structuredClone === "function"
+                    ? structuredClone(requestBody)
+                    : JSON.parse(JSON.stringify(requestBody));
+                patchToken(body, token);
+
+                const controller = new AbortController();
+                const abortTimer = setTimeout(() => controller.abort(), Math.max(5000, timeoutMs));
+                try {
+                    const response = await fetch(requestUrl, {
+                        method: "POST",
+                        headers: {
+                            "authorization": `Bearer ${accessToken}`,
+                            "content-type": "text/plain;charset=UTF-8",
+                        },
+                        credentials: "include",
+                        body: JSON.stringify(body),
+                        signal: controller.signal,
+                    });
+                    const responseText = await response.text();
+                    const responseHeaders = {};
+                    response.headers.forEach((value, key) => {
+                        responseHeaders[key] = value;
+                    });
+                    return {
+                        http_status: response.status,
+                        response_text: responseText,
+                        response_headers: responseHeaders,
+                        fingerprint: browserFingerprint(),
+                    };
+                } finally {
+                    clearTimeout(abortTimer);
+                }
+            },
+            args: [
+                String(data.action || "IMAGE_GENERATION"),
+                targetUrl.toString(),
+                String(data.access_token || ""),
+                data.body || {},
+                Math.max(5000, Number(data.timeout_ms || 60000)),
+            ],
+        });
+
+        const result = results && results[0] && results[0].result;
+        if (!result || !Number.isInteger(result.http_status)) {
+            throw new Error("Flow browser submit returned no HTTP response");
+        }
+        sendSocketMessage({
+            req_id: data.req_id,
+            status: "success",
+            http_status: result.http_status,
+            response_text: result.response_text || "",
+            response_headers: result.response_headers || {},
+            fingerprint: result.fingerprint || buildBrowserFingerprint(),
+        });
+    } catch (err) {
+        try {
+            sendSocketMessage({
+                req_id: data.req_id,
+                status: "error",
+                error: err && err.message ? err.message : "Browser-side Flow submit failed",
+            });
+        } catch (socketError) {
+            console.error("[Flow2API] Could not return Flow submit error:", socketError);
+        }
+    } finally {
+        if (newTabId) {
+            try {
+                await chrome.tabs.remove(newTabId);
+                console.log("[Flow2API] Closed temporary Flow submit tab.");
+            } catch (e) {
+                console.log("[Flow2API] Error closing Flow submit tab:", e);
+            }
+        }
+    }
+}
+
 async function handleGetToken(data) {
     let newTabId = null;
     try {
         console.log("[Flow2API] Auto-opening fresh Google Labs tab to avoid token expiry...");
-        const newTab = await chrome.tabs.create({ url: "https://labs.google/fx/tools/flow", active: false });
+        const projectId = String(data.project_id || "").trim();
+        const flowPageUrl = projectId
+            ? `https://labs.google/fx/tools/flow/project/${encodeURIComponent(projectId)}`
+            : "https://labs.google/fx/tools/flow";
+        const newTab = await chrome.tabs.create({ url: flowPageUrl, active: false });
         newTabId = newTab.id;
 
         await waitForTabReady(newTabId);
