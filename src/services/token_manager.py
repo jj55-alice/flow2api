@@ -16,7 +16,8 @@ class TokenManager:
     """Token lifecycle manager with AT auto-refresh"""
 
     _PROACTIVE_AT_REFRESH_WINDOW = timedelta(hours=1)
-    _PROACTIVE_AT_RETRY_DELAY_SECONDS = 600
+    _PROACTIVE_AT_RETRY_BASE_SECONDS = 60
+    _PROACTIVE_AT_RETRY_MAX_SECONDS = 600
 
     def __init__(self, db: Database, flow_client: FlowClient):
         self.db = db
@@ -28,6 +29,7 @@ class TokenManager:
         self._refresh_futures: dict[int, asyncio.Task] = {}
         self._at_validation_cache: dict[int, float] = {}
         self._proactive_at_retry_after: dict[int, float] = {}
+        self._proactive_at_failure_counts: dict[int, int] = {}
         self._protocol_refresher_task: Optional[asyncio.Task] = None
 
     async def _get_token_lock(
@@ -249,6 +251,8 @@ class TokenManager:
                 pass
         self._refresh_locks.pop(token_id, None)
         self._project_locks.pop(token_id, None)
+        self._proactive_at_retry_after.pop(token_id, None)
+        self._proactive_at_failure_counts.pop(token_id, None)
 
         if config.captcha_method == "personal" and project_ids:
             try:
@@ -626,6 +630,11 @@ class TokenManager:
                 result = await self._do_refresh_at(token_id, new_st, latest_token)
                 if result:
                     return True
+                if config.captcha_method == "extension":
+                    await self._record_extension_st_refresh_failure(
+                        token_id,
+                        "refreshed session cookie still returned an expired or invalid access token",
+                    )
 
             if disable_on_failure:
                 debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: all refresh attempts failed, disabling token")
@@ -686,6 +695,13 @@ class TokenManager:
                     new_at_expires = datetime.fromisoformat(expires.replace('Z', '+00:00'))
                 except:
                     pass
+
+            if new_at_expires is not None:
+                normalized_expiry = self._as_utc(new_at_expires)
+                if normalized_expiry is not None and normalized_expiry <= datetime.now(timezone.utc):
+                    raise RuntimeError(
+                        f"ST-to-AT returned an already expired access token ({normalized_expiry.isoformat()})"
+                    )
 
             # 更新数据库
             await self.db.update_token(
@@ -778,6 +794,21 @@ class TokenManager:
             record_token_refresh("st", "failure")
             return None
 
+    async def _record_extension_st_refresh_failure(self, token_id: int, reason: str) -> None:
+        """Persist extension refresh failures so the dashboard can explain retries."""
+        normalized_reason = str(reason or "unknown extension ST refresh failure").strip()
+        try:
+            await self.db.update_token(
+                token_id,
+                last_st_refresh_at=datetime.now(timezone.utc),
+                last_st_refresh_result=f"failure: {normalized_reason}"[:500],
+            )
+        except Exception as e:
+            debug_logger.log_warning(
+                f"[ST_REFRESH] Token {token_id}: failed to persist extension refresh result - {e}"
+            )
+        record_token_refresh("st", "failure")
+
     async def _try_refresh_st(self, token_id: int, token) -> Optional[str]:
         """尝试通过浏览器刷新 Session Token
 
@@ -803,6 +834,26 @@ class TokenManager:
                     from .browser_captcha_extension import ExtensionCaptchaService
                     debug_logger.log_info(f"[ST_REFRESH] extension 模式：从对应 Chrome 配置文件读取 ST...")
                     service = await ExtensionCaptchaService.get_instance(self.db)
+
+                    project_id = str(getattr(token, "current_project_id", "") or "").strip()
+                    if project_id:
+                        try:
+                            # Existing workers open a fresh Labs tab for CAPTCHA
+                            # generation. This lets NextAuth rotate the browser
+                            # session before its cookie is read for AT recovery.
+                            await service.get_token_bundle(
+                                project_id,
+                                action="IMAGE_GENERATION",
+                                timeout=30,
+                                token_id=token_id,
+                            )
+                        except Exception as e:
+                            # Page navigation may have refreshed the cookie even
+                            # when CAPTCHA generation itself failed.
+                            debug_logger.log_warning(
+                                f"[ST_REFRESH] Token {token_id}: extension session warmup failed - {e}"
+                            )
+
                     new_st = await service.get_session_token(token_id, timeout=15)
                     if new_st and new_st != token.st:
                         await self.db.update_token(
@@ -814,8 +865,13 @@ class TokenManager:
                         record_token_refresh("st", "success")
                         debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: extension에서 ST 자동 갱신 성공")
                         return new_st
-                    debug_logger.log_warning(f"[ST_REFRESH] Token {token_id}: extension에서 새 ST를 받지 못함")
-                    record_token_refresh("st", "failure")
+                    reason = (
+                        "extension returned the unchanged session cookie"
+                        if new_st == token.st
+                        else "extension did not return a session cookie"
+                    )
+                    await self._record_extension_st_refresh_failure(token_id, reason)
+                    debug_logger.log_warning(f"[ST_REFRESH] Token {token_id}: {reason}")
                     return None
                 debug_logger.log_info(f"[ST_REFRESH] 非 personal 模式，跳过 ST 自动刷新")
                 return None
@@ -858,7 +914,10 @@ class TokenManager:
 
         except Exception as e:
             debug_logger.log_error(f"[ST_REFRESH] Token {token_id}: 刷新 ST 失败 - {str(e)}")
-            record_token_refresh("st", "failure")
+            if config.captcha_method == "extension":
+                await self._record_extension_st_refresh_failure(token_id, str(e))
+            else:
+                record_token_refresh("st", "failure")
             return None
 
     async def _refresh_protocol_token(self, token: Token, now: datetime) -> None:
@@ -957,7 +1016,7 @@ class TokenManager:
                 debug_logger.log_error(f"[PROTOCOL_REFRESH] Token {getattr(token, 'id', '?')}: 后台刷新异常 - {e}")
 
     def _is_proactive_extension_refresh_due(self, token: Token, now: datetime) -> bool:
-        """Return True only before expiry so already-expired accounts remain manual recovery cases."""
+        """Return whether an extension account needs background AT recovery."""
         if config.captcha_method != "extension":
             return False
         if not token.auto_refresh_enabled:
@@ -965,16 +1024,23 @@ class TokenManager:
         if self._normalize_protocol_mode(token.protocol_mode) != "session":
             return False
 
+        if not (token.at or "").strip():
+            return True
+
         expires_at = self._as_utc(token.at_expires)
-        if expires_at is None or expires_at <= now:
-            return False
+        if expires_at is None:
+            return True
         return expires_at - now <= self._PROACTIVE_AT_REFRESH_WINDOW
 
     async def _refresh_expiring_extension_tokens(self, tokens: List[Token], now: datetime) -> None:
-        """Refresh extension/session ATs before expiry without disabling on transient failure."""
+        """Refresh expiring or expired extension ATs without disabling on transient failure."""
         monotonic_now = time.monotonic()
         for token in tokens:
-            if not token.id or not self._is_proactive_extension_refresh_due(token, now):
+            if not token.id:
+                continue
+            if not self._is_proactive_extension_refresh_due(token, now):
+                self._proactive_at_retry_after.pop(token.id, None)
+                self._proactive_at_failure_counts.pop(token.id, None)
                 continue
 
             retry_after = self._proactive_at_retry_after.get(token.id, 0.0)
@@ -991,12 +1057,20 @@ class TokenManager:
 
             if refreshed:
                 self._proactive_at_retry_after.pop(token.id, None)
+                self._proactive_at_failure_counts.pop(token.id, None)
                 debug_logger.log_info(
                     f"[AT_REFRESH] Token {token.id}: proactive extension AT refresh succeeded"
                 )
             else:
-                self._proactive_at_retry_after[token.id] = (
-                    time.monotonic() + self._PROACTIVE_AT_RETRY_DELAY_SECONDS
+                failure_count = self._proactive_at_failure_counts.get(token.id, 0) + 1
+                self._proactive_at_failure_counts[token.id] = failure_count
+                retry_delay = min(
+                    self._PROACTIVE_AT_RETRY_MAX_SECONDS,
+                    self._PROACTIVE_AT_RETRY_BASE_SECONDS * (2 ** min(failure_count - 1, 4)),
+                )
+                self._proactive_at_retry_after[token.id] = time.monotonic() + retry_delay
+                debug_logger.log_warning(
+                    f"[AT_REFRESH] Token {token.id}: background retry scheduled in {retry_delay}s"
                 )
 
     async def _protocol_refresh_loop(self) -> None:
