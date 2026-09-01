@@ -3,6 +3,9 @@ let reconnectTimeout = null;
 let heartbeatInterval = null;
 let routeEnabled = true;
 
+const RECONNECT_ALARM_NAME = "flow2api-reconnect";
+const RECONNECT_ALARM_PERIOD_MINUTES = 0.5;
+
 const DEFAULT_SETTINGS = {
     serverUrl: "ws://127.0.0.1:8000/captcha_ws",
     apiKey: "",
@@ -40,6 +43,12 @@ function closeSocket() {
 
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function ensureReconnectAlarm() {
+    chrome.alarms.create(RECONNECT_ALARM_NAME, {
+        periodInMinutes: RECONNECT_ALARM_PERIOD_MINUTES
+    });
 }
 
 function sendSocketMessage(payload) {
@@ -221,12 +230,17 @@ async function connectWS() {
         if (event && event.code === 4001) {
             routeEnabled = false;
         }
-        const reconnectDelay = routeEnabled ? 2000 : 10000;
-        console.log(`[Flow2API] WebSocket Closed. Reconnecting in ${reconnectDelay / 1000}s...`);
         ws = null;
         if (heartbeatInterval) clearInterval(heartbeatInterval);
         if (reconnectTimeout) clearTimeout(reconnectTimeout);
-        reconnectTimeout = setTimeout(connectWS, reconnectDelay);
+        reconnectTimeout = null;
+
+        if (routeEnabled) {
+            console.log("[Flow2API] WebSocket Closed. Reconnecting in 2s...");
+            reconnectTimeout = setTimeout(connectWS, 2000);
+        } else {
+            console.log("[Flow2API] Browser route paused. Waiting for the reconnect alarm...");
+        }
     };
 
     ws.onerror = (e) => {
@@ -601,4 +615,24 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
     }
 });
 
+chrome.runtime.onStartup.addListener(() => {
+    console.log("[Flow2API] Chrome started; checking dashboard connection state...");
+    routeEnabled = true;
+    ensureReconnectAlarm();
+    connectWS();
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+    console.log("[Flow2API] Extension installed or updated; starting reconnect monitor...");
+    routeEnabled = true;
+    ensureReconnectAlarm();
+    connectWS();
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name !== RECONNECT_ALARM_NAME) return;
+    connectWS();
+});
+
+ensureReconnectAlarm();
 connectWS();
