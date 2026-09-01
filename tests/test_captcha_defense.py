@@ -447,6 +447,19 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(websocket.closed_codes, [4001])
         self.assertFalse(service.active_connections)
 
+    async def test_new_connection_replaces_duplicate_route_socket(self):
+        service = ExtensionCaptchaService(db=_RouteDbStub())
+        first = _ConnectExtensionSocket(service, "google-1")
+        second = _ConnectExtensionSocket(service, "google-1")
+
+        self.assertTrue(await service.connect(first))
+        self.assertTrue(await service.connect(second))
+
+        self.assertEqual(first.closed_codes, [4002])
+        self.assertEqual(second.closed_codes, [])
+        self.assertEqual(len(service.active_connections), 1)
+        self.assertIs(service.active_connections[0].websocket, second)
+
     async def test_load_balancer_skips_manually_paused_browser(self):
         paused = Token(
             id=1,

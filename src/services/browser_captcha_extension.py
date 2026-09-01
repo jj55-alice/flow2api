@@ -59,6 +59,7 @@ class ExtensionCaptchaService:
             client_label=(websocket.query_params.get("client_label") or "").strip(),
         )
         self.active_connections.append(conn)
+        await self._replace_duplicate_route_connections(conn)
         debug_logger.log_info(
             f"[Extension Captcha] Client connected. Total: {len(self.active_connections)}, "
             f"route_key={conn.route_key or '-'}, label={conn.client_label or '-'}"
@@ -91,15 +92,30 @@ class ExtensionCaptchaService:
                 return conn
         return None
 
-    async def _close_connection(self, websocket: WebSocket) -> None:
+    async def _close_connection(self, websocket: WebSocket, *, code: int = 4001) -> None:
         try:
-            await websocket.close(code=4001)
+            await websocket.close(code=code)
         except Exception:
-            # The extension may close immediately after receiving the paused
-            # state, so cleanup must not depend on which side wins that race.
+            # The extension may close immediately after receiving the state,
+            # so cleanup must not depend on which side wins that race.
             pass
         finally:
             self.disconnect(websocket)
+
+    async def _replace_duplicate_route_connections(self, current: ExtensionConnection) -> None:
+        """Keep only the newest WebSocket for one Chrome/account route."""
+        route_key = str(current.route_key or "").strip()
+        if not route_key:
+            return
+        duplicates = [
+            conn for conn in list(self.active_connections)
+            if conn is not current and conn.route_key == route_key
+        ]
+        for duplicate in duplicates:
+            debug_logger.log_warning(
+                f"[Extension Captcha] Replacing duplicate connection for route_key={route_key}"
+            )
+            await self._close_connection(duplicate.websocket, code=4002)
 
     def _select_raw_connection(self, route_key: str) -> Optional[ExtensionConnection]:
         normalized_key = (route_key or "").strip()
@@ -282,6 +298,7 @@ class ExtensionCaptchaService:
                     registered_fingerprint = self._normalize_fingerprint(payload.get("fingerprint"))
                     if registered_fingerprint:
                         conn.fingerprint = registered_fingerprint
+                    await self._replace_duplicate_route_connections(conn)
                     debug_logger.log_info(
                         f"[Extension Captcha] Client registered route_key={conn.route_key or '-'}, "
                         f"label={conn.client_label or '-'}, "

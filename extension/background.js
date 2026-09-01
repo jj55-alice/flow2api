@@ -1,4 +1,6 @@
 let ws = null;
+let connectPromise = null;
+let connectionGeneration = 0;
 let reconnectTimeout = null;
 let heartbeatInterval = null;
 let routeEnabled = true;
@@ -27,17 +29,20 @@ function getSettings() {
 }
 
 function closeSocket() {
+    connectionGeneration += 1;
+    connectPromise = null;
     if (heartbeatInterval) clearInterval(heartbeatInterval);
     heartbeatInterval = null;
     if (reconnectTimeout) clearTimeout(reconnectTimeout);
     reconnectTimeout = null;
-    if (ws) {
+    const socket = ws;
+    ws = null;
+    if (socket) {
         try {
-            ws.close();
+            socket.close();
         } catch (e) {
             console.log("[Flow2API] Close socket error", e);
         }
-        ws = null;
     }
 }
 
@@ -51,11 +56,11 @@ function ensureReconnectAlarm() {
     });
 }
 
-function sendSocketMessage(payload) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
+function sendSocketMessage(payload, socket = ws) {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
         throw new Error("Flow2API WebSocket is not connected");
     }
-    ws.send(JSON.stringify(payload));
+    socket.send(JSON.stringify(payload));
 }
 
 function buildBrowserFingerprint(browserNavigator = navigator) {
@@ -146,109 +151,135 @@ function closeFlowTabs() {
 
 async function connectWS() {
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+    if (connectPromise) return connectPromise;
 
-    const settings = await getSettings();
-    const url = new URL(settings.serverUrl || DEFAULT_SETTINGS.serverUrl);
-    if (settings.apiKey) {
-        url.searchParams.set("key", settings.apiKey);
-    }
-    if (settings.routeKey) {
-        url.searchParams.set("route_key", settings.routeKey);
-    }
-    if (settings.clientLabel) {
-        url.searchParams.set("client_label", settings.clientLabel);
-    }
+    const generation = connectionGeneration;
+    const attempt = (async () => {
+        const settings = await getSettings();
+        if (generation !== connectionGeneration) return;
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
-    ws = new WebSocket(url.toString());
+        const url = new URL(settings.serverUrl || DEFAULT_SETTINGS.serverUrl);
+        if (settings.apiKey) {
+            url.searchParams.set("key", settings.apiKey);
+        }
+        if (settings.routeKey) {
+            url.searchParams.set("route_key", settings.routeKey);
+        }
+        if (settings.clientLabel) {
+            url.searchParams.set("client_label", settings.clientLabel);
+        }
 
-    ws.onopen = () => {
-        console.log("[Flow2API] Background connected to WebSocket", url.toString());
-        ws.send(JSON.stringify({
-            type: "register",
-            route_key: settings.routeKey,
-            client_label: settings.clientLabel,
-            extension_version: chrome.runtime.getManifest().version,
-            fingerprint: buildBrowserFingerprint()
-        }));
-        if (heartbeatInterval) clearInterval(heartbeatInterval);
-        heartbeatInterval = setInterval(() => {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: "ping" }));
+        const socket = new WebSocket(url.toString());
+        ws = socket;
+
+        socket.onopen = () => {
+            if (ws !== socket) {
+                socket.close(4002, "superseded connection");
+                return;
             }
-        }, 20000);
-    };
-
-    let requestQueue = Promise.resolve();
-
-    ws.onmessage = async (event) => {
-        let data;
-        try {
-            data = JSON.parse(event.data);
-        } catch (e) {
-            return;
-        }
-
-        if (data.type === "register_ack") {
-            console.log("[Flow2API] Registered route key:", data.route_key || "(empty)");
-            return;
-        }
-
-        if (data.type === "connection_state") {
-            routeEnabled = data.enabled !== false;
-            if (!routeEnabled) {
-                console.log("[Flow2API] Browser route paused by dashboard; closing Flow tabs.");
-                await closeFlowTabs();
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    ws.close(4001, "browser route paused");
+            console.log("[Flow2API] Background connected to WebSocket", url.toString());
+            sendSocketMessage({
+                type: "register",
+                route_key: settings.routeKey,
+                client_label: settings.clientLabel,
+                extension_version: chrome.runtime.getManifest().version,
+                fingerprint: buildBrowserFingerprint()
+            }, socket);
+            if (heartbeatInterval) clearInterval(heartbeatInterval);
+            heartbeatInterval = setInterval(() => {
+                if (ws === socket && socket.readyState === WebSocket.OPEN) {
+                    sendSocketMessage({ type: "ping" }, socket);
                 }
-            } else {
-                console.log("[Flow2API] Browser route enabled by dashboard.");
+            }, 20000);
+        };
+
+        let requestQueue = Promise.resolve();
+
+        socket.onmessage = async (event) => {
+            if (ws !== socket) return;
+            let data;
+            try {
+                data = JSON.parse(event.data);
+            } catch (e) {
+                return;
             }
-            return;
-        }
 
-        if (data.type === "get_token") {
-            requestQueue = requestQueue.then(() => handleGetToken(data)).catch(err => {
-                console.error("[Flow2API] Queue Error:", err);
-            });
-        }
+            if (data.type === "register_ack") {
+                console.log("[Flow2API] Registered route key:", data.route_key || "(empty)");
+                return;
+            }
 
-        if (data.type === "get_session_cookie") {
-            requestQueue = requestQueue.then(() => handleGetSessionCookie(data)).catch(err => {
-                console.error("[Flow2API] Session cookie queue error:", err);
-            });
-        }
+            if (data.type === "connection_state") {
+                routeEnabled = data.enabled !== false;
+                if (!routeEnabled) {
+                    console.log("[Flow2API] Browser route paused by dashboard; closing Flow tabs.");
+                    await closeFlowTabs();
+                    if (socket.readyState === WebSocket.OPEN) {
+                        socket.close(4001, "browser route paused");
+                    }
+                } else {
+                    console.log("[Flow2API] Browser route enabled by dashboard.");
+                }
+                return;
+            }
 
-        if (data.type === "submit_flow_request") {
-            requestQueue = requestQueue.then(() => handleSubmitFlowRequest(data)).catch(err => {
-                console.error("[Flow2API] Flow submit queue error:", err);
-            });
-        }
-    };
+            if (data.type === "get_token") {
+                requestQueue = requestQueue.then(() => handleGetToken(data, socket)).catch(err => {
+                    console.error("[Flow2API] Queue Error:", err);
+                });
+            }
 
-    ws.onclose = (event) => {
-        if (event && event.code === 4001) {
-            routeEnabled = false;
-        }
-        ws = null;
-        if (heartbeatInterval) clearInterval(heartbeatInterval);
-        if (reconnectTimeout) clearTimeout(reconnectTimeout);
-        reconnectTimeout = null;
+            if (data.type === "get_session_cookie") {
+                requestQueue = requestQueue.then(() => handleGetSessionCookie(data, socket)).catch(err => {
+                    console.error("[Flow2API] Session cookie queue error:", err);
+                });
+            }
 
-        if (routeEnabled) {
-            console.log("[Flow2API] WebSocket Closed. Reconnecting in 2s...");
-            reconnectTimeout = setTimeout(connectWS, 2000);
-        } else {
-            console.log("[Flow2API] Browser route paused. Waiting for the reconnect alarm...");
-        }
-    };
+            if (data.type === "submit_flow_request") {
+                requestQueue = requestQueue.then(() => handleSubmitFlowRequest(data, socket)).catch(err => {
+                    console.error("[Flow2API] Flow submit queue error:", err);
+                });
+            }
+        };
 
-    ws.onerror = (e) => {
-        console.log("[Flow2API] WebSocket Error", e);
-    };
+        socket.onclose = (event) => {
+            if (ws !== socket) return;
+            if (event && event.code === 4001) {
+                routeEnabled = false;
+            }
+            ws = null;
+            if (heartbeatInterval) clearInterval(heartbeatInterval);
+            heartbeatInterval = null;
+            if (reconnectTimeout) clearTimeout(reconnectTimeout);
+            reconnectTimeout = null;
+
+            if (routeEnabled) {
+                console.log("[Flow2API] WebSocket Closed. Reconnecting in 2s...");
+                reconnectTimeout = setTimeout(connectWS, 2000);
+            } else {
+                console.log("[Flow2API] Browser route paused. Waiting for the reconnect alarm...");
+            }
+        };
+
+        socket.onerror = (e) => {
+            if (ws === socket) {
+                console.log("[Flow2API] WebSocket Error", e);
+            }
+        };
+    })();
+
+    connectPromise = attempt;
+    try {
+        await attempt;
+    } finally {
+        if (connectPromise === attempt) {
+            connectPromise = null;
+        }
+    }
 }
 
-async function handleGetSessionCookie(data) {
+async function handleGetSessionCookie(data, socket) {
     try {
         const cookie = await chrome.cookies.get({
             url: "https://labs.google/fx/tools/flow",
@@ -256,28 +287,28 @@ async function handleGetSessionCookie(data) {
         });
 
         if (cookie && cookie.value) {
-            ws.send(JSON.stringify({
+            sendSocketMessage({
                 req_id: data.req_id,
                 status: "success",
                 session_token: cookie.value
-            }));
+            }, socket);
         } else {
-            ws.send(JSON.stringify({
+            sendSocketMessage({
                 req_id: data.req_id,
                 status: "error",
                 error: "labs.google 세션 쿠키를 찾을 수 없습니다. 이 Chrome 프로필에서 Flow에 로그인되어 있는지 확인하세요."
-            }));
+            }, socket);
         }
     } catch (err) {
-        ws.send(JSON.stringify({
+        sendSocketMessage({
             req_id: data.req_id,
             status: "error",
             error: err.message || "세션 쿠키 읽기 실패"
-        }));
+        }, socket);
     }
 }
 
-async function handleSubmitFlowRequest(data) {
+async function handleSubmitFlowRequest(data, socket) {
     let newTabId = null;
     try {
         const targetUrl = new URL(String(data.url || ""));
@@ -435,14 +466,14 @@ async function handleSubmitFlowRequest(data) {
             response_text: result.response_text || "",
             response_headers: result.response_headers || {},
             fingerprint: result.fingerprint || buildBrowserFingerprint(),
-        });
+        }, socket);
     } catch (err) {
         try {
             sendSocketMessage({
                 req_id: data.req_id,
                 status: "error",
                 error: err && err.message ? err.message : "Browser-side Flow submit failed",
-            });
+            }, socket);
         } catch (socketError) {
             console.error("[Flow2API] Could not return Flow submit error:", socketError);
         }
@@ -458,7 +489,7 @@ async function handleSubmitFlowRequest(data) {
     }
 }
 
-async function handleGetToken(data) {
+async function handleGetToken(data, socket) {
     let newTabId = null;
     try {
         console.log("[Flow2API] Auto-opening fresh Google Labs tab to avoid token expiry...");
@@ -574,25 +605,25 @@ async function handleGetToken(data) {
         }
 
         if (successResponse) {
-            ws.send(JSON.stringify({
+            sendSocketMessage({
                 req_id: data.req_id,
                 status: successResponse.status,
                 token: successResponse.token,
                 fingerprint: successResponse.fingerprint
-            }));
+            }, socket);
         } else {
-            ws.send(JSON.stringify({
+            sendSocketMessage({
                 req_id: data.req_id,
                 status: "error",
                 error: "Extension script failed: " + lastErrorMsg
-            }));
+            }, socket);
         }
     } catch (err) {
-        ws.send(JSON.stringify({
+        sendSocketMessage({
             req_id: data.req_id,
             status: "error",
             error: err.message
-        }));
+        }, socket);
     } finally {
         if (newTabId) {
             try {

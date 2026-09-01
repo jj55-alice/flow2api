@@ -13,7 +13,7 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn("alarms", manifest["permissions"])
         self.assertGreaterEqual(
             tuple(int(part) for part in manifest["version"].split(".")),
-            (1, 2, 1),
+            (1, 2, 2),
         )
 
     def test_worker_reconnects_on_chrome_start_and_alarm(self):
@@ -22,6 +22,9 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn("chrome.runtime.onStartup.addListener", background)
         self.assertIn("chrome.alarms.onAlarm.addListener", background)
         self.assertIn("periodInMinutes: RECONNECT_ALARM_PERIOD_MINUTES", background)
+        self.assertIn("if (connectPromise) return connectPromise", background)
+        self.assertIn("handleGetSessionCookie(data, socket)", background)
+        self.assertIn("sendSocketMessage(payload, socket = ws)", background)
         self.assertIn("connectWS();", background)
 
 
