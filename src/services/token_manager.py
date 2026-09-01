@@ -284,21 +284,41 @@ class TokenManager:
         await self.db.update_token(token_id, is_active=False)
 
     async def set_browser_connection_enabled(self, token_id: int, enabled: bool) -> tuple[Token, bool]:
-        """Persist the manual extension-browser switch and apply it immediately."""
+        """Persist the manual extension-browser switch and apply it immediately.
+
+        The dashboard switch is the operator-facing work/park control for an
+        extension account. Keep the token activity flag in step with it so a
+        connected profile cannot remain unusable, and a parked profile is not
+        counted as an active worker. A 429 safety ban remains authoritative and
+        cannot be cleared by toggling the browser connection.
+        """
         token = await self.db.get_token(token_id)
         if token is None:
             raise ValueError(f"Token {token_id} not found")
 
         normalized_enabled = bool(enabled)
-        await self.db.update_token(
-            token_id,
-            browser_enabled=normalized_enabled,
+        updates: Dict[str, Any] = {
+            "browser_enabled": normalized_enabled,
             # Turning a browser off makes the next enable fetch its current
             # session. Keeping this flag persisted also survives restarts.
-            browser_session_sync_pending=True,
-        )
-        token.browser_enabled = normalized_enabled
-        token.browser_session_sync_pending = True
+            "browser_session_sync_pending": True,
+        }
+        if not normalized_enabled:
+            updates["is_active"] = False
+        elif str(token.ban_reason or "").strip() != "429_rate_limit":
+            updates.update({
+                "is_active": True,
+                "ban_reason": None,
+                "banned_at": None,
+                "captcha_failure_count": 0,
+                "captcha_cooldown_until": None,
+                "captcha_circuit_opened_at": None,
+                "captcha_last_failure_at": None,
+            })
+
+        await self.db.update_token(token_id, **updates)
+        for field, value in updates.items():
+            setattr(token, field, value)
         self._proactive_at_retry_after.pop(token_id, None)
         self._proactive_at_failure_counts.pop(token_id, None)
 

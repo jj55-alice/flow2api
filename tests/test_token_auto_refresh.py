@@ -157,9 +157,62 @@ class ExtensionAtAutoRefreshTests(unittest.IsolatedAsyncioTestCase):
             updated, connected = await manager.set_browser_connection_enabled(1, False)
 
         self.assertFalse(updated.browser_enabled)
+        self.assertFalse(updated.is_active)
         self.assertTrue(updated.browser_session_sync_pending)
         self.assertFalse(connected)
         extension_service.set_route_enabled.assert_awaited_once_with("google-1", False)
+
+    async def test_browser_toggle_on_reactivates_account_and_clears_captcha_state(self):
+        token = self._token(1, datetime.now(timezone.utc) + timedelta(hours=2))
+        token.extension_route_key = "google-1"
+        token.browser_enabled = False
+        token.is_active = False
+        token.captcha_failure_count = 2
+        token.captcha_cooldown_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+        db = _RefreshDbStub([token])
+        manager = TokenManager(db, flow_client=SimpleNamespace())
+        extension_service = SimpleNamespace(
+            set_route_enabled=AsyncMock(),
+            has_connection_for_route_key=Mock(return_value=True),
+        )
+
+        with patch(
+            "src.services.browser_captcha_extension.ExtensionCaptchaService.get_instance",
+            new=AsyncMock(return_value=extension_service),
+        ):
+            updated, connected = await manager.set_browser_connection_enabled(1, True)
+
+        self.assertTrue(updated.browser_enabled)
+        self.assertTrue(updated.is_active)
+        self.assertTrue(updated.browser_session_sync_pending)
+        self.assertEqual(updated.captcha_failure_count, 0)
+        self.assertIsNone(updated.captcha_cooldown_until)
+        self.assertTrue(connected)
+        extension_service.set_route_enabled.assert_awaited_once_with("google-1", True)
+
+    async def test_browser_toggle_on_does_not_bypass_429_ban(self):
+        token = self._token(1, datetime.now(timezone.utc) + timedelta(hours=2))
+        token.extension_route_key = "google-1"
+        token.browser_enabled = False
+        token.is_active = False
+        token.ban_reason = "429_rate_limit"
+        db = _RefreshDbStub([token])
+        manager = TokenManager(db, flow_client=SimpleNamespace())
+        extension_service = SimpleNamespace(
+            set_route_enabled=AsyncMock(),
+            has_connection_for_route_key=Mock(return_value=True),
+        )
+
+        with patch(
+            "src.services.browser_captcha_extension.ExtensionCaptchaService.get_instance",
+            new=AsyncMock(return_value=extension_service),
+        ):
+            updated, connected = await manager.set_browser_connection_enabled(1, True)
+
+        self.assertTrue(updated.browser_enabled)
+        self.assertFalse(updated.is_active)
+        self.assertEqual(updated.ban_reason, "429_rate_limit")
+        self.assertTrue(connected)
 
     async def test_browser_session_sync_refreshes_st_and_at_then_clears_pending(self):
         token = self._token(1, datetime.now(timezone.utc) + timedelta(hours=2))

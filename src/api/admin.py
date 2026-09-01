@@ -163,10 +163,10 @@ async def _annotate_token_runtime_status(rows: List[Dict[str, Any]]) -> List[Dic
             and extension_connected is not False
         )
 
-        if not bool(row.get("is_active")):
-            availability_status = "inactive"
-        elif not browser_enabled:
+        if not browser_enabled:
             availability_status = "browser_paused"
+        elif not bool(row.get("is_active")):
+            availability_status = "inactive"
         elif browser_sync_pending:
             availability_status = "browser_syncing"
         elif not at_value:
@@ -1113,7 +1113,9 @@ async def set_browser_connection(
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    if request.enabled and connected:
+    if request.enabled and not updated_token.is_active:
+        message = "브라우저 연결은 켰지만 429 자동 차단이 유지되어 작업에서는 제외됩니다."
+    elif request.enabled and connected:
         message = "브라우저 사용을 켰습니다. 현재 세션을 동기화하고 있습니다."
     elif request.enabled:
         message = "브라우저 사용을 켰습니다. 해당 Chrome 프로필이 연결되면 세션을 자동으로 가져옵니다."
@@ -1123,6 +1125,7 @@ async def set_browser_connection(
     return {
         "success": True,
         "message": message,
+        "is_active": bool(updated_token.is_active),
         "browser_enabled": bool(updated_token.browser_enabled),
         "extension_connected": bool(connected),
         "session_sync_pending": bool(updated_token.browser_session_sync_pending),
