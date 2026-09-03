@@ -888,6 +888,7 @@ class FlowClient:
         """识别可重试的 TLS/连接类网络错误。"""
         error_lower = (error_str or "").lower()
         return any(keyword in error_lower for keyword in [
+            "flow browser submit returned no http response",
             "curl: (35)",
             "curl: (52)",
             "curl: (56)",
@@ -908,6 +909,16 @@ class FlowClient:
             "connection refused",
             "network is unreachable",
             "remote host closed connection",
+        ])
+
+    @staticmethod
+    def _is_generation_policy_error(error_str: str) -> bool:
+        """Return whether Flow rejected this request's prompt or content."""
+        error_lower = str(error_str or "").lower()
+        return any(keyword in error_lower for keyword in [
+            "public_error_unsafe_generation",
+            "unsafe_generation",
+            "request contains an invalid ar",
         ])
 
     def _get_control_plane_timeout(self) -> int:
@@ -4090,6 +4101,9 @@ class FlowClient:
     ) -> bool:
         """统一处理生成链路的重试判定与打码自愈通知。"""
         error_str = str(error)
+        if self._is_generation_policy_error(error_str):
+            return False
+
         retry_reason = self._get_retry_reason(error_str)
         retry_delay = self._get_retry_delay_seconds(error_str, retry_attempt)
 
@@ -4146,6 +4160,11 @@ class FlowClient:
     def _get_retry_reason(self, error_str: str) -> Optional[str]:
         """判断是否需要重试，返回日志提示内容"""
         error_lower = error_str.lower()
+        # Prompt/content policy rejections are deterministic for this request.
+        # Retrying them only burns browser capacity and must not affect account
+        # health or trigger a route recycle.
+        if self._is_generation_policy_error(error_str):
+            return None
         if "error_no_slot_available_block" in error_lower:
             return "打码服务资源阻塞"
         if "error_no_slot_available" in error_lower:

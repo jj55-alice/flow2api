@@ -12,11 +12,16 @@ class _RefreshDbStub:
     def __init__(self, tokens):
         self.tokens = tokens
         self.updates = []
+        self.consecutive_error_counts = {token.id: 0 for token in tokens}
+        self.reset_error_calls = []
 
     async def get_token_refresh_config(self):
         return SimpleNamespace(enabled=False, refresh_interval_minutes=120)
 
     async def get_active_tokens(self):
+        return self.tokens
+
+    async def get_all_tokens(self):
         return self.tokens
 
     async def get_token(self, token_id):
@@ -34,6 +39,22 @@ class _RefreshDbStub:
         if token:
             for key, value in updates.items():
                 setattr(token, key, value)
+
+    async def increment_token_stats(self, token_id, stat_type):
+        if stat_type == "error":
+            self.consecutive_error_counts[token_id] += 1
+
+    async def get_token_stats(self, token_id):
+        return SimpleNamespace(
+            consecutive_error_count=self.consecutive_error_counts[token_id],
+        )
+
+    async def get_admin_config(self):
+        return SimpleNamespace(error_ban_threshold=3)
+
+    async def reset_error_count(self, token_id):
+        self.consecutive_error_counts[token_id] = 0
+        self.reset_error_calls.append(token_id)
 
 
 class _RecordingTokenManager(TokenManager):
@@ -140,6 +161,18 @@ class ExtensionAtAutoRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.sync_calls, [1])
         self.assertEqual(manager.refresh_calls, [])
 
+    async def test_inactive_enabled_browser_is_included_in_automatic_recovery(self):
+        now = datetime.now(timezone.utc)
+        token = self._token(1, now + timedelta(hours=2))
+        token.is_active = False
+        token.browser_session_sync_pending = True
+        manager = _RecordingTokenManager(_RefreshDbStub([token]))
+
+        await manager.run_protocol_refresh_once()
+
+        self.assertEqual(manager.sync_calls, [1])
+        self.assertEqual(manager.refresh_calls, [])
+
     async def test_browser_toggle_persists_pending_sync_and_updates_route(self):
         token = self._token(1, datetime.now(timezone.utc) + timedelta(hours=2))
         token.extension_route_key = "google-1"
@@ -219,6 +252,7 @@ class ExtensionAtAutoRefreshTests(unittest.IsolatedAsyncioTestCase):
         token.current_project_id = "project-1"
         token.extension_route_key = "google-1"
         token.browser_session_sync_pending = True
+        token.is_active = False
         db = _RefreshDbStub([token])
         manager = TokenManager(db, flow_client=SimpleNamespace())
         manager._do_refresh_at = AsyncMock(return_value=True)
@@ -235,8 +269,50 @@ class ExtensionAtAutoRefreshTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(synchronized)
         self.assertEqual(token.st, "fresh-session-token")
+        self.assertTrue(token.is_active)
         self.assertFalse(token.browser_session_sync_pending)
+        self.assertEqual(db.reset_error_calls, [1])
         manager._do_refresh_at.assert_awaited_once_with(1, "fresh-session-token", token)
+
+    async def test_browser_session_sync_does_not_reactivate_429_ban(self):
+        token = self._token(1, datetime.now(timezone.utc) + timedelta(hours=2))
+        token.current_project_id = "project-1"
+        token.extension_route_key = "google-1"
+        token.browser_session_sync_pending = True
+        token.is_active = False
+        token.ban_reason = "429_rate_limit"
+        db = _RefreshDbStub([token])
+        manager = TokenManager(db, flow_client=SimpleNamespace())
+        manager._do_refresh_at = AsyncMock(return_value=True)
+        extension_service = SimpleNamespace(
+            get_token_bundle=AsyncMock(return_value={"token": "captcha-token"}),
+            get_session_token=AsyncMock(return_value="fresh-session-token"),
+        )
+
+        with patch(
+            "src.services.browser_captcha_extension.ExtensionCaptchaService.get_instance",
+            new=AsyncMock(return_value=extension_service),
+        ):
+            synchronized = await manager.sync_extension_browser_session(1)
+
+        self.assertTrue(synchronized)
+        self.assertFalse(token.is_active)
+        self.assertEqual(token.ban_reason, "429_rate_limit")
+        self.assertEqual(db.reset_error_calls, [])
+
+    async def test_extension_error_threshold_schedules_session_recovery(self):
+        token = self._token(1, datetime.now(timezone.utc) + timedelta(hours=2))
+        token.browser_enabled = True
+        db = _RefreshDbStub([token])
+        db.consecutive_error_counts[1] = 2
+        manager = TokenManager(db, flow_client=SimpleNamespace())
+
+        await manager.record_error(1)
+
+        self.assertFalse(token.is_active)
+        self.assertTrue(token.browser_session_sync_pending)
+        self.assertEqual(db.consecutive_error_counts[1], 0)
+        self.assertEqual(db.reset_error_calls, [1])
 
     async def test_route_reconnect_completes_only_pending_enabled_session(self):
         token = self._token(1, datetime.now(timezone.utc) + timedelta(hours=2))

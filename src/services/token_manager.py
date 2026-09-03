@@ -388,11 +388,27 @@ class TokenManager:
                     )
                     return False
 
+                latest_token = await self.db.get_token(token_id) or token
+                if not latest_token.browser_enabled:
+                    # A manual OFF that happened during synchronization wins;
+                    # leave the pending flag intact for the next manual ON.
+                    return False
+
+                can_reactivate = (
+                    str(latest_token.ban_reason or "").strip() != "429_rate_limit"
+                )
                 await self.db.update_token(
                     token_id,
                     browser_session_sync_pending=False,
                     last_st_refresh_result="success: browser session synchronized",
+                    **({
+                        "is_active": True,
+                        "ban_reason": None,
+                        "banned_at": None,
+                    } if can_reactivate else {}),
                 )
+                if can_reactivate:
+                    await self.db.reset_error_count(token_id)
                 self._proactive_at_retry_after.pop(token_id, None)
                 self._proactive_at_failure_counts.pop(token_id, None)
                 debug_logger.log_info(
@@ -1147,9 +1163,13 @@ class TokenManager:
             debug_logger.log_warning(f"[PROTOCOL_REFRESH] 读取刷新配置失败: {e}")
             return
 
+        # Inactive extension accounts may be awaiting automatic session
+        # recovery. Include them in the extension refresh pass, while keeping
+        # scheduled protocol refresh limited to active accounts.
+        all_tokens = await self.db.get_all_tokens()
         tokens = await self.db.get_active_tokens()
         now = datetime.now(timezone.utc)
-        await self._refresh_expiring_extension_tokens(tokens, now)
+        await self._refresh_expiring_extension_tokens(all_tokens, now)
 
         if not refresh_config or not refresh_config.enabled:
             return
@@ -1318,6 +1338,27 @@ class TokenManager:
         admin_config = await self.db.get_admin_config()
 
         if stats and stats.consecutive_error_count >= admin_config.error_ban_threshold:
+            token = await self.db.get_token(token_id)
+            if (
+                config.captcha_method == "extension"
+                and token is not None
+                and token.browser_enabled
+                and str(token.ban_reason or "").strip() != "429_rate_limit"
+            ):
+                debug_logger.log_warning(
+                    f"[TOKEN_RECOVERY] Token {token_id} consecutive error count "
+                    f"({stats.consecutive_error_count}) reached threshold "
+                    f"({admin_config.error_ban_threshold}); scheduling browser session resync"
+                )
+                await self.db.update_token(
+                    token_id,
+                    is_active=False,
+                    browser_session_sync_pending=True,
+                )
+                await self.db.reset_error_count(token_id)
+                self._proactive_at_retry_after.pop(token_id, None)
+                self._proactive_at_failure_counts.pop(token_id, None)
+                return
             debug_logger.log_warning(
                 f"[TOKEN_BAN] Token {token_id} consecutive error count ({stats.consecutive_error_count}) "
                 f"reached threshold ({admin_config.error_ban_threshold}), auto-disabling"
