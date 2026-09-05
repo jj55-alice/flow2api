@@ -7,6 +7,11 @@ let routeEnabled = true;
 
 const RECONNECT_ALARM_NAME = "flow2api-reconnect";
 const RECONNECT_ALARM_PERIOD_MINUTES = 0.5;
+const FLOW_ROOT_URL = "https://flow.google.com";
+const FLOW_TAB_PATTERNS = [
+    "https://flow.google.com/*",
+    "https://labs.google/fx/*"
+];
 
 const DEFAULT_SETTINGS = {
     serverUrl: "ws://127.0.0.1:8000/captcha_ws",
@@ -48,6 +53,13 @@ function closeSocket() {
 
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function buildFlowPageUrl(projectId = "") {
+    const normalizedProjectId = String(projectId || "").trim();
+    return normalizedProjectId
+        ? `${FLOW_ROOT_URL}/project/${encodeURIComponent(normalizedProjectId)}`
+        : FLOW_ROOT_URL;
 }
 
 function ensureReconnectAlarm() {
@@ -134,7 +146,7 @@ function waitForTabReady(tabId, timeoutMs = 12000) {
 
 function closeFlowTabs() {
     return new Promise((resolve) => {
-        chrome.tabs.query({ url: ["https://labs.google/fx/*"] }, (tabs) => {
+        chrome.tabs.query({ url: FLOW_TAB_PATTERNS }, (tabs) => {
             if (chrome.runtime.lastError || !Array.isArray(tabs) || tabs.length === 0) {
                 resolve();
                 return;
@@ -324,7 +336,7 @@ async function handleSubmitFlowRequest(data, socket) {
         if (!projectId) {
             throw new Error("Missing Flow project ID");
         }
-        const flowPageUrl = `https://labs.google/fx/tools/flow/project/${encodeURIComponent(projectId)}`;
+        const flowPageUrl = buildFlowPageUrl(projectId);
         console.log("[Flow2API] Opening mapped Flow project for browser-side submit...");
         const newTab = await chrome.tabs.create({ url: flowPageUrl, active: false });
         newTabId = newTab.id;
@@ -494,9 +506,7 @@ async function handleGetToken(data, socket) {
     try {
         console.log("[Flow2API] Auto-opening fresh Google Labs tab to avoid token expiry...");
         const projectId = String(data.project_id || "").trim();
-        const flowPageUrl = projectId
-            ? `https://labs.google/fx/tools/flow/project/${encodeURIComponent(projectId)}`
-            : "https://labs.google/fx/tools/flow";
+        const flowPageUrl = buildFlowPageUrl(projectId);
         const newTab = await chrome.tabs.create({ url: flowPageUrl, active: false });
         newTabId = newTab.id;
 
