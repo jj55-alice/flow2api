@@ -2,6 +2,7 @@ import hashlib
 import tempfile
 import time
 import unittest
+from pathlib import Path
 
 from fastapi import Request, Response
 
@@ -135,6 +136,17 @@ class AdminSessionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(await self.db.is_admin_session_valid(first_payload["token"]))
         self.assertFalse(await self.db.is_admin_session_valid(second_payload["token"]))
+
+    def test_manage_page_initializes_without_removed_local_storage_auth_helper(self):
+        manage_html = (
+            Path(__file__).resolve().parents[1] / "static" / "manage.html"
+        ).read_text()
+
+        self.assertNotIn("checkAuth()", manage_html)
+        self.assertIn(
+            "DOMContentLoaded',()=>{refreshTokens();loadATAutoRefreshConfig()",
+            manage_html,
+        )
 
 
 if __name__ == "__main__":
