@@ -79,10 +79,17 @@ function writeSessionStorage(value) {
 
 function normalizeCapturedAccessToken(value) {
     const token = String(value || "").trim();
-    if (!token.startsWith("ya29.") || token.length < 100 || token.length > 2048) {
+    // OAuth bearer tokens are opaque. RFC 6750 defines their transport
+    // alphabet, but does not guarantee Google's historical "ya29." prefix.
+    if (!token || token.length > 4096 || !/^[A-Za-z0-9\-._~+/]+=*$/.test(token)) {
         return "";
     }
     return token;
+}
+
+function accessTokenFromAuthorization(value) {
+    const match = String(value || "").trim().match(/^Bearer\s+([^\s]+)$/i);
+    return normalizeCapturedAccessToken(match && match[1]);
 }
 
 async function rememberFlowAccessToken(accessToken, capturedAt) {
@@ -464,6 +471,7 @@ async function handleGetSessionCookie(data, socket) {
         const browserAuth = !capturedAuth && newTabId
             ? await probeBrowserFlowAuthentication(newTabId, cookieAuthorization)
             : null;
+        const authObservation = await readSessionStorage(FLOW_REQUEST_AUTH_STORAGE_KEY) || {};
 
         const cookie = await chrome.cookies.get({
             url: "https://labs.google/fx/tools/flow",
@@ -480,6 +488,8 @@ async function handleGetSessionCookie(data, socket) {
                 access_token_captured_at: capturedAuth ? capturedAuth.captured_at : null,
                 browser_auth_valid: browserAuthValid,
                 browser_auth_status: browserAuth ? browserAuth.http_status : 0,
+                observed_auth_scheme: String(authObservation.auth_scheme || "none").slice(0, 32),
+                observed_auth_at: Number(authObservation.seen_at || 0) || null,
                 credits: browserAuthValid ? browserAuth.credits : null,
                 user_paygate_tier: browserAuthValid ? browserAuth.user_paygate_tier : "",
             }, socket);
@@ -487,7 +497,10 @@ async function handleGetSessionCookie(data, socket) {
             sendSocketMessage({
                 req_id: data.req_id,
                 status: "error",
-                error: "현재 Flow 인증 또는 기존 Labs 세션을 찾을 수 없습니다. 이 Chrome 프로필에서 Flow에 로그인되어 있는지 확인하세요."
+                error: "현재 Flow 인증 또는 기존 Labs 세션을 찾을 수 없습니다. 이 Chrome 프로필에서 Flow에 로그인되어 있는지 확인하세요.",
+                browser_auth_status: browserAuth ? browserAuth.http_status : 0,
+                observed_auth_scheme: String(authObservation.auth_scheme || "none").slice(0, 32),
+                observed_auth_at: Number(authObservation.seen_at || 0) || null,
             }, socket);
         }
     } catch (err) {
@@ -886,7 +899,8 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
             (header) => String(header && header.name || "").toLowerCase() === "authorization"
         );
         const authorizationValue = String(authorization && authorization.value || "");
-        const authScheme = authorizationValue.trim().split(/\s+/, 1)[0] || "none";
+        if (!authorizationValue) return;
+        const authScheme = authorizationValue.trim().split(/\s+/, 1)[0] || "unknown";
         writeSessionStorage({
             [FLOW_REQUEST_AUTH_STORAGE_KEY]: {
                 auth_scheme: authScheme.slice(0, 32),
@@ -894,11 +908,9 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
             },
         }).catch(() => {});
 
-        const match = authorizationValue.match(
-            /^Bearer\s+(ya29\.[^\s]+)$/i
-        );
-        if (!match) return;
-        rememberFlowAccessToken(match[1], Date.now()).catch((error) => {
+        const accessToken = accessTokenFromAuthorization(authorizationValue);
+        if (!accessToken) return;
+        rememberFlowAccessToken(accessToken, Date.now()).catch((error) => {
             console.log("[Flow2API] Could not retain Flow request authentication:", error);
         });
     },

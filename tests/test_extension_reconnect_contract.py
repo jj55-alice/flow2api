@@ -54,6 +54,9 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn("chrome.webRequest.onBeforeSendHeaders", background)
         self.assertIn('"requestHeaders", "extraHeaders"', background)
         self.assertIn("waitForRecentFlowAccessToken(5000)", background)
+        self.assertNotIn("startsWith(\"ya29.\")", background)
+        self.assertNotIn("ya29\\.", capture_script)
+        self.assertIn("OAuth bearer tokens are opaque", background)
         self.assertNotIn("accounts.google.com/o/oauth2", background)
         self.assertNotIn("FLOW_OAUTH_CLIENT_ID", background)
 

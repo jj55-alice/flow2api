@@ -78,7 +78,7 @@ class _ImmediateExtensionSocket:
                         "req_id": payload["req_id"],
                         "status": "success",
                         "session_token": "labs-session-token",
-                        "access_token": "ya29." + ("captured" * 20),
+                        "access_token": "opaque-flow-token_" + ("captured" * 8),
                         "access_token_captured_at": 123456789,
                     }),
                 )
@@ -343,7 +343,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             project_id="project-a",
         )
 
-        self.assertTrue(credentials["access_token"].startswith("ya29."))
+        self.assertTrue(credentials["access_token"].startswith("opaque-flow-token_"))
         self.assertEqual(credentials["session_token"], "labs-session-token")
 
     async def test_token_bundle_preserves_browser_fingerprint(self):

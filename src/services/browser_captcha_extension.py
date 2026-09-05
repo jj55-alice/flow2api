@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -487,9 +488,9 @@ class ExtensionCaptchaService:
                     session_token = str(result.get("session_token") or "").strip()
                     access_token = str(result.get("access_token") or "").strip()
                     if (
-                        not access_token.startswith("ya29.")
-                        or len(access_token) < 100
-                        or len(access_token) > 2048
+                        not access_token
+                        or len(access_token) > 4096
+                        or re.fullmatch(r"[A-Za-z0-9._~+/\-]+=*", access_token) is None
                     ):
                         access_token = ""
                     browser_auth_valid = bool(result.get("browser_auth_valid"))
@@ -508,11 +509,18 @@ class ExtensionCaptchaService:
                         "access_token_captured_at": result.get("access_token_captured_at"),
                         "browser_auth_valid": browser_auth_valid,
                         "browser_auth_status": browser_auth_status,
+                        "observed_auth_scheme": str(
+                            result.get("observed_auth_scheme") or "none"
+                        ).strip()[:32],
+                        "observed_auth_at": result.get("observed_auth_at"),
                         "credits": credits,
                         "user_paygate_tier": user_paygate_tier,
                     }
                 debug_logger.log_warning(
-                    f"[Extension Captcha] Browser credential request failed: {result.get('error')}"
+                    "[Extension Captcha] Browser credential request failed: "
+                    f"{result.get('error')}; "
+                    f"browser_status={result.get('browser_auth_status') or 0}, "
+                    f"observed_scheme={str(result.get('observed_auth_scheme') or 'none')[:32]}"
                 )
                 return {}
             except asyncio.TimeoutError:

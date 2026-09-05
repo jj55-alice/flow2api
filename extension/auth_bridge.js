@@ -13,7 +13,7 @@
         }
 
         const accessToken = String(event.data.access_token || "").trim();
-        if (!accessToken.startsWith("ya29.") || accessToken.length < 100 || accessToken.length > 2048) {
+        if (!accessToken || accessToken.length > 4096 || !/^[A-Za-z0-9\-._~+/]+=*$/.test(accessToken)) {
             return;
         }
 

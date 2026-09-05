@@ -20,10 +20,13 @@
         if (window.__FLOW2API_BROWSER_SUBMIT_ACTIVE__) return;
         if (!isFlowApiUrl(requestUrl)) return;
 
-        const match = String(value || "").match(/^Bearer\s+(ya29\.[^\s]+)$/i);
-        if (!match) return;
+        const match = String(value || "").trim().match(/^Bearer\s+([^\s]+)$/i);
+        const accessToken = String(match && match[1] || "");
+        if (!accessToken || accessToken.length > 4096 || !/^[A-Za-z0-9\-._~+/]+=*$/.test(accessToken)) {
+            return;
+        }
 
-        lastAccessToken = match[1];
+        lastAccessToken = accessToken;
         window.postMessage({
             source: MESSAGE_SOURCE,
             type: "flow_access_token",

@@ -260,7 +260,7 @@ class ExtensionAtAutoRefreshTests(unittest.IsolatedAsyncioTestCase):
             "userPaygateTier": "PAYGATE_TIER_ONE",
         })
         manager._do_refresh_at = AsyncMock(return_value=False)
-        captured_at = "ya29." + ("fresh" * 30)
+        captured_at = "opaque-flow-token_" + ("fresh" * 12)
         extension_service = SimpleNamespace(
             get_browser_credentials=AsyncMock(return_value={
                 "session_token": "fresh-session-token",
