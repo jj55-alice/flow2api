@@ -18,6 +18,8 @@ class TokenManager:
     _PROACTIVE_AT_REFRESH_WINDOW = timedelta(hours=1)
     _PROACTIVE_AT_RETRY_BASE_SECONDS = 60
     _PROACTIVE_AT_RETRY_MAX_SECONDS = 600
+    _BROWSER_CAPTURED_AT_VALIDITY = timedelta(minutes=90)
+    _BROWSER_COOKIE_AUTH_VALIDITY = timedelta(minutes=90)
 
     def __init__(self, db: Database, flow_client: FlowClient):
         self.db = db
@@ -137,6 +139,87 @@ class TokenManager:
 
     async def _get_credits_for_token(self, token: Token, at: str) -> Dict[str, Any]:
         return await self._flow_call_for_token(token, lambda: self.flow_client.get_credits(at))
+
+    async def _refresh_at_from_extension_browser(self, token_id: int, token: Token) -> bool:
+        """Verify and adopt the current mapped Flow browser authentication."""
+        from .browser_captcha_extension import ExtensionCaptchaService
+
+        service = await ExtensionCaptchaService.get_instance(self.db)
+        credentials = await service.get_browser_credentials(
+            token_id,
+            project_id=str(token.current_project_id or "").strip(),
+            timeout=20,
+        )
+        if not isinstance(credentials, dict):
+            return False
+
+        session_token = str(credentials.get("session_token") or "").strip()
+        browser_at = str(credentials.get("access_token") or "").strip()
+        browser_auth_valid = bool(credentials.get("browser_auth_valid"))
+        now = datetime.now(timezone.utc)
+
+        if session_token and session_token != str(token.st or "").strip():
+            await self.db.update_token(token_id, st=session_token)
+            token.st = session_token
+            record_token_refresh("st", "success")
+
+        if browser_at:
+            try:
+                credits_result = await self._get_credits_for_token(token, browser_at)
+                expires_at = now + self._BROWSER_CAPTURED_AT_VALIDITY
+                await self.db.update_token(
+                    token_id,
+                    at=browser_at,
+                    at_expires=expires_at,
+                    credits=credits_result.get("credits", 0),
+                    user_paygate_tier=credits_result.get("userPaygateTier"),
+                    last_st_refresh_at=now,
+                    last_st_refresh_result="success: current Flow browser authentication",
+                )
+                token.at = browser_at
+                token.at_expires = expires_at
+                self._mark_at_valid(token_id)
+                record_token_refresh("at", "success")
+                debug_logger.log_info(
+                    f"[AT_REFRESH] Token {token_id}: current Flow browser AT verified"
+                )
+                return True
+            except Exception as e:
+                record_token_refresh("at", "failure")
+                debug_logger.log_warning(
+                    f"[AT_REFRESH] Token {token_id}: captured browser AT validation failed - {e}"
+                )
+
+        if browser_auth_valid:
+            expires_at = now + self._BROWSER_COOKIE_AUTH_VALIDITY
+            update_values: Dict[str, Any] = {
+                "at_expires": expires_at,
+                "last_st_refresh_at": now,
+                "last_st_refresh_result": "success: current Flow browser cookie authentication",
+            }
+            if credentials.get("credits") is not None:
+                update_values["credits"] = credentials.get("credits")
+            if credentials.get("user_paygate_tier"):
+                update_values["user_paygate_tier"] = credentials.get("user_paygate_tier")
+            await self.db.update_token(token_id, **update_values)
+            token.at_expires = expires_at
+            self._mark_at_valid(
+                token_id,
+                ttl_seconds=max(300, int(self._BROWSER_COOKIE_AUTH_VALIDITY.total_seconds()) - 60),
+            )
+            record_token_refresh("at", "success")
+            debug_logger.log_info(
+                f"[AT_REFRESH] Token {token_id}: current Flow browser cookie authentication verified"
+            )
+            return True
+
+        if session_token:
+            debug_logger.log_info(
+                f"[AT_REFRESH] Token {token_id}: falling back to legacy session exchange"
+            )
+            return await self._do_refresh_at(token_id, session_token, token)
+
+        return False
 
     async def get_personal_warmup_project_ids(
         self,
@@ -332,7 +415,7 @@ class TokenManager:
         return token, connected
 
     async def sync_extension_browser_session(self, token_id: int) -> bool:
-        """Fetch the enabled profile's current ST and exchange it for a verified AT."""
+        """Fetch and verify the enabled profile's current Flow authentication."""
         refresh_lock = await self._get_token_lock(
             self._refresh_locks,
             self._refresh_lock_guard,
@@ -346,45 +429,11 @@ class TokenManager:
                 return True
 
             try:
-                from .browser_captcha_extension import ExtensionCaptchaService
-
-                service = await ExtensionCaptchaService.get_instance(self.db)
-                project_id = str(token.current_project_id or "").strip()
-                if project_id:
-                    try:
-                        await service.get_token_bundle(
-                            project_id,
-                            action="IMAGE_GENERATION",
-                            timeout=30,
-                            token_id=token_id,
-                        )
-                    except Exception as e:
-                        debug_logger.log_warning(
-                            f"[BROWSER_SYNC] Token {token_id}: session warmup failed - {e}"
-                        )
-
-                session_token = await service.get_session_token(token_id, timeout=15)
-                if not session_token:
-                    await self._record_extension_st_refresh_failure(
-                        token_id,
-                        "enabled browser did not return a session cookie",
-                    )
-                    return False
-
-                await self.db.update_token(
-                    token_id,
-                    st=session_token,
-                    last_st_refresh_at=datetime.now(timezone.utc),
-                    last_st_refresh_result="success: browser enabled",
-                )
-                token.st = session_token
-                record_token_refresh("st", "success")
-
-                refreshed = await self._do_refresh_at(token_id, session_token, token)
+                refreshed = await self._refresh_at_from_extension_browser(token_id, token)
                 if not refreshed:
                     await self._record_extension_st_refresh_failure(
                         token_id,
-                        "browser session did not produce a valid access token",
+                        "current Flow browser session authentication could not be verified",
                     )
                     return False
 
@@ -412,7 +461,7 @@ class TokenManager:
                 self._proactive_at_retry_after.pop(token_id, None)
                 self._proactive_at_failure_counts.pop(token_id, None)
                 debug_logger.log_info(
-                    f"[BROWSER_SYNC] Token {token_id}: browser ST/AT synchronized"
+                    f"[BROWSER_SYNC] Token {token_id}: browser authentication synchronized"
                 )
                 return True
             except Exception as e:
@@ -792,12 +841,24 @@ class TokenManager:
             if not token:
                 return False
 
-            result = await self._do_refresh_at(token_id, token.st, token)
-            if result:
-                return True
-
-            debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: first AT refresh failed, trying ST refresh...")
-            new_st = await self._try_refresh_st(token_id, token)
+            if (
+                config.captcha_method == "extension"
+                and bool(getattr(token, "browser_enabled", True))
+            ):
+                debug_logger.log_info(
+                    f"[AT_REFRESH] Token {token_id}: trying current Flow browser auth..."
+                )
+                if await self._refresh_at_from_extension_browser(token_id, token):
+                    return True
+                new_st = None
+            else:
+                result = await self._do_refresh_at(token_id, token.st, token)
+                if result:
+                    return True
+                debug_logger.log_info(
+                    f"[AT_REFRESH] Token {token_id}: first AT refresh failed, trying ST refresh..."
+                )
+                new_st = await self._try_refresh_st(token_id, token)
             if new_st:
                 debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: ST refreshed, retrying AT refresh...")
                 latest_token = await self.db.get_token(token_id) or token
@@ -810,7 +871,7 @@ class TokenManager:
                         "refreshed session cookie still returned an expired or invalid access token",
                     )
 
-            if disable_on_failure:
+            if disable_on_failure and config.captcha_method != "extension":
                 debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: all refresh attempts failed, disabling token")
                 await self.disable_token(token_id)
             else:

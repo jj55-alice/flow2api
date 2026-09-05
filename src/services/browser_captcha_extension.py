@@ -228,6 +228,26 @@ class ExtensionCaptchaService:
             return False
         return (version_parts + (0, 0, 0))[:3] >= (1, 2, 0)
 
+    @staticmethod
+    def _supports_browser_auth_capture(extension_version: str) -> bool:
+        try:
+            version_parts = tuple(
+                int(part) for part in str(extension_version or "").split(".")[:3]
+            )
+        except (TypeError, ValueError):
+            return False
+        return (version_parts + (0, 0, 0))[:3] >= (1, 3, 0)
+
+    @staticmethod
+    def _supports_browser_cookie_auth(extension_version: str) -> bool:
+        try:
+            version_parts = tuple(
+                int(part) for part in str(extension_version or "").split(".")[:3]
+            )
+        except (TypeError, ValueError):
+            return False
+        return (version_parts + (0, 0, 0))[:3] >= (1, 3, 3)
+
     def describe_routes(self) -> str:
         return self._describe_routes()
 
@@ -402,8 +422,14 @@ class ExtensionCaptchaService:
                 timeout=timeout,
             )
 
-    async def get_session_token(self, token_id: Optional[int], timeout: int = 15) -> Optional[str]:
-        """Read the current labs.google session cookie from the mapped profile."""
+    async def get_browser_credentials(
+        self,
+        token_id: Optional[int],
+        *,
+        project_id: str = "",
+        timeout: int = 20,
+    ) -> Dict[str, Any]:
+        """Read current Flow auth, with the legacy Labs session as a fallback."""
         if not self.active_connections:
             raise RuntimeError("Chrome Extension not connected")
 
@@ -413,6 +439,22 @@ class ExtensionCaptchaService:
             raise RuntimeError(
                 f"No Chrome Extension connection matches token_id={token_id} route_key='{route_key}'"
             )
+
+        normalized_project_id = str(project_id or "").strip()
+        if normalized_project_id and not self._supports_browser_auth_capture(conn.extension_version):
+            try:
+                # During a rolling extension update, preserve the old behavior:
+                # opening Flow can still rotate the legacy Labs session cookie.
+                await self.get_token_bundle(
+                    normalized_project_id,
+                    action="IMAGE_GENERATION",
+                    timeout=min(30, max(10, timeout)),
+                    token_id=token_id,
+                )
+            except Exception as e:
+                debug_logger.log_warning(
+                    f"[Extension Captcha] Legacy auth warmup failed for route_key={route_key}: {e}"
+                )
 
         route_guard_key = route_key or "(empty)"
         route_lock = self._route_locks.setdefault(route_guard_key, asyncio.Lock())
@@ -438,19 +480,51 @@ class ExtensionCaptchaService:
                     "type": "get_session_cookie",
                     "req_id": req_id,
                     "route_key": route_key,
+                    "project_id": normalized_project_id,
                 }))
                 result = await asyncio.wait_for(future, timeout=timeout)
                 if result.get("status") == "success":
-                    return str(result.get("session_token") or "").strip() or None
+                    session_token = str(result.get("session_token") or "").strip()
+                    access_token = str(result.get("access_token") or "").strip()
+                    if (
+                        not access_token.startswith("ya29.")
+                        or len(access_token) < 100
+                        or len(access_token) > 2048
+                    ):
+                        access_token = ""
+                    browser_auth_valid = bool(result.get("browser_auth_valid"))
+                    try:
+                        browser_auth_status = int(result.get("browser_auth_status") or 0)
+                    except (TypeError, ValueError):
+                        browser_auth_status = 0
+                    try:
+                        credits = int(result.get("credits")) if result.get("credits") is not None else None
+                    except (TypeError, ValueError):
+                        credits = None
+                    user_paygate_tier = str(result.get("user_paygate_tier") or "").strip()[:128]
+                    return {
+                        "session_token": session_token,
+                        "access_token": access_token,
+                        "access_token_captured_at": result.get("access_token_captured_at"),
+                        "browser_auth_valid": browser_auth_valid,
+                        "browser_auth_status": browser_auth_status,
+                        "credits": credits,
+                        "user_paygate_tier": user_paygate_tier,
+                    }
                 debug_logger.log_warning(
-                    f"[Extension Captcha] Session cookie request failed: {result.get('error')}"
+                    f"[Extension Captcha] Browser credential request failed: {result.get('error')}"
                 )
-                return None
+                return {}
             except asyncio.TimeoutError:
-                debug_logger.log_warning("[Extension Captcha] Session cookie request timed out")
-                return None
+                debug_logger.log_warning("[Extension Captcha] Browser credential request timed out")
+                return {}
             finally:
                 self.pending_requests.pop(req_id, None)
+
+    async def get_session_token(self, token_id: Optional[int], timeout: int = 15) -> Optional[str]:
+        """Read the legacy labs.google session cookie from the mapped profile."""
+        credentials = await self.get_browser_credentials(token_id, timeout=timeout)
+        return str(credentials.get("session_token") or "").strip() or None
 
     async def submit_flow_request(
         self,
@@ -478,8 +552,6 @@ class ExtensionCaptchaService:
             raise ValueError("Extension Flow submit only allows the Google Flow v1 API")
         if not isinstance(json_data, dict):
             raise ValueError("Extension Flow submit requires a JSON object body")
-        if not str(at_token or "").strip():
-            raise ValueError("Extension Flow submit requires an access token")
 
         route_key = await self._resolve_route_key(token_id)
         conn = self._select_connection(route_key)
@@ -493,6 +565,13 @@ class ExtensionCaptchaService:
             raise RuntimeError(
                 f"Chrome Extension route_key='{route_key}' must be reloaded "
                 f"(connected version: {conn.extension_version or 'legacy'}, required: 1.2.0+)"
+            )
+        if (
+            not str(at_token or "").strip()
+            and not self._supports_browser_cookie_auth(conn.extension_version)
+        ):
+            raise ValueError(
+                "Extension Flow submit requires an access token or extension version 1.3.3+"
             )
 
         route_guard_key = route_key or "(empty)"

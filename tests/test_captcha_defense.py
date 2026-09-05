@@ -78,6 +78,8 @@ class _ImmediateExtensionSocket:
                         "req_id": payload["req_id"],
                         "status": "success",
                         "session_token": "labs-session-token",
+                        "access_token": "ya29." + ("captured" * 20),
+                        "access_token_captured_at": 123456789,
                     }),
                 )
             elif payload.get("type") == "submit_flow_request":
@@ -325,6 +327,25 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(session_token, "labs-session-token")
 
+    async def test_current_flow_access_token_can_be_read_for_mapped_profile(self):
+        service = ExtensionCaptchaService(db=_RouteDbStub())
+        websocket = _ImmediateExtensionSocket(service)
+        service.active_connections.append(
+            ExtensionConnection(
+                websocket=websocket,
+                route_key="google-1",
+                extension_version="1.3.0",
+            )
+        )
+
+        credentials = await service.get_browser_credentials(
+            token_id=1,
+            project_id="project-a",
+        )
+
+        self.assertTrue(credentials["access_token"].startswith("ya29."))
+        self.assertEqual(credentials["session_token"], "labs-session-token")
+
     async def test_token_bundle_preserves_browser_fingerprint(self):
         service = ExtensionCaptchaService(db=_RouteDbStub())
         websocket = _ImmediateExtensionSocket(service)
@@ -368,6 +389,56 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(websocket.flow_submits), 1)
         self.assertEqual(websocket.flow_submits[0]["route_key"], "google-1")
         self.assertEqual(websocket.flow_submits[0]["access_token"], "access-token")
+
+    async def test_cookie_auth_extension_can_submit_without_legacy_access_token(self):
+        service = ExtensionCaptchaService(db=_RouteDbStub())
+        websocket = _ImmediateExtensionSocket(service)
+        service.active_connections.append(
+            ExtensionConnection(
+                websocket=websocket,
+                route_key="google-1",
+                extension_version="1.3.3",
+            )
+        )
+
+        response = await service.submit_flow_request(
+            project_id="project-a",
+            action="IMAGE_GENERATION",
+            token_id=1,
+            url=(
+                "https://aisandbox-pa.googleapis.com/v1/projects/project-a/"
+                "flowMedia:batchGenerateImages"
+            ),
+            at_token="",
+            json_data={"clientContext": {"projectId": "project-a"}},
+            timeout=15,
+        )
+
+        self.assertEqual(response["status"], 200)
+
+    async def test_legacy_extension_still_requires_access_token_for_submit(self):
+        service = ExtensionCaptchaService(db=_RouteDbStub())
+        service.active_connections.append(
+            ExtensionConnection(
+                websocket=_ImmediateExtensionSocket(service),
+                route_key="google-1",
+                extension_version="1.3.2",
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "access token or extension version 1.3.3"):
+            await service.submit_flow_request(
+                project_id="project-a",
+                action="IMAGE_GENERATION",
+                token_id=1,
+                url=(
+                    "https://aisandbox-pa.googleapis.com/v1/projects/project-a/"
+                    "flowMedia:batchGenerateImages"
+                ),
+                at_token="",
+                json_data={"clientContext": {"projectId": "project-a"}},
+                timeout=15,
+            )
 
     async def test_flow_submit_requires_reloaded_extension(self):
         service = ExtensionCaptchaService(db=_RouteDbStub())

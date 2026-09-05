@@ -12,6 +12,10 @@ const FLOW_TAB_PATTERNS = [
     "https://flow.google.com/*",
     "https://labs.google/fx/*"
 ];
+const FLOW_ACCESS_TOKEN_STORAGE_KEY = "flowAccessTokenSession";
+const FLOW_REQUEST_AUTH_STORAGE_KEY = "flowRequestAuthObservation";
+const FLOW_ACCESS_TOKEN_MAX_AGE_MS = 2 * 60 * 1000;
+const FLOW_API_ROOT_URL = "https://aisandbox-pa.googleapis.com/v1";
 
 const DEFAULT_SETTINGS = {
     serverUrl: "ws://127.0.0.1:8000/captcha_ws",
@@ -53,6 +57,148 @@ function closeSocket() {
 
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function readSessionStorage(key) {
+    return new Promise((resolve) => {
+        chrome.storage.session.get(key, (stored) => {
+            if (chrome.runtime.lastError) {
+                resolve(undefined);
+                return;
+            }
+            resolve(stored ? stored[key] : undefined);
+        });
+    });
+}
+
+function writeSessionStorage(value) {
+    return new Promise((resolve) => {
+        chrome.storage.session.set(value, () => resolve());
+    });
+}
+
+function normalizeCapturedAccessToken(value) {
+    const token = String(value || "").trim();
+    if (!token.startsWith("ya29.") || token.length < 100 || token.length > 2048) {
+        return "";
+    }
+    return token;
+}
+
+async function rememberFlowAccessToken(accessToken, capturedAt) {
+    const normalizedToken = normalizeCapturedAccessToken(accessToken);
+    if (!normalizedToken) return;
+    await writeSessionStorage({
+        [FLOW_ACCESS_TOKEN_STORAGE_KEY]: {
+            access_token: normalizedToken,
+            captured_at: Number(capturedAt || Date.now()),
+        },
+    });
+}
+
+async function getRecentFlowAccessToken() {
+    const captured = await readSessionStorage(FLOW_ACCESS_TOKEN_STORAGE_KEY);
+    const accessToken = normalizeCapturedAccessToken(captured && captured.access_token);
+    const capturedAt = Number(captured && captured.captured_at || 0);
+    if (!accessToken || !capturedAt || Date.now() - capturedAt > FLOW_ACCESS_TOKEN_MAX_AGE_MS) {
+        return null;
+    }
+    return { access_token: accessToken, captured_at: capturedAt };
+}
+
+async function waitForRecentFlowAccessToken(timeoutMs = 5000) {
+    const deadline = Date.now() + Math.max(0, Number(timeoutMs || 0));
+    do {
+        const captured = await getRecentFlowAccessToken();
+        if (captured) return captured;
+        await sleep(200);
+    } while (Date.now() < deadline);
+    return null;
+}
+
+async function sha1Hex(value) {
+    const digest = await crypto.subtle.digest(
+        "SHA-1",
+        new TextEncoder().encode(String(value || ""))
+    );
+    return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function buildGoogleCookieAuthorization(origin = FLOW_ROOT_URL) {
+    const cookieNames = [
+        "SAPISID",
+        "APISID",
+        "__Secure-1PAPISID",
+        "__Secure-3PAPISID",
+    ];
+    const cookieEntries = await Promise.all(cookieNames.map(async (name) => {
+        const cookie = await chrome.cookies.get({ url: `${FLOW_ROOT_URL}/`, name });
+        return [name, cookie && cookie.value ? cookie.value : ""];
+    }));
+    const cookies = Object.fromEntries(cookieEntries);
+    const timestamp = Math.floor(Date.now() / 1000);
+    const parts = [];
+    const appendHash = async (scheme, value) => {
+        if (!value) return;
+        const digest = await sha1Hex(`${timestamp} ${value} ${origin}`);
+        parts.push(`${scheme} ${timestamp}_${digest}`);
+    };
+
+    await appendHash(
+        "SAPISIDHASH",
+        cookies.SAPISID || cookies.APISID || cookies["__Secure-3PAPISID"]
+    );
+    await appendHash("SAPISID1PHASH", cookies["__Secure-1PAPISID"]);
+    await appendHash("SAPISID3PHASH", cookies["__Secure-3PAPISID"]);
+    return parts.join(" ");
+}
+
+async function probeBrowserFlowAuthentication(tabId, authorization) {
+    if (!tabId || !authorization) return null;
+    try {
+        const results = await chrome.scripting.executeScript({
+            target: { tabId },
+            world: "MAIN",
+            func: async (requestUrl, cookieAuthorization) => {
+                try {
+                    const response = await fetch(requestUrl, {
+                        method: "GET",
+                        headers: {
+                            "authorization": cookieAuthorization,
+                            "x-goog-authuser": "0",
+                        },
+                        credentials: "include",
+                    });
+                    let payload = null;
+                    try {
+                        payload = await response.json();
+                    } catch (_) {
+                        payload = null;
+                    }
+                    return {
+                        http_status: response.status,
+                        credits: Number.isFinite(Number(payload && payload.credits))
+                            ? Number(payload.credits)
+                            : null,
+                        user_paygate_tier: typeof (payload && payload.userPaygateTier) === "string"
+                            ? payload.userPaygateTier
+                            : "",
+                    };
+                } catch (error) {
+                    return {
+                        http_status: 0,
+                        error: error && error.message ? error.message : "Browser authentication probe failed",
+                    };
+                }
+            },
+            args: [`${FLOW_API_ROOT_URL}/credits`, authorization],
+        });
+        const result = results && results[0] && results[0].result;
+        return result && Number.isInteger(result.http_status) ? result : null;
+    } catch (error) {
+        console.log("[Flow2API] Current Flow browser authentication probe failed:", error);
+        return null;
+    }
 }
 
 function buildFlowPageUrl(projectId = "") {
@@ -292,23 +438,56 @@ async function connectWS() {
 }
 
 async function handleGetSessionCookie(data, socket) {
+    let newTabId = null;
     try {
+        const projectId = String(data.project_id || "").trim();
+        if (projectId) {
+            const newTab = await chrome.tabs.create({
+                url: buildFlowPageUrl(projectId),
+                active: false,
+            });
+            newTabId = newTab.id;
+            await waitForTabReady(newTabId);
+        }
+
+        let capturedAuth = await getRecentFlowAccessToken();
+        if (!capturedAuth && projectId) {
+            // Flow now commonly authenticates its own API requests from the
+            // signed-in page instead of rotating the legacy Labs session
+            // cookie. Give those page requests time to expose a fresh bearer
+            // token before falling back to first-party cookie authentication.
+            capturedAuth = await waitForRecentFlowAccessToken(5000);
+        }
+        const cookieAuthorization = !capturedAuth && newTabId
+            ? await buildGoogleCookieAuthorization(FLOW_ROOT_URL)
+            : "";
+        const browserAuth = !capturedAuth && newTabId
+            ? await probeBrowserFlowAuthentication(newTabId, cookieAuthorization)
+            : null;
+
         const cookie = await chrome.cookies.get({
             url: "https://labs.google/fx/tools/flow",
             name: "__Secure-next-auth.session-token"
         });
 
-        if (cookie && cookie.value) {
+        const browserAuthValid = Boolean(browserAuth && browserAuth.http_status === 200);
+        if ((cookie && cookie.value) || capturedAuth || browserAuthValid) {
             sendSocketMessage({
                 req_id: data.req_id,
                 status: "success",
-                session_token: cookie.value
+                session_token: cookie && cookie.value ? cookie.value : "",
+                access_token: capturedAuth ? capturedAuth.access_token : "",
+                access_token_captured_at: capturedAuth ? capturedAuth.captured_at : null,
+                browser_auth_valid: browserAuthValid,
+                browser_auth_status: browserAuth ? browserAuth.http_status : 0,
+                credits: browserAuthValid ? browserAuth.credits : null,
+                user_paygate_tier: browserAuthValid ? browserAuth.user_paygate_tier : "",
             }, socket);
         } else {
             sendSocketMessage({
                 req_id: data.req_id,
                 status: "error",
-                error: "labs.google 세션 쿠키를 찾을 수 없습니다. 이 Chrome 프로필에서 Flow에 로그인되어 있는지 확인하세요."
+                error: "현재 Flow 인증 또는 기존 Labs 세션을 찾을 수 없습니다. 이 Chrome 프로필에서 Flow에 로그인되어 있는지 확인하세요."
             }, socket);
         }
     } catch (err) {
@@ -317,6 +496,14 @@ async function handleGetSessionCookie(data, socket) {
             status: "error",
             error: err.message || "세션 쿠키 읽기 실패"
         }, socket);
+    } finally {
+        if (newTabId) {
+            try {
+                await chrome.tabs.remove(newTabId);
+            } catch (e) {
+                console.log("[Flow2API] Error closing auth refresh tab:", e);
+            }
+        }
     }
 }
 
@@ -344,10 +531,12 @@ async function handleSubmitFlowRequest(data, socket) {
         await waitForTabReady(newTabId);
         await sleep(1200);
 
+        const cookieAuthorization = await buildGoogleCookieAuthorization(FLOW_ROOT_URL);
+
         const results = await chrome.scripting.executeScript({
             target: { tabId: newTabId },
             world: "MAIN",
-            func: async (action, requestUrl, accessToken, requestBody, timeoutMs) => {
+            func: async (action, requestUrl, accessToken, cookieAuthorization, requestBody, timeoutMs) => {
                 const websiteKey = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
                 const browserFingerprint = () => {
                     const languages = Array.from(
@@ -432,17 +621,46 @@ async function handleSubmitFlowRequest(data, socket) {
 
                 const controller = new AbortController();
                 const abortTimer = setTimeout(() => controller.abort(), Math.max(5000, timeoutMs));
+                window.__FLOW2API_BROWSER_SUBMIT_ACTIVE__ = true;
                 try {
-                    const response = await fetch(requestUrl, {
-                        method: "POST",
-                        headers: {
-                            "authorization": `Bearer ${accessToken}`,
+                    const authorizationCandidates = [];
+                    if (cookieAuthorization) {
+                        authorizationCandidates.push({
+                            value: cookieAuthorization,
+                            googleAuthUser: true,
+                        });
+                    }
+                    if (accessToken) {
+                        authorizationCandidates.push({
+                            value: `Bearer ${accessToken}`,
+                            googleAuthUser: false,
+                        });
+                    }
+                    if (!authorizationCandidates.length) {
+                        throw new Error("No current Flow browser authentication is available");
+                    }
+
+                    let response = null;
+                    for (let index = 0; index < authorizationCandidates.length; index += 1) {
+                        const candidate = authorizationCandidates[index];
+                        const headers = {
+                            "authorization": candidate.value,
                             "content-type": "text/plain;charset=UTF-8",
-                        },
-                        credentials: "include",
-                        body: JSON.stringify(body),
-                        signal: controller.signal,
-                    });
+                        };
+                        if (candidate.googleAuthUser) {
+                            headers["x-goog-authuser"] = "0";
+                        }
+                        response = await fetch(requestUrl, {
+                            method: "POST",
+                            headers,
+                            credentials: "include",
+                            body: JSON.stringify(body),
+                            signal: controller.signal,
+                        });
+                        if (![401, 403].includes(response.status) || index === authorizationCandidates.length - 1) {
+                            break;
+                        }
+                    }
                     const responseText = await response.text();
                     const responseHeaders = {};
                     response.headers.forEach((value, key) => {
@@ -455,6 +673,7 @@ async function handleSubmitFlowRequest(data, socket) {
                         fingerprint: browserFingerprint(),
                     };
                 } finally {
+                    window.__FLOW2API_BROWSER_SUBMIT_ACTIVE__ = false;
                     clearTimeout(abortTimer);
                 }
             },
@@ -462,6 +681,7 @@ async function handleSubmitFlowRequest(data, socket) {
                 String(data.action || "IMAGE_GENERATION"),
                 targetUrl.toString(),
                 String(data.access_token || ""),
+                cookieAuthorization,
                 data.body || {},
                 Math.max(5000, Number(data.timeout_ms || 60000)),
             ],
@@ -645,6 +865,46 @@ async function handleGetToken(data, socket) {
         }
     }
 }
+
+chrome.runtime.onMessage.addListener((message, sender) => {
+    if (
+        !message ||
+        message.type !== "flow_access_token" ||
+        !sender.tab ||
+        !String(sender.tab.url || "").startsWith(`${FLOW_ROOT_URL}/`)
+    ) {
+        return;
+    }
+    rememberFlowAccessToken(message.access_token, message.captured_at).catch((error) => {
+        console.log("[Flow2API] Could not retain current Flow authentication:", error);
+    });
+});
+
+chrome.webRequest.onBeforeSendHeaders.addListener(
+    (details) => {
+        const authorization = (details.requestHeaders || []).find(
+            (header) => String(header && header.name || "").toLowerCase() === "authorization"
+        );
+        const authorizationValue = String(authorization && authorization.value || "");
+        const authScheme = authorizationValue.trim().split(/\s+/, 1)[0] || "none";
+        writeSessionStorage({
+            [FLOW_REQUEST_AUTH_STORAGE_KEY]: {
+                auth_scheme: authScheme.slice(0, 32),
+                seen_at: Date.now(),
+            },
+        }).catch(() => {});
+
+        const match = authorizationValue.match(
+            /^Bearer\s+(ya29\.[^\s]+)$/i
+        );
+        if (!match) return;
+        rememberFlowAccessToken(match[1], Date.now()).catch((error) => {
+            console.log("[Flow2API] Could not retain Flow request authentication:", error);
+        });
+    },
+    { urls: ["https://aisandbox-pa.googleapis.com/*"] },
+    ["requestHeaders", "extraHeaders"]
+);
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
     if (areaName !== "local") return;

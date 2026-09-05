@@ -247,7 +247,7 @@ class ExtensionAtAutoRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated.ban_reason, "429_rate_limit")
         self.assertTrue(connected)
 
-    async def test_browser_session_sync_refreshes_st_and_at_then_clears_pending(self):
+    async def test_browser_session_sync_adopts_current_flow_at_then_clears_pending(self):
         token = self._token(1, datetime.now(timezone.utc) + timedelta(hours=2))
         token.current_project_id = "project-1"
         token.extension_route_key = "google-1"
@@ -255,10 +255,17 @@ class ExtensionAtAutoRefreshTests(unittest.IsolatedAsyncioTestCase):
         token.is_active = False
         db = _RefreshDbStub([token])
         manager = TokenManager(db, flow_client=SimpleNamespace())
-        manager._do_refresh_at = AsyncMock(return_value=True)
+        manager._get_credits_for_token = AsyncMock(return_value={
+            "credits": 999,
+            "userPaygateTier": "PAYGATE_TIER_ONE",
+        })
+        manager._do_refresh_at = AsyncMock(return_value=False)
+        captured_at = "ya29." + ("fresh" * 30)
         extension_service = SimpleNamespace(
-            get_token_bundle=AsyncMock(return_value={"token": "captcha-token"}),
-            get_session_token=AsyncMock(return_value="fresh-session-token"),
+            get_browser_credentials=AsyncMock(return_value={
+                "session_token": "fresh-session-token",
+                "access_token": captured_at,
+            }),
         )
 
         with patch(
@@ -269,10 +276,18 @@ class ExtensionAtAutoRefreshTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(synchronized)
         self.assertEqual(token.st, "fresh-session-token")
+        self.assertEqual(token.at, captured_at)
+        self.assertEqual(token.credits, 999)
+        self.assertGreater(token.at_expires, datetime.now(timezone.utc) + timedelta(hours=1))
         self.assertTrue(token.is_active)
         self.assertFalse(token.browser_session_sync_pending)
         self.assertEqual(db.reset_error_calls, [1])
-        manager._do_refresh_at.assert_awaited_once_with(1, "fresh-session-token", token)
+        manager._do_refresh_at.assert_not_awaited()
+        extension_service.get_browser_credentials.assert_awaited_once_with(
+            1,
+            project_id="project-1",
+            timeout=20,
+        )
 
     async def test_browser_session_sync_does_not_reactivate_429_ban(self):
         token = self._token(1, datetime.now(timezone.utc) + timedelta(hours=2))
@@ -285,8 +300,10 @@ class ExtensionAtAutoRefreshTests(unittest.IsolatedAsyncioTestCase):
         manager = TokenManager(db, flow_client=SimpleNamespace())
         manager._do_refresh_at = AsyncMock(return_value=True)
         extension_service = SimpleNamespace(
-            get_token_bundle=AsyncMock(return_value={"token": "captcha-token"}),
-            get_session_token=AsyncMock(return_value="fresh-session-token"),
+            get_browser_credentials=AsyncMock(return_value={
+                "session_token": "fresh-session-token",
+                "access_token": "",
+            }),
         )
 
         with patch(
@@ -331,11 +348,14 @@ class ExtensionAtAutoRefreshTests(unittest.IsolatedAsyncioTestCase):
         manager = TokenManager(_RefreshDbStub([token]), flow_client=SimpleNamespace())
         manager._do_refresh_at = AsyncMock(return_value=False)
         manager._try_refresh_st = AsyncMock(return_value=None)
+        manager._refresh_at_from_extension_browser = AsyncMock(return_value=False)
         manager.disable_token = AsyncMock()
 
         refreshed = await manager._refresh_at_inner(1, disable_on_failure=False)
 
         self.assertFalse(refreshed)
+        manager._refresh_at_from_extension_browser.assert_awaited_once_with(1, token)
+        manager._try_refresh_st.assert_not_awaited()
         manager.disable_token.assert_not_awaited()
 
     async def test_st_to_at_response_with_expired_at_is_rejected(self):

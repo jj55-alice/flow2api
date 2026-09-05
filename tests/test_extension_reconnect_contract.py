@@ -13,7 +13,7 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn("alarms", manifest["permissions"])
         self.assertGreaterEqual(
             tuple(int(part) for part in manifest["version"].split(".")),
-            (1, 2, 3),
+            (1, 3, 2),
         )
 
     def test_manifest_allows_current_flow_host(self):
@@ -29,6 +29,33 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn('const FLOW_ROOT_URL = "https://flow.google.com"', background)
         self.assertIn('"https://flow.google.com/*"', background)
         self.assertIn("buildFlowPageUrl(projectId)", background)
+
+    def test_current_flow_auth_is_captured_without_persisting_to_local_storage(self):
+        manifest = json.loads((REPO_ROOT / "extension" / "manifest.json").read_text())
+        capture_script = (REPO_ROOT / "extension" / "auth_capture.js").read_text()
+        bridge_script = (REPO_ROOT / "extension" / "auth_bridge.js").read_text()
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        self.assertTrue(any(
+            script.get("world") == "MAIN"
+            and script.get("run_at") == "document_start"
+            and "auth_capture.js" in script.get("js", [])
+            for script in manifest["content_scripts"]
+        ))
+        self.assertIn("aisandbox-pa.googleapis.com", capture_script)
+        self.assertIn("flow_access_token", bridge_script)
+        self.assertIn("chrome.storage.session", background)
+        self.assertNotIn("chrome.storage.local.set", background)
+        self.assertIn("webRequest", manifest["permissions"])
+        self.assertIn(
+            "https://aisandbox-pa.googleapis.com/*",
+            manifest["host_permissions"],
+        )
+        self.assertIn("chrome.webRequest.onBeforeSendHeaders", background)
+        self.assertIn('"requestHeaders", "extraHeaders"', background)
+        self.assertIn("waitForRecentFlowAccessToken(5000)", background)
+        self.assertNotIn("accounts.google.com/o/oauth2", background)
+        self.assertNotIn("FLOW_OAUTH_CLIENT_ID", background)
 
     def test_worker_reconnects_on_chrome_start_and_alarm(self):
         background = (REPO_ROOT / "extension" / "background.js").read_text()
