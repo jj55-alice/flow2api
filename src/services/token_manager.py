@@ -149,7 +149,7 @@ class TokenManager:
         credentials = await service.get_browser_credentials(
             token_id,
             project_id=str(token.current_project_id or "").strip(),
-            timeout=20,
+            timeout=35,
         )
         if not isinstance(credentials, dict):
             self._browser_auth_failure_reasons[token_id] = (

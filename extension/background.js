@@ -15,6 +15,7 @@ const FLOW_TAB_PATTERNS = [
 const FLOW_ACCESS_TOKEN_STORAGE_KEY = "flowAccessTokenSession";
 const FLOW_REQUEST_AUTH_STORAGE_KEY = "flowRequestAuthObservation";
 const FLOW_ACCESS_TOKEN_MAX_AGE_MS = 2 * 60 * 1000;
+const FLOW_REQUEST_AUTH_MAX_AGE_MS = 5 * 60 * 1000;
 const FLOW_API_ROOT_URL = "https://aisandbox-pa.googleapis.com/v1";
 
 const DEFAULT_SETTINGS = {
@@ -92,6 +93,68 @@ function accessTokenFromAuthorization(value) {
     return normalizeCapturedAccessToken(match && match[1]);
 }
 
+function normalizeFlowRequestAuthorization(value) {
+    const authorization = String(value || "").trim();
+    if (!authorization || authorization.length > 8192 || /[\r\n]/.test(authorization)) {
+        return "";
+    }
+    if (accessTokenFromAuthorization(authorization)) {
+        return authorization;
+    }
+    if (!/^(?:SAPISIDHASH|SAPISID1PHASH|SAPISID3PHASH)\s+\S+/i.test(authorization)) {
+        return "";
+    }
+    return authorization;
+}
+
+async function rememberFlowRequestAuthorization(authorization, capturedAt, authUser = "") {
+    const normalizedAuthorization = normalizeFlowRequestAuthorization(authorization);
+    if (!normalizedAuthorization) return;
+    const observedAuthUser = /^\d{1,3}$/.test(String(authUser || "").trim())
+        ? String(authUser).trim()
+        : "0";
+    await writeSessionStorage({
+        [FLOW_REQUEST_AUTH_STORAGE_KEY]: {
+            authorization: normalizedAuthorization,
+            auth_scheme: normalizedAuthorization.split(/\s+/, 1)[0].slice(0, 32),
+            auth_user: observedAuthUser,
+            seen_at: Number(capturedAt || Date.now()),
+        },
+    });
+}
+
+async function getRecentFlowRequestAuthorization(notBefore = 0) {
+    const captured = await readSessionStorage(FLOW_REQUEST_AUTH_STORAGE_KEY);
+    const authorization = normalizeFlowRequestAuthorization(captured && captured.authorization);
+    const capturedAt = Number(captured && captured.seen_at || 0);
+    if (
+        !authorization ||
+        !capturedAt ||
+        capturedAt < Number(notBefore || 0) ||
+        Date.now() - capturedAt > FLOW_REQUEST_AUTH_MAX_AGE_MS
+    ) {
+        return null;
+    }
+    return {
+        authorization,
+        auth_scheme: authorization.split(/\s+/, 1)[0].slice(0, 32),
+        auth_user: /^\d{1,3}$/.test(String(captured && captured.auth_user || ""))
+            ? String(captured.auth_user)
+            : "0",
+        seen_at: capturedAt,
+    };
+}
+
+async function waitForRecentFlowRequestAuthorization(notBefore, timeoutMs = 3000) {
+    const deadline = Date.now() + Math.max(0, Number(timeoutMs || 0));
+    do {
+        const captured = await getRecentFlowRequestAuthorization(notBefore);
+        if (captured) return captured;
+        await sleep(200);
+    } while (Date.now() < deadline);
+    return null;
+}
+
 async function rememberFlowAccessToken(accessToken, capturedAt) {
     const normalizedToken = normalizeCapturedAccessToken(accessToken);
     if (!normalizedToken) return;
@@ -160,19 +223,19 @@ async function buildGoogleCookieAuthorization(origin = FLOW_ROOT_URL) {
     return parts.join(" ");
 }
 
-async function probeBrowserFlowAuthentication(tabId, authorization) {
+async function probeBrowserFlowAuthentication(tabId, authorization, authUser = "0") {
     if (!tabId || !authorization) return null;
     try {
         const results = await chrome.scripting.executeScript({
             target: { tabId },
             world: "MAIN",
-            func: async (requestUrl, cookieAuthorization) => {
+            func: async (requestUrl, cookieAuthorization, googleAuthUser) => {
                 try {
                     const response = await fetch(requestUrl, {
                         method: "GET",
                         headers: {
                             "authorization": cookieAuthorization,
-                            "x-goog-authuser": "0",
+                            "x-goog-authuser": googleAuthUser,
                         },
                         credentials: "include",
                     });
@@ -198,7 +261,7 @@ async function probeBrowserFlowAuthentication(tabId, authorization) {
                     };
                 }
             },
-            args: [`${FLOW_API_ROOT_URL}/credits`, authorization],
+            args: [`${FLOW_API_ROOT_URL}/credits`, authorization, authUser],
         });
         const result = results && results[0] && results[0].result;
         return result && Number.isInteger(result.http_status) ? result : null;
@@ -448,6 +511,7 @@ async function handleGetSessionCookie(data, socket) {
     let newTabId = null;
     try {
         const projectId = String(data.project_id || "").trim();
+        const authCaptureStartedAt = Date.now();
         if (projectId) {
             const newTab = await chrome.tabs.create({
                 url: buildFlowPageUrl(projectId),
@@ -457,19 +521,33 @@ async function handleGetSessionCookie(data, socket) {
             await waitForTabReady(newTabId);
         }
 
-        let capturedAuth = await getRecentFlowAccessToken();
-        if (!capturedAuth && projectId) {
-            // Flow now commonly authenticates its own API requests from the
-            // signed-in page instead of rotating the legacy Labs session
-            // cookie. Give those page requests time to expose a fresh bearer
-            // token before falling back to first-party cookie authentication.
-            capturedAuth = await waitForRecentFlowAccessToken(5000);
+        let requestAuthorization = projectId
+            ? await waitForRecentFlowRequestAuthorization(authCaptureStartedAt, 3000)
+            : null;
+        if (!requestAuthorization) {
+            requestAuthorization = await getRecentFlowRequestAuthorization();
+        }
+        const observedBearer = accessTokenFromAuthorization(
+            requestAuthorization && requestAuthorization.authorization
+        );
+        let capturedAuth = observedBearer
+            ? { access_token: observedBearer, captured_at: requestAuthorization.seen_at }
+            : (!requestAuthorization ? await getRecentFlowAccessToken() : null);
+        if (!capturedAuth && !requestAuthorization && projectId) {
+            capturedAuth = await waitForRecentFlowAccessToken(1000);
         }
         const cookieAuthorization = !capturedAuth && newTabId
-            ? await buildGoogleCookieAuthorization(FLOW_ROOT_URL)
+            ? (
+                requestAuthorization && requestAuthorization.authorization ||
+                await buildGoogleCookieAuthorization(FLOW_ROOT_URL)
+            )
             : "";
         const browserAuth = !capturedAuth && newTabId
-            ? await probeBrowserFlowAuthentication(newTabId, cookieAuthorization)
+            ? await probeBrowserFlowAuthentication(
+                newTabId,
+                cookieAuthorization,
+                requestAuthorization && requestAuthorization.auth_user || "0"
+            )
             : null;
         const authObservation = await readSessionStorage(FLOW_REQUEST_AUTH_STORAGE_KEY) || {};
 
@@ -537,6 +615,7 @@ async function handleSubmitFlowRequest(data, socket) {
             throw new Error("Missing Flow project ID");
         }
         const flowPageUrl = buildFlowPageUrl(projectId);
+        const authCaptureStartedAt = Date.now();
         console.log("[Flow2API] Opening mapped Flow project for browser-side submit...");
         const newTab = await chrome.tabs.create({ url: flowPageUrl, active: false });
         newTabId = newTab.id;
@@ -544,12 +623,26 @@ async function handleSubmitFlowRequest(data, socket) {
         await waitForTabReady(newTabId);
         await sleep(1200);
 
-        const cookieAuthorization = await buildGoogleCookieAuthorization(FLOW_ROOT_URL);
+        let requestAuthorization = await getRecentFlowRequestAuthorization(authCaptureStartedAt);
+        if (!requestAuthorization) {
+            requestAuthorization = await getRecentFlowRequestAuthorization();
+        }
+        const cookieAuthorization = requestAuthorization && requestAuthorization.authorization
+            || await buildGoogleCookieAuthorization(FLOW_ROOT_URL);
+        const googleAuthUser = requestAuthorization && requestAuthorization.auth_user || "0";
 
         const results = await chrome.scripting.executeScript({
             target: { tabId: newTabId },
             world: "MAIN",
-            func: async (action, requestUrl, accessToken, cookieAuthorization, requestBody, timeoutMs) => {
+            func: async (
+                action,
+                requestUrl,
+                accessToken,
+                cookieAuthorization,
+                googleAuthUser,
+                requestBody,
+                timeoutMs
+            ) => {
                 const websiteKey = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
                 const browserFingerprint = () => {
                     const languages = Array.from(
@@ -640,13 +733,13 @@ async function handleSubmitFlowRequest(data, socket) {
                     if (cookieAuthorization) {
                         authorizationCandidates.push({
                             value: cookieAuthorization,
-                            googleAuthUser: true,
+                            googleAuthUser,
                         });
                     }
                     if (accessToken) {
                         authorizationCandidates.push({
                             value: `Bearer ${accessToken}`,
-                            googleAuthUser: false,
+                            googleAuthUser: "",
                         });
                     }
                     if (!authorizationCandidates.length) {
@@ -661,7 +754,7 @@ async function handleSubmitFlowRequest(data, socket) {
                             "content-type": "text/plain;charset=UTF-8",
                         };
                         if (candidate.googleAuthUser) {
-                            headers["x-goog-authuser"] = "0";
+                            headers["x-goog-authuser"] = candidate.googleAuthUser;
                         }
                         response = await fetch(requestUrl, {
                             method: "POST",
@@ -695,6 +788,7 @@ async function handleSubmitFlowRequest(data, socket) {
                 targetUrl.toString(),
                 String(data.access_token || ""),
                 cookieAuthorization,
+                googleAuthUser,
                 data.body || {},
                 Math.max(5000, Number(data.timeout_ms || 60000)),
             ],
@@ -882,15 +976,24 @@ async function handleGetToken(data, socket) {
 chrome.runtime.onMessage.addListener((message, sender) => {
     if (
         !message ||
-        message.type !== "flow_access_token" ||
         !sender.tab ||
         !String(sender.tab.url || "").startsWith(`${FLOW_ROOT_URL}/`)
     ) {
         return;
     }
-    rememberFlowAccessToken(message.access_token, message.captured_at).catch((error) => {
-        console.log("[Flow2API] Could not retain current Flow authentication:", error);
-    });
+    if (message.type === "flow_access_token") {
+        rememberFlowAccessToken(message.access_token, message.captured_at).catch((error) => {
+            console.log("[Flow2API] Could not retain current Flow authentication:", error);
+        });
+    } else if (message.type === "flow_request_authorization") {
+        rememberFlowRequestAuthorization(
+            message.authorization,
+            message.captured_at,
+            message.auth_user
+        ).catch((error) => {
+            console.log("[Flow2API] Could not retain Flow request authorization:", error);
+        });
+    }
 });
 
 chrome.webRequest.onBeforeSendHeaders.addListener(
@@ -900,13 +1003,14 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
         );
         const authorizationValue = String(authorization && authorization.value || "");
         if (!authorizationValue) return;
-        const authScheme = authorizationValue.trim().split(/\s+/, 1)[0] || "unknown";
-        writeSessionStorage({
-            [FLOW_REQUEST_AUTH_STORAGE_KEY]: {
-                auth_scheme: authScheme.slice(0, 32),
-                seen_at: Date.now(),
-            },
-        }).catch(() => {});
+        const authUserHeader = (details.requestHeaders || []).find(
+            (header) => String(header && header.name || "").toLowerCase() === "x-goog-authuser"
+        );
+        rememberFlowRequestAuthorization(
+            authorizationValue,
+            Date.now(),
+            String(authUserHeader && authUserHeader.value || "")
+        ).catch(() => {});
 
         const accessToken = accessTokenFromAuthorization(authorizationValue);
         if (!accessToken) return;

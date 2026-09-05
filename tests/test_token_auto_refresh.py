@@ -286,7 +286,7 @@ class ExtensionAtAutoRefreshTests(unittest.IsolatedAsyncioTestCase):
         extension_service.get_browser_credentials.assert_awaited_once_with(
             1,
             project_id="project-1",
-            timeout=20,
+            timeout=35,
         )
 
     async def test_browser_session_sync_does_not_reactivate_429_ban(self):

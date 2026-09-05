@@ -6,12 +6,32 @@
             event.source !== window ||
             event.origin !== location.origin ||
             !event.data ||
-            event.data.source !== MESSAGE_SOURCE ||
-            event.data.type !== "flow_access_token"
+            event.data.source !== MESSAGE_SOURCE
         ) {
             return;
         }
 
+        if (event.data.type === "flow_request_authorization") {
+            const authorization = String(event.data.authorization || "").trim();
+            if (
+                !authorization ||
+                authorization.length > 8192 ||
+                /[\r\n]/.test(authorization) ||
+                !/^(?:Bearer|SAPISIDHASH|SAPISID1PHASH|SAPISID3PHASH)\s+\S+/i.test(authorization)
+            ) {
+                return;
+            }
+            chrome.runtime.sendMessage({
+                type: "flow_request_authorization",
+                authorization,
+                captured_at: Number(event.data.captured_at || Date.now()),
+            }, () => {
+                void chrome.runtime.lastError;
+            });
+            return;
+        }
+
+        if (event.data.type !== "flow_access_token") return;
         const accessToken = String(event.data.access_token || "").trim();
         if (!accessToken || accessToken.length > 4096 || !/^[A-Za-z0-9\-._~+/]+=*$/.test(accessToken)) {
             return;

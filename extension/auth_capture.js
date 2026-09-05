@@ -20,7 +20,24 @@
         if (window.__FLOW2API_BROWSER_SUBMIT_ACTIVE__) return;
         if (!isFlowApiUrl(requestUrl)) return;
 
-        const match = String(value || "").trim().match(/^Bearer\s+([^\s]+)$/i);
+        const authorization = String(value || "").trim();
+        if (
+            !authorization ||
+            authorization.length > 8192 ||
+            /[\r\n]/.test(authorization) ||
+            !/^(?:Bearer|SAPISIDHASH|SAPISID1PHASH|SAPISID3PHASH)\s+\S+/i.test(authorization)
+        ) {
+            return;
+        }
+
+        window.postMessage({
+            source: MESSAGE_SOURCE,
+            type: "flow_request_authorization",
+            authorization,
+            captured_at: Date.now(),
+        }, location.origin);
+
+        const match = authorization.match(/^Bearer\s+([^\s]+)$/i);
         const accessToken = String(match && match[1] || "");
         if (!accessToken || accessToken.length > 4096 || !/^[A-Za-z0-9\-._~+/]+=*$/.test(accessToken)) {
             return;
