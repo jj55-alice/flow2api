@@ -345,6 +345,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(credentials["access_token"].startswith("opaque-flow-token_"))
         self.assertEqual(credentials["session_token"], "labs-session-token")
+        self.assertEqual(credentials["extension_version"], "1.3.0")
 
     async def test_token_bundle_preserves_browser_fingerprint(self):
         service = ExtensionCaptchaService(db=_RouteDbStub())

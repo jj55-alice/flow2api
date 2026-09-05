@@ -507,6 +507,7 @@ class ExtensionCaptchaService:
                         "session_token": session_token,
                         "access_token": access_token,
                         "access_token_captured_at": result.get("access_token_captured_at"),
+                        "extension_version": conn.extension_version,
                         "browser_auth_valid": browser_auth_valid,
                         "browser_auth_status": browser_auth_status,
                         "observed_auth_scheme": str(
@@ -522,10 +523,31 @@ class ExtensionCaptchaService:
                     f"browser_status={result.get('browser_auth_status') or 0}, "
                     f"observed_scheme={str(result.get('observed_auth_scheme') or 'none')[:32]}"
                 )
-                return {}
+                try:
+                    browser_auth_status = int(result.get("browser_auth_status") or 0)
+                except (TypeError, ValueError):
+                    browser_auth_status = 0
+                return {
+                    "extension_version": conn.extension_version,
+                    "browser_auth_valid": False,
+                    "browser_auth_status": browser_auth_status,
+                    "observed_auth_scheme": str(
+                        result.get("observed_auth_scheme") or "none"
+                    ).strip()[:32],
+                    "observed_auth_at": result.get("observed_auth_at"),
+                    "browser_auth_error": str(
+                        result.get("error") or "browser credential request failed"
+                    ).strip()[:240],
+                }
             except asyncio.TimeoutError:
                 debug_logger.log_warning("[Extension Captcha] Browser credential request timed out")
-                return {}
+                return {
+                    "extension_version": conn.extension_version,
+                    "browser_auth_valid": False,
+                    "browser_auth_status": 0,
+                    "observed_auth_scheme": "none",
+                    "browser_auth_error": "browser credential request timed out",
+                }
             finally:
                 self.pending_requests.pop(req_id, None)
 

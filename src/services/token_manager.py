@@ -32,6 +32,7 @@ class TokenManager:
         self._at_validation_cache: dict[int, float] = {}
         self._proactive_at_retry_after: dict[int, float] = {}
         self._proactive_at_failure_counts: dict[int, int] = {}
+        self._browser_auth_failure_reasons: dict[int, str] = {}
         self._protocol_refresher_task: Optional[asyncio.Task] = None
 
     async def _get_token_lock(
@@ -151,11 +152,24 @@ class TokenManager:
             timeout=20,
         )
         if not isinstance(credentials, dict):
+            self._browser_auth_failure_reasons[token_id] = (
+                "current Flow browser session returned an invalid response"
+            )
             return False
 
         session_token = str(credentials.get("session_token") or "").strip()
         browser_at = str(credentials.get("access_token") or "").strip()
         browser_auth_valid = bool(credentials.get("browser_auth_valid"))
+        extension_version = str(credentials.get("extension_version") or "unknown").strip()[:32]
+        observed_auth_scheme = str(
+            credentials.get("observed_auth_scheme") or "none"
+        ).strip()[:32]
+        try:
+            browser_auth_status = int(credentials.get("browser_auth_status") or 0)
+        except (TypeError, ValueError):
+            browser_auth_status = 0
+        browser_auth_error = str(credentials.get("browser_auth_error") or "").strip()[:240]
+        captured_token_rejected = False
         now = datetime.now(timezone.utc)
 
         if session_token and session_token != str(token.st or "").strip():
@@ -183,8 +197,10 @@ class TokenManager:
                 debug_logger.log_info(
                     f"[AT_REFRESH] Token {token_id}: current Flow browser AT verified"
                 )
+                self._browser_auth_failure_reasons.pop(token_id, None)
                 return True
             except Exception as e:
+                captured_token_rejected = True
                 record_token_refresh("at", "failure")
                 debug_logger.log_warning(
                     f"[AT_REFRESH] Token {token_id}: captured browser AT validation failed - {e}"
@@ -211,13 +227,32 @@ class TokenManager:
             debug_logger.log_info(
                 f"[AT_REFRESH] Token {token_id}: current Flow browser cookie authentication verified"
             )
+            self._browser_auth_failure_reasons.pop(token_id, None)
             return True
+
+        diagnostic_parts = [f"extension={extension_version}"]
+        if observed_auth_scheme != "none":
+            diagnostic_parts.append(f"observed_auth={observed_auth_scheme}")
+        if browser_auth_status:
+            diagnostic_parts.append(f"browser_status={browser_auth_status}")
+        if captured_token_rejected:
+            diagnostic_parts.append("captured_token_validation=failed")
+        if browser_auth_error:
+            diagnostic_parts.append(f"extension_error={browser_auth_error}")
+        self._browser_auth_failure_reasons[token_id] = (
+            "current Flow browser session authentication could not be verified ("
+            + ", ".join(diagnostic_parts)
+            + ")"
+        )
 
         if session_token:
             debug_logger.log_info(
                 f"[AT_REFRESH] Token {token_id}: falling back to legacy session exchange"
             )
-            return await self._do_refresh_at(token_id, session_token, token)
+            refreshed = await self._do_refresh_at(token_id, session_token, token)
+            if refreshed:
+                self._browser_auth_failure_reasons.pop(token_id, None)
+            return refreshed
 
         return False
 
@@ -433,7 +468,10 @@ class TokenManager:
                 if not refreshed:
                     await self._record_extension_st_refresh_failure(
                         token_id,
-                        "current Flow browser session authentication could not be verified",
+                        self._browser_auth_failure_reasons.pop(
+                            token_id,
+                            "current Flow browser session authentication could not be verified",
+                        ),
                     )
                     return False
 

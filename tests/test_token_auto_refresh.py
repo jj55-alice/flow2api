@@ -317,6 +317,35 @@ class ExtensionAtAutoRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(token.ban_reason, "429_rate_limit")
         self.assertEqual(db.reset_error_calls, [])
 
+    async def test_browser_session_sync_records_safe_auth_diagnostics(self):
+        token = self._token(1, datetime.now(timezone.utc) - timedelta(hours=2))
+        token.current_project_id = "project-1"
+        token.extension_route_key = "google-1"
+        token.browser_session_sync_pending = True
+        db = _RefreshDbStub([token])
+        manager = TokenManager(db, flow_client=SimpleNamespace())
+        extension_service = SimpleNamespace(
+            get_browser_credentials=AsyncMock(return_value={
+                "extension_version": "1.3.5",
+                "browser_auth_valid": False,
+                "browser_auth_status": 401,
+                "observed_auth_scheme": "Bearer",
+                "browser_auth_error": "Flow authentication unavailable",
+            }),
+        )
+
+        with patch(
+            "src.services.browser_captcha_extension.ExtensionCaptchaService.get_instance",
+            new=AsyncMock(return_value=extension_service),
+        ):
+            synchronized = await manager.sync_extension_browser_session(1)
+
+        self.assertFalse(synchronized)
+        self.assertIn("extension=1.3.5", token.last_st_refresh_result)
+        self.assertIn("observed_auth=Bearer", token.last_st_refresh_result)
+        self.assertIn("browser_status=401", token.last_st_refresh_result)
+        self.assertNotIn("access_token", token.last_st_refresh_result)
+
     async def test_extension_error_threshold_schedules_session_recovery(self):
         token = self._token(1, datetime.now(timezone.utc) + timedelta(hours=2))
         token.browser_enabled = True
