@@ -169,6 +169,7 @@ class TokenManager:
         except (TypeError, ValueError):
             browser_auth_status = 0
         browser_auth_error = str(credentials.get("browser_auth_error") or "").strip()[:240]
+        observed_api_key = bool(credentials.get("observed_api_key"))
         captured_token_rejected = False
         now = datetime.now(timezone.utc)
 
@@ -235,6 +236,7 @@ class TokenManager:
             diagnostic_parts.append(f"observed_auth={observed_auth_scheme}")
         if browser_auth_status:
             diagnostic_parts.append(f"browser_status={browser_auth_status}")
+        diagnostic_parts.append(f"api_key={'yes' if observed_api_key else 'no'}")
         if captured_token_rejected:
             diagnostic_parts.append("captured_token_validation=failed")
         if browser_auth_error:

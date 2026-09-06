@@ -17,7 +17,10 @@
     }
 
     function publishAuthorization(value, requestUrl) {
-        if (window.__FLOW2API_BROWSER_SUBMIT_ACTIVE__) return;
+        if (
+            window.__FLOW2API_BROWSER_SUBMIT_ACTIVE__ ||
+            window.__FLOW2API_BROWSER_AUTH_PROBE_ACTIVE__
+        ) return;
         if (!isFlowApiUrl(requestUrl)) return;
 
         const authorization = String(value || "").trim();

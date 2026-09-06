@@ -514,6 +514,7 @@ class ExtensionCaptchaService:
                             result.get("observed_auth_scheme") or "none"
                         ).strip()[:32],
                         "observed_auth_at": result.get("observed_auth_at"),
+                        "observed_api_key": bool(result.get("observed_api_key")),
                         "credits": credits,
                         "user_paygate_tier": user_paygate_tier,
                     }
@@ -535,6 +536,7 @@ class ExtensionCaptchaService:
                         result.get("observed_auth_scheme") or "none"
                     ).strip()[:32],
                     "observed_auth_at": result.get("observed_auth_at"),
+                    "observed_api_key": bool(result.get("observed_api_key")),
                     "browser_auth_error": str(
                         result.get("error") or "browser credential request failed"
                     ).strip()[:240],

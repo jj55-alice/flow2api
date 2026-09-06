@@ -344,6 +344,7 @@ class ExtensionAtAutoRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("extension=1.3.5", token.last_st_refresh_result)
         self.assertIn("observed_auth=Bearer", token.last_st_refresh_result)
         self.assertIn("browser_status=401", token.last_st_refresh_result)
+        self.assertIn("api_key=no", token.last_st_refresh_result)
         self.assertNotIn("access_token", token.last_st_refresh_result)
 
     async def test_extension_error_threshold_schedules_session_recovery(self):
