@@ -13,6 +13,15 @@ from ..core.config import config
 from ..core.logger import debug_logger
 
 
+class ExtensionCaptchaError(RuntimeError):
+    """Actionable extension-captcha failure that must not be flattened to None."""
+
+    def __init__(self, message: str, code: str = "extension_captcha_failed"):
+        super().__init__(message)
+        self.code = code
+        self.http_status = 503
+
+
 @dataclass
 class ExtensionConnection:
     websocket: WebSocket
@@ -282,6 +291,22 @@ class ExtensionCaptchaService:
     def describe_routes(self) -> str:
         return self._describe_routes()
 
+    def get_runtime_status(self) -> Dict[str, Any]:
+        """Return non-sensitive connection data for the admin configuration UI."""
+        routes = [
+            {
+                "route_key": conn.route_key,
+                "client_label": conn.client_label,
+                "connected_at": conn.connected_at,
+            }
+            for conn in self.active_connections
+        ]
+        return {
+            "connected": bool(routes),
+            "connection_count": len(routes),
+            "routes": routes,
+        }
+
     @staticmethod
     def _normalize_fingerprint(value: Any) -> Dict[str, str]:
         if not isinstance(value, dict):
@@ -410,15 +435,19 @@ class ExtensionCaptchaService:
     ) -> Optional[Dict[str, Any]]:
         if not self.active_connections:
             debug_logger.log_warning("[Extension Captcha] No active extension connections available.")
-            raise RuntimeError("Chrome Extension not connected or Google Labs tab not open.")
+            raise ExtensionCaptchaError(
+                "Chrome extension is not connected. Open a Google Labs tab and check the extension connection URL/API key.",
+                code="extension_not_connected",
+            )
 
         route_key = await self._resolve_route_key(token_id)
         conn = self._select_connection(route_key)
         if conn is None:
             available = self._describe_routes() or "none"
-            raise RuntimeError(
+            raise ExtensionCaptchaError(
                 f"No Chrome Extension connection matches token_id={token_id} route_key='{route_key}'. "
-                f"Available route keys: {available}"
+                f"Available route keys: {available}",
+                code="extension_route_mismatch",
             )
         route_guard_key = route_key or "(empty)"
         route_lock = self._route_locks.setdefault(route_guard_key, asyncio.Lock())
@@ -439,9 +468,10 @@ class ExtensionCaptchaService:
             conn = self._select_connection(route_key)
             if conn is None:
                 available = self._describe_routes() or "none"
-                raise RuntimeError(
+                raise ExtensionCaptchaError(
                     f"Chrome Extension disconnected while waiting for route_key='{route_key}'. "
-                    f"Available route keys: {available}"
+                    f"Available route keys: {available}",
+                    code="extension_disconnected",
                 )
 
             return await self._dispatch_token_request(
@@ -779,7 +809,10 @@ class ExtensionCaptchaService:
             if result.get("status") == "success":
                 token = str(result.get("token") or "").strip()
                 if not token:
-                    return None
+                    raise ExtensionCaptchaError(
+                        "Chrome extension reported success but returned an empty reCAPTCHA token.",
+                        code="extension_empty_token",
+                    )
                 fingerprint = self._normalize_fingerprint(result.get("fingerprint"))
                 if fingerprint:
                     conn.fingerprint = fingerprint
@@ -790,16 +823,27 @@ class ExtensionCaptchaService:
                     "fingerprint": fingerprint,
                 }
 
-            error_msg = result.get("error")
+            error_msg = str(result.get("error") or "unknown extension error").strip()
             debug_logger.log_error(f"[Extension Captcha] Error from extension: {error_msg}")
-            return None
+            raise ExtensionCaptchaError(
+                f"Chrome extension failed to obtain a reCAPTCHA token: {error_msg}",
+                code="extension_token_failed",
+            )
 
         except asyncio.TimeoutError:
             debug_logger.log_error(f"[Extension Captcha] Timeout waiting for token (req_id: {req_id})")
-            return None
+            raise ExtensionCaptchaError(
+                f"Timed out after {timeout}s waiting for the Chrome extension to return a reCAPTCHA token.",
+                code="extension_token_timeout",
+            )
+        except ExtensionCaptchaError:
+            raise
         except Exception as e:
             debug_logger.log_error(f"[Extension Captcha] Communication error: {e}")
-            return None
+            raise ExtensionCaptchaError(
+                f"Chrome extension communication failed: {e}",
+                code="extension_communication_failed",
+            ) from e
         finally:
             self.pending_requests.pop(req_id, None)
 

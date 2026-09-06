@@ -14,6 +14,7 @@ from pathlib import Path
 from .core.config import config
 from .core.database import Database
 from .core.monitoring import CONTENT_TYPE_LATEST, render_main_metrics
+from .core.korean_ui import localized_static_page_response
 from .services.flow_client import FlowClient
 from .services.proxy_manager import ProxyManager
 from .services.token_manager import TokenManager
@@ -300,8 +301,11 @@ _STATIC_PAGE_NO_CACHE_HEADERS = {
 }
 
 
-def _static_page_response(file_path: Path) -> FileResponse:
-    return FileResponse(str(file_path), headers=_STATIC_PAGE_NO_CACHE_HEADERS)
+def _static_page_response(file_path: Path) -> Response:
+    return localized_static_page_response(
+        file_path,
+        headers=_STATIC_PAGE_NO_CACHE_HEADERS,
+    )
 
 
 @app.get("/", response_class=HTMLResponse)

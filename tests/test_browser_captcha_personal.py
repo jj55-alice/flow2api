@@ -8,7 +8,9 @@ from src.services.browser_captcha_personal import (
     BrowserCaptchaService,
     ResidentTabInfo,
     _PersonalBrowserPoolService,
+    _build_personal_browser_args,
     _patch_nodriver_connection_instance,
+    _tune_personal_browser_args_for_docker_headed,
 )
 
 
@@ -353,6 +355,15 @@ class BrowserCaptchaPersonalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(connection.connect_count, 1)
         self.assertEqual(connection.register_count, 1)
         self.assertTrue(getattr(connection, "_flow2api_send_patched", False))
+
+    def test_docker_headed_tuning_removes_crashing_optimization_hints_override(self):
+        browser_args = _build_personal_browser_args(headless=False)
+
+        tuned_args = _tune_personal_browser_args_for_docker_headed(browser_args)
+
+        self.assertTrue(any("OptimizationHints" in arg for arg in browser_args))
+        self.assertFalse(any("OptimizationHints" in arg for arg in tuned_args))
+        self.assertTrue(any("UseDnsHttpsSvcb" in arg for arg in tuned_args))
 
 
 if __name__ == "__main__":

@@ -667,6 +667,17 @@ def _tune_personal_browser_args_for_docker_headed(
             continue
         if any(arg.startswith(prefix) for prefix in removable_prefixes):
             continue
+        if arg.startswith('--disable-features='):
+            # Chromium 151 can segfault on Docker/X11 with this feature override;
+            # nodriver then only observes an abnormal websocket close (1006).
+            disabled_features = [
+                feature
+                for feature in arg.partition('=')[2].split(',')
+                if feature and feature != 'OptimizationHints'
+            ]
+            if disabled_features:
+                tuned_args.append(f"--disable-features={','.join(disabled_features)}")
+            continue
         tuned_args.append(arg)
 
     tuned_args.extend([

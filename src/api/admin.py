@@ -46,6 +46,39 @@ captcha_runtime_prepare_tasks: Dict[str, asyncio.Task] = {}
 
 ADMIN_SESSION_COOKIE_NAME = "admin_session"
 SUPPORTED_API_CAPTCHA_METHODS = {"yescaptcha", "capmonster", "ezcaptcha", "capsolver"}
+SUPPORTED_CAPTCHA_METHODS = SUPPORTED_API_CAPTCHA_METHODS | {
+    "extension", "browser", "personal", "remote_browser"
+}
+
+
+async def _get_extension_captcha_status() -> Dict[str, Any]:
+    """Build an admin-safe snapshot of extension connections and token routing."""
+    from ..services.browser_captcha_extension import ExtensionCaptchaService
+
+    service = await ExtensionCaptchaService.get_instance(db)
+    status = service.get_runtime_status()
+    tokens = await token_manager.get_active_tokens() if token_manager else []
+    configured_routes = {
+        str(getattr(item, "extension_route_key", "") or "").strip()
+        for item in tokens
+        if str(getattr(item, "extension_route_key", "") or "").strip()
+    }
+    active_routes = {
+        str(item.get("route_key") or "").strip()
+        for item in status["routes"]
+        if str(item.get("route_key") or "").strip()
+    }
+    tokens_without_route = [
+        item.id for item in tokens
+        if not str(getattr(item, "extension_route_key", "") or "").strip()
+    ]
+    status.update({
+        "configured_routes": sorted(configured_routes),
+        "unmatched_routes": sorted(configured_routes - active_routes),
+        "tokens_without_route": tokens_without_route,
+        "ready": bool(status["connected"] and not (configured_routes - active_routes) and not tokens_without_route),
+    })
+    return status
 
 
 def _mask_token(token: Optional[str]) -> str:
@@ -1916,7 +1949,9 @@ async def update_captcha_config(
     token: str = Depends(verify_admin_token)
 ):
     """Update captcha configuration"""
-    captcha_method = request.get("captcha_method")
+    captcha_method = str(request.get("captcha_method") or "").strip().lower()
+    if captcha_method not in SUPPORTED_CAPTCHA_METHODS:
+        return {"success": False, "message": f"不支持的验证码方式: {captcha_method or '<empty>'}"}
     yescaptcha_api_key = request.get("yescaptcha_api_key")
     yescaptcha_base_url = request.get("yescaptcha_base_url")
     yescaptcha_task_type = normalize_yescaptcha_task_type(request.get("yescaptcha_task_type"))
@@ -2016,13 +2051,22 @@ async def update_captcha_config(
                 "已开始准备内置浏览器打码运行环境，安装进度将自动显示。"
             )
 
-    return {
+    response = {
         "success": True,
         "message": "验证码配置更新成功",
         "runtime_prepare_started": runtime_prepare_started,
         "runtime_prepare_message": runtime_prepare_message,
         "runtime_status_method": runtime_status_method,
     }
+    if captcha_method == "extension":
+        extension_status = await _get_extension_captcha_status()
+        response["extension_status"] = extension_status
+        if not extension_status["ready"]:
+            response["warning"] = (
+                "扩展模式已保存，但连接或 Token 路由尚未就绪。"
+                "请保持 Google Labs 页面打开，并让每个 Token 的扩展路由与在线路由一致。"
+            )
+    return response
 
 
 @router.get("/api/captcha/runtime-status")
@@ -2043,7 +2087,7 @@ async def get_captcha_runtime_status(
 async def get_captcha_config(token: str = Depends(verify_admin_token)):
     """Get captcha configuration"""
     captcha_config = await db.get_captcha_config()
-    return {
+    result = {
         "captcha_method": captcha_config.captcha_method,
         "yescaptcha_api_key": captcha_config.yescaptcha_api_key,
         "yescaptcha_base_url": captcha_config.yescaptcha_base_url,
@@ -2063,8 +2107,11 @@ async def get_captcha_config(token: str = Depends(verify_admin_token)):
         "personal_project_pool_size": captcha_config.personal_project_pool_size,
         "personal_max_resident_tabs": captcha_config.personal_max_resident_tabs,
         "browser_personal_fresh_restart_every_n_solves": captcha_config.browser_personal_fresh_restart_every_n_solves,
-        "personal_idle_tab_ttl_seconds": captcha_config.personal_idle_tab_ttl_seconds
+        "personal_idle_tab_ttl_seconds": captcha_config.personal_idle_tab_ttl_seconds,
+        "config_source": "database",
     }
+    result["extension_status"] = await _get_extension_captcha_status()
+    return result
 
 
 @router.post("/api/captcha/score-test")

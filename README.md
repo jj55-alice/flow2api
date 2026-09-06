@@ -71,6 +71,17 @@
 
 - 自动更新st浏览器拓展：[Flow2API-Token-Updater](https://github.com/TheSmallHanCat/Flow2API-Token-Updater)
 
+#### Chrome 扩展验证码模式
+
+1. 在 Chrome 的扩展管理页加载本仓库的 `extension/` 目录（更新代码后需点击“重新加载”）。
+2. 在扩展选项中填写 Flow2API WebSocket 地址、API Key 和 Route Key。
+3. 在管理台的验证码配置中选择 `Chrome扩展打码`。
+4. 编辑对应 Token，将“扩展路由”设置为与扩展 Route Key 完全相同的值。
+5. 管理台显示“扩展已就绪”后再发起生成请求。
+
+验证码方式以管理台数据库配置为运行时权威值；`setting.toml` 仅用于首次初始化数据库。
+扩展 `1.1.0` 起会同时返回生成验证码时的 User-Agent/语言指纹，后端提交 Flow 请求时会复用该指纹，避免验证码生成环境与提交环境不一致。
+
 ### 方式一：Docker 部署（推荐）
 
 #### 标准模式（不使用代理）
@@ -590,4 +601,3 @@ curl -X POST "http://localhost:8000/v1/chat/completions" \
 ## Star History
 
 [![Star History Chart](https://star-history.dera.page/svg?repos=TheSmallHanCat/flow2api&type=date&legend=top-left)](https://star-history.dera.page/#TheSmallHanCat/flow2api&type=date&legend=top-left)
-

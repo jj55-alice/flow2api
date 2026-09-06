@@ -17,6 +17,7 @@ from ..core.account_tiers import (
     supports_model_for_tier,
 )
 from .file_cache import FileCache
+from .browser_captcha_extension import ExtensionCaptchaError
 
 
 # Model configuration
@@ -1605,6 +1606,7 @@ class GenerationHandler:
             raise
         except Exception as e:
             error_msg = f"生成失败: {str(e)}"
+            error_status, error_code = self._classify_generation_error(e)
             debug_logger.log_error(f"[GENERATION] 生成失败: {error_msg}")
             if token:
                 await self._record_token_failure(
@@ -1625,7 +1627,7 @@ class GenerationHandler:
                 request_operation if generation_type else "generate_unknown",
                 request_payload if 'request_payload' in locals() else {"model": model},
                 {"error": error_msg, "performance": perf_trace},
-                500,
+                error_status,
                 duration,
                 log_id=request_log_state.get("id"),
                 status_text="failed",
@@ -1633,7 +1635,11 @@ class GenerationHandler:
             )
             if stream:
                 yield self._create_stream_chunk(f"错误: {error_msg}\n")
-            yield self._create_error_response(error_msg, status_code=500)
+            yield self._create_error_response(
+                error_msg,
+                status_code=error_status,
+                error_code=error_code,
+            )
         finally:
             if pending_token_state.get("active") and token and self.load_balancer:
                 await self.load_balancer.release_pending(
@@ -1681,6 +1687,9 @@ class GenerationHandler:
         reCAPTCHA 获取失败、验证码供应商错误、打码资源不足等问题通常不是账号本身异常；
         若将其纳入连续错误，会在回归测试或代理波动时把 token 自动打成 inactive。
         """
+        if isinstance(error, ExtensionCaptchaError):
+            return False
+
         error_text = str(error or "").strip().lower()
         if not error_text:
             return True
@@ -1719,6 +1728,20 @@ class GenerationHandler:
             "recaptcha evaluation failed",
             "public_error_unusual_activity",
         ))
+
+    def _classify_generation_error(self, error: Exception) -> tuple[int, str]:
+        """Map captcha failures to actionable gateway/service errors instead of HTTP 500."""
+        if isinstance(error, ExtensionCaptchaError):
+            return error.http_status, error.code
+
+        error_text = str(error or "").strip().lower()
+        if "too_much_traffic" in error_text or "too much traffic" in error_text:
+            return 429, "captcha_rate_limited"
+        if "recaptcha evaluation failed" in error_text:
+            return 502, "captcha_evaluation_failed"
+        if "failed to obtain recaptcha token" in error_text:
+            return 503, "captcha_token_unavailable"
+        return 500, "generation_failed"
 
     async def _handle_image_generation(
         self,
@@ -2771,7 +2794,12 @@ class GenerationHandler:
 
         return json.dumps(response, ensure_ascii=False)
 
-    def _create_error_response(self, error_message: str, status_code: int = 500) -> str:
+    def _create_error_response(
+        self,
+        error_message: str,
+        status_code: int = 500,
+        error_code: str = "generation_failed",
+    ) -> str:
         """创建错误响应"""
         import json
 
@@ -2779,7 +2807,7 @@ class GenerationHandler:
             "error": {
                 "message": error_message,
                 "type": "server_error" if status_code >= 500 else "invalid_request_error",
-                "code": "generation_failed",
+                "code": error_code,
                 "status_code": status_code,
             }
         }

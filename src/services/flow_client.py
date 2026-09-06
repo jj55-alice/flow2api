@@ -4343,7 +4343,7 @@ class FlowClient:
                 pass
         elif config.captcha_method == "extension":
             try:
-                from .browser_captcha_extension import ExtensionCaptchaService
+                from .browser_captcha_extension import ExtensionCaptchaError, ExtensionCaptchaService
                 service = await ExtensionCaptchaService.get_instance()
                 await service.report_flow_error(
                     project_id=project_id,
@@ -4712,10 +4712,16 @@ class FlowClient:
                     fingerprint = next_fingerprint
                 self._set_request_fingerprint(fingerprint if token else None)
                 return token, None
+            except ExtensionCaptchaError:
+                self._set_request_fingerprint(None)
+                raise
             except Exception as e:
                 debug_logger.log_error(f"[reCAPTCHA Extension] 错误: {str(e)}")
                 self._set_request_fingerprint(None)
-                return None, None
+                raise ExtensionCaptchaError(
+                    f"Chrome extension captcha failed unexpectedly: {e}",
+                    code="extension_captcha_failed",
+                ) from e
 
         # 内置浏览器打码 (nodriver)
         if captcha_method == "personal":
