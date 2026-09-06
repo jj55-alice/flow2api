@@ -802,6 +802,364 @@ async function handleSubmitFlowRequest(data, socket) {
                     Object.values(value).forEach(item => patchToken(item, token));
                 };
 
+                const submitImageThroughCurrentFlowUi = async (rawBody) => {
+                    const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+                    const isVisible = element => {
+                        if (!(element instanceof Element)) return false;
+                        const rect = element.getBoundingClientRect();
+                        const style = getComputedStyle(element);
+                        return rect.width > 0 && rect.height > 0
+                            && style.visibility !== "hidden" && style.display !== "none";
+                    };
+                    const clickElement = element => {
+                        if (!(element instanceof HTMLElement)) {
+                            throw new Error("Flow UI target is not clickable");
+                        }
+                        HTMLElement.prototype.click.call(element);
+                    };
+                    const waitFor = async (probe, budgetMs, label) => {
+                        const deadline = Date.now() + budgetMs;
+                        while (Date.now() < deadline) {
+                            const value = probe();
+                            if (value) return value;
+                            await pause(200);
+                        }
+                        throw new Error(`Timed out waiting for ${label}`);
+                    };
+                    const normalizedText = value => String(value || "").replace(/\s+/g, " ").trim();
+                    const findButtonByIcon = iconName => Array.from(document.querySelectorAll("button"))
+                        .find(button => isVisible(button) && Array.from(button.querySelectorAll("mat-icon, i"))
+                            .some(icon => normalizedText(icon.textContent) === iconName));
+                    const setInputValue = (input, value) => {
+                        const descriptor = Object.getOwnPropertyDescriptor(
+                            HTMLInputElement.prototype,
+                            "value"
+                        );
+                        if (descriptor && descriptor.set) {
+                            descriptor.set.call(input, value);
+                        } else {
+                            input.value = value;
+                        }
+                        input.dispatchEvent(new Event("input", { bubbles: true }));
+                        input.dispatchEvent(new Event("change", { bubbles: true }));
+                    };
+                    const mediaAssetFromUrl = rawUrl => {
+                        try {
+                            const parsed = new URL(String(rawUrl || ""), location.href);
+                            let mediaId = "";
+                            if (parsed.hostname === "flow-content.google") {
+                                const match = parsed.pathname.match(
+                                    /^\/image\/([0-9a-f]{8}-[0-9a-f-]{27,})/i
+                                );
+                                mediaId = match ? match[1] : "";
+                            }
+                            if (!mediaId) {
+                                const candidate = parsed.searchParams.get("name") || "";
+                                if (/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(candidate)) {
+                                    mediaId = candidate;
+                                }
+                            }
+                            return mediaId ? { mediaId, url: parsed.toString() } : null;
+                        } catch (error) {
+                            return null;
+                        }
+                    };
+                    const currentMediaAssets = () => {
+                        const assets = new Map();
+                        document.querySelectorAll("img").forEach(image => {
+                            const asset = mediaAssetFromUrl(image.currentSrc || image.src);
+                            if (asset) assets.set(asset.mediaId, asset);
+                        });
+                        return assets;
+                    };
+                    const countFailureSignals = () => {
+                        const text = normalizedText(document.body && document.body.innerText).toLowerCase();
+                        const signals = [
+                            "이미지를 생성할 수 없습니다",
+                            "unable to generate",
+                            "couldn't generate",
+                            "can't create",
+                            "not able to generate",
+                            "content policy",
+                        ];
+                        return signals.reduce((total, signal) => {
+                            let count = 0;
+                            let offset = 0;
+                            while ((offset = text.indexOf(signal, offset)) >= 0) {
+                                count += 1;
+                                offset += signal.length;
+                            }
+                            return total + count;
+                        }, 0);
+                    };
+
+                    const requests = Array.isArray(rawBody && rawBody.requests)
+                        ? rawBody.requests
+                        : [];
+                    const imageRequest = requests[0] || {};
+                    const promptParts = imageRequest.structuredPrompt
+                        && Array.isArray(imageRequest.structuredPrompt.parts)
+                        ? imageRequest.structuredPrompt.parts
+                        : [];
+                    const prompt = promptParts
+                        .map(part => normalizedText(part && part.text))
+                        .filter(Boolean)
+                        .join("\n");
+                    if (!prompt) {
+                        throw new Error("Flow UI image fallback requires a prompt");
+                    }
+
+                    const aspectLabels = {
+                        IMAGE_ASPECT_RATIO_LANDSCAPE: "16:9",
+                        IMAGE_ASPECT_RATIO_PORTRAIT: "9:16",
+                        IMAGE_ASPECT_RATIO_SQUARE: "1:1",
+                        IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE: "4:3",
+                        IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR: "3:4",
+                    };
+                    const modelLabels = {
+                        GEM_PIX: "Nano Banana Pro",
+                        GEM_PIX_2: "Nano Banana Pro",
+                        GEM_PIX_PRO_VERTEX: "Nano Banana Pro",
+                        NARWHAL: "Nano Banana 2",
+                        HARBOR_SEAL: "Nano Banana 2 Lite",
+                    };
+                    const requestedAspect = aspectLabels[imageRequest.imageAspectRatio] || "";
+                    const requestedModel = modelLabels[imageRequest.imageModelName] || "Nano Banana 2";
+                    const privateUiContext = rawBody && rawBody.__flow2apiUiContext || {};
+                    const inputFileNames = Array.isArray(privateUiContext.inputFileNames)
+                        ? privateUiContext.inputFileNames.map(normalizedText).filter(Boolean)
+                        : [];
+                    const requestedInputs = Array.isArray(imageRequest.imageInputs)
+                        ? imageRequest.imageInputs
+                        : [];
+                    if (requestedInputs.length && inputFileNames.length !== requestedInputs.length) {
+                        throw new Error(
+                            "Flow UI image fallback cannot match every reference image to its upload"
+                        );
+                    }
+
+                    // The current flow.google.com editor keeps image defaults in
+                    // a sticky settings panel. Align them before submitting so
+                    // the browser fallback preserves the API request semantics.
+                    try {
+                        const settingsTrigger = await waitFor(
+                            () => document.querySelector(".settings-trigger-button"),
+                            8000,
+                            "Flow image settings"
+                        );
+                        clickElement(settingsTrigger);
+                        const saveButton = await waitFor(
+                            () => {
+                                const candidate = document.querySelector(".settings-save-button");
+                                return isVisible(candidate) ? candidate : null;
+                            },
+                            5000,
+                            "Flow settings panel"
+                        );
+                        const radios = Array.from(document.querySelectorAll('[role="radio"]'))
+                            .filter(isVisible);
+                        const selectRadio = label => {
+                            const radio = radios.find(item => normalizedText(item.textContent).endsWith(label));
+                            if (radio && radio.getAttribute("aria-checked") !== "true") {
+                                clickElement(radio);
+                            }
+                        };
+                        if (requestedAspect) selectRadio(requestedAspect);
+                        selectRadio("x1");
+
+                        const modelButton = document.querySelector(".image-model-picker-button");
+                        if (modelButton && !normalizedText(modelButton.textContent).includes(requestedModel)) {
+                            clickElement(modelButton);
+                            const modelItem = await waitFor(
+                                () => Array.from(document.querySelectorAll('[role="menuitem"]'))
+                                    .find(item => isVisible(item)
+                                        && normalizedText(item.textContent).includes(requestedModel)),
+                                4000,
+                                `Flow image model ${requestedModel}`
+                            );
+                            clickElement(modelItem);
+                            await pause(200);
+                        }
+                        clickElement(saveButton);
+                        await pause(500);
+                    } catch (settingsError) {
+                        console.warn(
+                            "[Flow2API] Could not fully align Flow UI image defaults; "
+                            + "the prompt directive will enforce them instead:",
+                            settingsError
+                        );
+                        const visibleSave = document.querySelector(".settings-save-button");
+                        if (visibleSave && isVisible(visibleSave)) clickElement(visibleSave);
+                        await pause(300);
+                    }
+
+                    for (const fileName of inputFileNames) {
+                        const addButton = await waitFor(
+                            () => {
+                                const candidate = document.querySelector(
+                                    "flow-prompt-box .add-menu-trigger, button.add-menu-trigger"
+                                );
+                                return isVisible(candidate) ? candidate : null;
+                            },
+                            5000,
+                            "Flow asset picker button"
+                        );
+                        clickElement(addButton);
+                        const picker = await waitFor(
+                            () => {
+                                const candidate = document.querySelector("flow-add-menu-popover-content");
+                                return isVisible(candidate) ? candidate : null;
+                            },
+                            5000,
+                            "Flow asset picker"
+                        );
+                        const searchInput = picker.querySelector('input[type="text"]');
+                        if (searchInput) {
+                            setInputValue(searchInput, fileName);
+                            await pause(800);
+                        }
+                        const assetOption = await waitFor(
+                            () => Array.from(picker.querySelectorAll('button.asset-item[role="option"]'))
+                                .find(item => normalizedText(item.textContent).includes(fileName)),
+                            6000,
+                            `uploaded Flow asset ${fileName}`
+                        );
+                        clickElement(assetOption);
+                        const addToPrompt = await waitFor(
+                            () => {
+                                const candidate = picker.querySelector(".detail-add-to-prompt-btn");
+                                return isVisible(candidate) ? candidate : null;
+                            },
+                            3000,
+                            "add-to-prompt button"
+                        );
+                        clickElement(addToPrompt);
+                        await pause(500);
+                    }
+
+                    const firstBaseline = currentMediaAssets();
+                    await pause(700);
+                    const secondBaseline = currentMediaAssets();
+                    const baselineIds = new Set([...firstBaseline.keys(), ...secondBaseline.keys()]);
+                    const baselineFailureCount = countFailureSignals();
+
+                    const directive = [
+                        `Make me exactly one picture of ${prompt}`,
+                        requestedAspect ? `in a ${requestedAspect} aspect ratio` : "",
+                        requestedModel ? `using ${requestedModel}` : "",
+                    ].filter(Boolean).join(" ") + ".";
+                    const composer = await waitFor(
+                        () => Array.from(document.querySelectorAll('[contenteditable="true"]'))
+                            .find(isVisible),
+                        8000,
+                        "Flow prompt composer"
+                    );
+                    composer.focus();
+                    let inserted = false;
+                    if (typeof document.execCommand === "function") {
+                        const selection = getSelection();
+                        const range = document.createRange();
+                        range.selectNodeContents(composer);
+                        selection.removeAllRanges();
+                        selection.addRange(range);
+                        document.execCommand("delete", false, null);
+                        inserted = document.execCommand("insertText", false, directive);
+                    }
+                    if (!inserted) {
+                        const paragraph = document.createElement("p");
+                        paragraph.textContent = directive;
+                        composer.replaceChildren(paragraph);
+                        composer.dispatchEvent(new InputEvent("input", {
+                            bubbles: true,
+                            inputType: "insertText",
+                            data: directive,
+                        }));
+                    }
+
+                    const submitButton = await waitFor(
+                        () => {
+                            const candidate = findButtonByIcon("arrow_forward");
+                            return candidate && !candidate.disabled
+                                && candidate.getAttribute("aria-disabled") !== "true"
+                                ? candidate
+                                : null;
+                        },
+                        8000,
+                        "enabled Flow image submit button"
+                    );
+                    clickElement(submitButton);
+
+                    const uiTimeoutMs = Math.min(70000, Math.max(45000, timeoutMs));
+                    const deadline = Date.now() + uiTimeoutMs;
+                    let stableIds = "";
+                    let stablePolls = 0;
+                    let confirmationClicked = false;
+                    while (Date.now() < deadline) {
+                        await pause(700);
+                        if (!confirmationClicked) {
+                            const confirmation = Array.from(document.querySelectorAll("button"))
+                                .find(button => {
+                                    if (!isVisible(button) || button.disabled) return false;
+                                    const text = normalizedText(button.textContent).toLowerCase();
+                                    return /^(confirm|create|generate|yes,? create|yes,? generate|확인|생성|만들기)$/.test(text);
+                                });
+                            if (confirmation) {
+                                clickElement(confirmation);
+                                confirmationClicked = true;
+                            }
+                        }
+
+                        const assets = currentMediaAssets();
+                        const fresh = Array.from(assets.values())
+                            .filter(asset => !baselineIds.has(asset.mediaId));
+                        if (fresh.length) {
+                            const ids = fresh.map(asset => asset.mediaId).sort().join(",");
+                            stablePolls = ids === stableIds ? stablePolls + 1 : 1;
+                            stableIds = ids;
+                            if (stablePolls >= 3) {
+                                return {
+                                    http_status: 200,
+                                    response_text: JSON.stringify({
+                                        media: fresh.map(asset => ({
+                                            name: asset.mediaId,
+                                            image: {
+                                                generatedImage: {
+                                                    mediaId: asset.mediaId,
+                                                    fifeUrl: asset.url,
+                                                    prompt,
+                                                    modelNameType: imageRequest.imageModelName || "",
+                                                    aspectRatio: imageRequest.imageAspectRatio || "",
+                                                    seed: Number(imageRequest.seed || 0),
+                                                },
+                                            },
+                                        })),
+                                        flow2apiTransport: "flow_google_ui",
+                                    }),
+                                    response_headers: { "content-type": "application/json" },
+                                    fingerprint: browserFingerprint(),
+                                };
+                            }
+                        }
+                        if (countFailureSignals() > baselineFailureCount) {
+                            throw new Error("Flow agent reported that it could not generate the image");
+                        }
+                    }
+                    throw new Error("Timed out waiting for the image generated by the Flow UI");
+                };
+
+                const parsedRequestUrl = new URL(requestUrl);
+                if (
+                    action === "IMAGE_GENERATION"
+                    && /\/flowMedia:batchGenerateImages$/.test(parsedRequestUrl.pathname)
+                ) {
+                    window.__FLOW2API_BROWSER_SUBMIT_ACTIVE__ = true;
+                    try {
+                        return await submitImageThroughCurrentFlowUi(requestBody || {});
+                    } finally {
+                        window.__FLOW2API_BROWSER_SUBMIT_ACTIVE__ = false;
+                    }
+                }
+
                 await ensureRecaptcha();
                 const token = await Promise.race([
                     grecaptcha.enterprise.execute(websiteKey, { action }),
@@ -813,6 +1171,7 @@ async function handleSubmitFlowRequest(data, socket) {
                 const body = typeof structuredClone === "function"
                     ? structuredClone(requestBody)
                     : JSON.parse(JSON.stringify(requestBody));
+                delete body.__flow2apiUiContext;
                 patchToken(body, token);
 
                 const controller = new AbortController();

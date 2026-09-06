@@ -53,6 +53,10 @@ class FlowClient:
             default=None
         )
         self._remote_browser_prefill_last_sent: Dict[str, float] = {}
+        # The migrated Flow asset picker exposes uploads by file name while
+        # generation requests carry only media IDs. Keep a bounded bridge for
+        # extension-driven image-to-image generation.
+        self._uploaded_media_file_names: Dict[str, str] = {}
 
         # 仅保留当前上游仍稳定出现的最小浏览器风格头；具体 UA / Accept-Language / UA-CH
         # 统一以当前请求链路绑定的 runtime fingerprint 为准，不再兼容旧版随机平台策略。
@@ -114,6 +118,15 @@ class FlowClient:
     def clear_request_fingerprint(self):
         """清理请求链路绑定的浏览器指纹。"""
         self._set_request_fingerprint(None)
+
+    def _remember_uploaded_media_file_name(self, media_id: str, file_name: str) -> None:
+        normalized_media_id = str(media_id or "").strip()
+        normalized_file_name = str(file_name or "").strip()
+        if not normalized_media_id or not normalized_file_name:
+            return
+        self._uploaded_media_file_names[normalized_media_id] = normalized_file_name
+        while len(self._uploaded_media_file_names) > 256:
+            self._uploaded_media_file_names.pop(next(iter(self._uploaded_media_file_names)))
 
     def _get_primary_accept_language(self, fallback: str = "zh-CN,zh;q=0.9") -> str:
         fingerprint = self.get_request_fingerprint()
@@ -1466,7 +1479,8 @@ class FlowClient:
         at: str,
         image_bytes: bytes,
         aspect_ratio: str = "IMAGE_ASPECT_RATIO_LANDSCAPE",
-        project_id: Optional[str] = None
+        project_id: Optional[str] = None,
+        token_id: Optional[int] = None,
     ) -> str:
         """上传图片,返回mediaId
 
@@ -1475,6 +1489,7 @@ class FlowClient:
             image_bytes: 图片字节数据
             aspect_ratio: 图片或视频宽高比（会自动转换为图片格式）
             project_id: 项目ID（新上传接口可使用）
+            token_id: token ID（extension 模式下用于选择对应 Chrome profile）
 
         Returns:
             mediaId
@@ -1497,10 +1512,16 @@ class FlowClient:
         upload_file_name = f"flow2api_upload_{int(time.time() * 1000)}.{ext}"
         new_url = f"{self.api_base_url}/flow/uploadImage"
         normalized_project_id = str(project_id or "").strip()
+        captcha_method = getattr(config, "captcha_method", "personal")
         new_client_context = {
             "sessionId": self._generate_session_id(),
-            "tool": "PINHOLE"
+            "tool": "PINHOLE",
         }
+        if captcha_method == "extension":
+            new_client_context["recaptchaContext"] = {
+                "token": "__FLOW2API_EXTENSION_BROWSER_SUBMIT__",
+                "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+            }
         if normalized_project_id:
             new_client_context["projectId"] = normalized_project_id
 
@@ -1530,7 +1551,6 @@ class FlowClient:
         max_retries = config.flow_max_retries
         last_error: Optional[Exception] = None
 
-        captcha_method = getattr(config, "captcha_method", "personal")
         if captcha_method == "personal":
             try:
                 from .browser_captcha_personal import BrowserCaptchaService
@@ -1545,19 +1565,41 @@ class FlowClient:
 
         for retry_attempt in range(max_retries):
             try:
-                new_result = await self._make_request(
-                    method="POST",
-                    url=new_url,
-                    json_data=new_json_data,
-                    use_at=True,
-                    at_token=at,
-                    use_media_proxy=True
-                )
+                if captcha_method == "extension" and normalized_project_id:
+                    from .browser_captcha_extension import ExtensionCaptchaService
+
+                    service = await ExtensionCaptchaService.get_instance(self.db)
+                    response_payload = await service.submit_flow_request(
+                        project_id=normalized_project_id,
+                        action="UPLOAD_IMAGE",
+                        token_id=token_id,
+                        url=new_url,
+                        at_token=at,
+                        json_data=new_json_data,
+                        timeout=config.flow_timeout,
+                    )
+                    response_fingerprint = response_payload.get("fingerprint")
+                    self._set_request_fingerprint(
+                        response_fingerprint
+                        if isinstance(response_fingerprint, dict)
+                        else None
+                    )
+                    new_result = self._decode_browser_flow_response(response_payload)
+                else:
+                    new_result = await self._make_request(
+                        method="POST",
+                        url=new_url,
+                        json_data=new_json_data,
+                        use_at=True,
+                        at_token=at,
+                        use_media_proxy=True,
+                    )
                 media_id = (
                     self._extract_media_name(new_result.get("media"))
                     or new_result.get("mediaGenerationId", {}).get("mediaGenerationId")
                 )
                 if media_id:
+                    self._remember_uploaded_media_file_name(media_id, upload_file_name)
                     return media_id
                 raise Exception(f"Invalid upload response: missing media id, keys={list(new_result.keys())}")
             except Exception as new_upload_error:
@@ -1598,6 +1640,7 @@ class FlowClient:
                     or legacy_result.get("media", {}).get("name")
                 )
                 if media_id:
+                    self._remember_uploaded_media_file_name(media_id, upload_file_name)
                     return media_id
                 raise Exception(f"Legacy upload response missing media id: keys={list(legacy_result.keys())}")
             except Exception as legacy_upload_error:
@@ -1755,6 +1798,21 @@ class FlowClient:
                 "useNewMedia": True,
                 "requests": [request_data]
             }
+            if config.captcha_method == "extension" and image_inputs:
+                input_file_names = [
+                    self._uploaded_media_file_names.get(
+                        str(item.get("name") or "").strip(),
+                        "",
+                    )
+                    for item in image_inputs
+                    if isinstance(item, dict)
+                ]
+                if input_file_names and all(input_file_names):
+                    # Private extension metadata. background.js removes it
+                    # before a request can leave the Flow page.
+                    json_data["__flow2apiUiContext"] = {
+                        "inputFileNames": input_file_names,
+                    }
 
             try:
                 result = await self._make_image_generation_request(

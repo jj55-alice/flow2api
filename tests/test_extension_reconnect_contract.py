@@ -13,7 +13,7 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn("alarms", manifest["permissions"])
         self.assertGreaterEqual(
             tuple(int(part) for part in manifest["version"].split(".")),
-            (1, 3, 2),
+            (1, 3, 9),
         )
 
     def test_manifest_allows_current_flow_host(self):
@@ -81,6 +81,18 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn("handleGetSessionCookie(data, socket)", background)
         self.assertIn("sendSocketMessage(payload, socket = ws)", background)
         self.assertIn("connectWS();", background)
+
+    def test_current_flow_image_generation_uses_ui_transport(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        self.assertIn("submitImageThroughCurrentFlowUi", background)
+        self.assertIn("/flowMedia:batchGenerateImages$", background)
+        self.assertIn(".settings-trigger-button", background)
+        self.assertIn("Nano Banana 2 Lite", background)
+        self.assertIn("flow-add-menu-popover-content", background)
+        self.assertIn("__flow2apiUiContext", background)
+        self.assertIn("delete body.__flow2apiUiContext", background)
+        self.assertIn("flow_google_ui", background)
 
 
 if __name__ == "__main__":
