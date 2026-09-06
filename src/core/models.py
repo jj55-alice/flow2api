@@ -43,6 +43,8 @@ class Token(BaseModel):
     # 打码代理（token 级，可覆盖全局浏览器打码代理）
     captcha_proxy_url: Optional[str] = None
     extension_route_key: Optional[str] = None
+    browser_enabled: bool = True
+    browser_session_sync_pending: bool = False
 
     # 协议刷新 Session Token
     protocol_mode: str = "session"  # session/protocol
@@ -58,6 +60,12 @@ class Token(BaseModel):
     # 429禁用相关
     ban_reason: Optional[str] = None  # 禁用原因: "429_rate_limit" 或 None
     banned_at: Optional[datetime] = None  # 禁用时间
+
+    # reCAPTCHA 회로 차단 상태 (재시작 후에도 유지)
+    captcha_failure_count: int = 0
+    captcha_cooldown_until: Optional[datetime] = None
+    captcha_circuit_opened_at: Optional[datetime] = None
+    captcha_last_failure_at: Optional[datetime] = None
 
 
 class Project(BaseModel):

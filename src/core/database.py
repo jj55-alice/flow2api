@@ -1,7 +1,9 @@
 """Database storage layer for Flow2API"""
 import asyncio
 import aiosqlite
+import hashlib
 import json
+import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from typing import Optional, List, Dict, Any
@@ -432,9 +434,20 @@ class Database:
                     )
                 """)
 
+            if not await self._table_exists(db, "admin_sessions"):
+                print("  ✓ Creating missing table: admin_sessions")
+                await db.execute("""
+                    CREATE TABLE admin_sessions (
+                        token_hash TEXT PRIMARY KEY,
+                        created_at INTEGER NOT NULL,
+                        expires_at INTEGER NOT NULL
+                    )
+                """)
+
             # ========== Step 2: Add missing columns to existing tables ==========
             # Check and add missing columns to tokens table
             if await self._table_exists(db, "tokens"):
+                captcha_circuit_columns_added = False
                 columns_to_add = [
                     ("at", "TEXT"),  # Access Token
                     ("at_expires", "TIMESTAMP"),  # AT expiration time
@@ -448,6 +461,8 @@ class Database:
                     ("video_concurrency", "INTEGER DEFAULT -1"),
                     ("captcha_proxy_url", "TEXT"),  # token级打码代理
                     ("extension_route_key", "TEXT"),  # extension 模式路由键
+                    ("browser_enabled", "BOOLEAN DEFAULT 1"),  # extension 계정 수동 사용 스위치
+                    ("browser_session_sync_pending", "BOOLEAN DEFAULT 0"),
                     ("protocol_mode", "TEXT DEFAULT 'session'"),  # ST 刷新模式
                     ("google_cookies", "TEXT DEFAULT ''"),  # 协议登录 Google Cookies
                     ("login_account", "TEXT DEFAULT ''"),  # 协议登录账号提示
@@ -459,6 +474,10 @@ class Database:
                     ("last_st_refresh_result", "TEXT DEFAULT ''"),
                     ("ban_reason", "TEXT"),  # 禁用原因
                     ("banned_at", "TIMESTAMP"),  # 禁用时间
+                    ("captcha_failure_count", "INTEGER DEFAULT 0"),
+                    ("captcha_cooldown_until", "TIMESTAMP"),
+                    ("captcha_circuit_opened_at", "TIMESTAMP"),
+                    ("captcha_last_failure_at", "TIMESTAMP"),
                 ]
 
                 for col_name, col_type in columns_to_add:
@@ -466,8 +485,52 @@ class Database:
                         try:
                             await db.execute(f"ALTER TABLE tokens ADD COLUMN {col_name} {col_type}")
                             print(f"  ✓ Added column '{col_name}' to tokens table")
+                            if col_name.startswith("captcha_"):
+                                captcha_circuit_columns_added = True
                         except Exception as e:
                             print(f"  ✗ Failed to add column '{col_name}': {e}")
+
+                if captcha_circuit_columns_added and await self._table_exists(db, "request_logs"):
+                    captcha_config = (config_dict or {}).get("captcha", {})
+                    try:
+                        base_cooldown_seconds = max(
+                            30,
+                            min(86400, int(captcha_config.get("captcha_failure_cooldown_seconds", 7200))),
+                        )
+                    except Exception:
+                        base_cooldown_seconds = 7200
+
+                    # Preserve the first-stage cooldown for accounts whose latest
+                    # completed event is a recent UNUSUAL_ACTIVITY failure. This
+                    # prevents the upgrade restart itself from immediately
+                    # re-exposing an account that was already supposed to rest.
+                    latest_failure = """
+                        (SELECT MAX(rl.updated_at)
+                         FROM request_logs rl
+                         WHERE rl.token_id = tokens.id
+                           AND rl.status_code >= 400
+                           AND rl.response_body LIKE '%PUBLIC_ERROR_UNUSUAL_ACTIVITY%')
+                    """
+                    latest_success = """
+                        (SELECT MAX(rl.updated_at)
+                         FROM request_logs rl
+                         WHERE rl.token_id = tokens.id
+                           AND rl.status_code = 200
+                           AND rl.status_text = 'completed')
+                    """
+                    await db.execute(
+                        f"""
+                        UPDATE tokens
+                        SET captcha_failure_count = 1,
+                            captcha_last_failure_at = {latest_failure},
+                            captcha_circuit_opened_at = {latest_failure},
+                            captcha_cooldown_until = datetime({latest_failure}, '+' || ? || ' seconds')
+                        WHERE {latest_failure} IS NOT NULL
+                          AND datetime({latest_failure}) > datetime('now', '-' || ? || ' seconds')
+                          AND ({latest_success} IS NULL OR datetime({latest_success}) < datetime({latest_failure}))
+                        """,
+                        (base_cooldown_seconds, base_cooldown_seconds),
+                    )
 
             # Check and add missing columns to admin_config table
             if await self._table_exists(db, "admin_config"):
@@ -634,6 +697,8 @@ class Database:
                     video_concurrency INTEGER DEFAULT -1,
                     captcha_proxy_url TEXT,
                     extension_route_key TEXT,
+                    browser_enabled BOOLEAN DEFAULT 1,
+                    browser_session_sync_pending BOOLEAN DEFAULT 0,
                     protocol_mode TEXT DEFAULT 'session',
                     google_cookies TEXT DEFAULT '',
                     login_account TEXT DEFAULT '',
@@ -644,7 +709,11 @@ class Database:
                     last_st_refresh_at TIMESTAMP,
                     last_st_refresh_result TEXT DEFAULT '',
                     ban_reason TEXT,
-                    banned_at TIMESTAMP
+                    banned_at TIMESTAMP,
+                    captcha_failure_count INTEGER DEFAULT 0,
+                    captcha_cooldown_until TIMESTAMP,
+                    captcha_circuit_opened_at TIMESTAMP,
+                    captcha_last_failure_at TIMESTAMP
                 )
             """)
 
@@ -728,6 +797,16 @@ class Database:
                     api_key TEXT DEFAULT 'han1234',
                     error_ban_threshold INTEGER DEFAULT 3,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Persistent dashboard sessions. Only a one-way hash of each
+            # bearer token is stored so a database read cannot recover it.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS admin_sessions (
+                    token_hash TEXT PRIMARY KEY,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL
                 )
             """)
 
@@ -847,6 +926,7 @@ class Database:
             await db.execute("CREATE INDEX IF NOT EXISTS idx_project_id ON projects(project_id)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_tokens_email ON tokens(email)")
             await db.execute("CREATE INDEX IF NOT EXISTS idx_tokens_is_active_last_used_at ON tokens(is_active, last_used_at)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at)")
 
             # Migrate request_logs table if needed
             await self._migrate_request_logs(db)
@@ -934,16 +1014,18 @@ class Database:
                                    credits, user_paygate_tier, current_project_id, current_project_name,
                                    image_enabled, video_enabled, image_concurrency, video_concurrency,
                                    captcha_proxy_url, extension_route_key,
+                                   browser_enabled, browser_session_sync_pending,
                                    protocol_mode, google_cookies, login_account, login_password,
                                    proxy_url, auto_refresh_enabled, refresh_interval_minutes,
                                    last_st_refresh_at, last_st_refresh_result)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (token.st, token.at, token.at_expires, token.email, token.name, token.remark,
                   token.is_active, token.credits, token.user_paygate_tier,
                   token.current_project_id, token.current_project_name,
                   token.image_enabled, token.video_enabled,
                   token.image_concurrency, token.video_concurrency,
                   token.captcha_proxy_url, token.extension_route_key,
+                  token.browser_enabled, token.browser_session_sync_pending,
                   token.protocol_mode, token.google_cookies, token.login_account,
                   token.login_password, token.proxy_url, token.auto_refresh_enabled,
                   token.refresh_interval_minutes, token.last_st_refresh_at,
@@ -988,6 +1070,20 @@ class Database:
             if row:
                 return Token(**dict(row))
             return None
+
+    async def get_token_by_extension_route_key(self, route_key: str) -> Optional[Token]:
+        """Get the token mapped to one extension browser route."""
+        normalized_key = str(route_key or "").strip()
+        if not normalized_key:
+            return None
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM tokens WHERE extension_route_key = ? ORDER BY id LIMIT 1",
+                (normalized_key,),
+            )
+            row = await cursor.fetchone()
+            return Token(**dict(row)) if row else None
 
     async def get_all_tokens(self) -> List[Token]:
         """Get all tokens"""
@@ -1334,6 +1430,73 @@ class Database:
             await db.commit()
 
     # Config operations
+    @staticmethod
+    def _hash_admin_session_token(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    async def create_admin_session(self, token: str, ttl_seconds: int) -> int:
+        """Persist a hashed admin session token and return its expiry epoch."""
+        normalized = str(token or "").strip()
+        if not normalized:
+            raise ValueError("Admin session token must not be empty")
+
+        try:
+            normalized_ttl = max(1, int(ttl_seconds))
+        except (TypeError, ValueError):
+            normalized_ttl = 1
+
+        now = int(time.time())
+        expires_at = now + normalized_ttl
+        token_hash = self._hash_admin_session_token(normalized)
+        async with self._connect(write=True) as db:
+            await db.execute("DELETE FROM admin_sessions WHERE expires_at <= ?", (now,))
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO admin_sessions (token_hash, created_at, expires_at)
+                VALUES (?, ?, ?)
+                """,
+                (token_hash, now, expires_at),
+            )
+            await db.commit()
+        return expires_at
+
+    async def is_admin_session_valid(self, token: Optional[str]) -> bool:
+        """Return whether a persisted admin session exists and has not expired."""
+        normalized = str(token or "").strip()
+        if not normalized:
+            return False
+
+        token_hash = self._hash_admin_session_token(normalized)
+        now = int(time.time())
+        async with self._connect() as db:
+            cursor = await db.execute(
+                "SELECT expires_at FROM admin_sessions WHERE token_hash = ?",
+                (token_hash,),
+            )
+            row = await cursor.fetchone()
+
+        if row is not None and int(row[0]) > now:
+            return True
+        if row is not None:
+            await self.delete_admin_session(normalized)
+        return False
+
+    async def delete_admin_session(self, token: Optional[str]) -> None:
+        """Revoke one admin session."""
+        normalized = str(token or "").strip()
+        if not normalized:
+            return
+        token_hash = self._hash_admin_session_token(normalized)
+        async with self._connect(write=True) as db:
+            await db.execute("DELETE FROM admin_sessions WHERE token_hash = ?", (token_hash,))
+            await db.commit()
+
+    async def delete_all_admin_sessions(self) -> None:
+        """Revoke every admin session, for example after a password change."""
+        async with self._connect(write=True) as db:
+            await db.execute("DELETE FROM admin_sessions")
+            await db.commit()
+
     async def get_admin_config(self) -> Optional[AdminConfig]:
         """Get admin configuration"""
         async with self._connect() as db:

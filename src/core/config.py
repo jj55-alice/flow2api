@@ -297,6 +297,15 @@ class Config:
         """Set admin password from database"""
         self._admin_password = password
 
+    @property
+    def admin_session_ttl_days(self) -> int:
+        """Dashboard session lifetime in days."""
+        try:
+            value = int(self._config.get("global", {}).get("admin_session_ttl_days", 30))
+        except (TypeError, ValueError):
+            value = 30
+        return max(1, min(365, value))
+
     def set_debug_enabled(self, enabled: bool):
         """Set debug mode enabled/disabled"""
         if "debug" not in self._config:
@@ -465,11 +474,11 @@ class Config:
     @property
     def browser_captcha_generation_retries(self) -> int:
         """生成接口因 reCAPTCHA 评估失败时允许的总重试次数。"""
-        value = self._config.get("captcha", {}).get("browser_captcha_generation_retries", 2)
+        value = self._config.get("captcha", {}).get("browser_captcha_generation_retries", 1)
         try:
             return max(1, min(20, int(value)))
         except Exception:
-            return 2
+            return 1
 
     @property
     def captcha_failure_threshold(self) -> int:
@@ -482,12 +491,12 @@ class Config:
 
     @property
     def captcha_failure_cooldown_seconds(self) -> int:
-        """验证码回路断开后账号的冷却时间。"""
-        value = self._config.get("captcha", {}).get("captcha_failure_cooldown_seconds", 900)
+        """首次验证码回路断开后账号的冷却时间；后续失败按 1x/3x/12x 递增。"""
+        value = self._config.get("captcha", {}).get("captcha_failure_cooldown_seconds", 7200)
         try:
             return max(30, min(86400, int(value)))
         except Exception:
-            return 900
+            return 7200
 
     @property
     def extension_route_min_interval_seconds(self) -> float:
@@ -506,6 +515,12 @@ class Config:
             return max(0.0, min(10.0, float(value)))
         except Exception:
             return 1.0
+
+    @property
+    def extension_fallback_user_agent(self) -> str:
+        """旧版扩展未回传浏览器指纹时使用的临时兼容 User-Agent。"""
+        value = self._config.get("captcha", {}).get("extension_fallback_user_agent", "")
+        return str(value or "").strip()[:512]
 
     @property
     def personal_max_resident_tabs(self) -> int:

@@ -1292,6 +1292,7 @@ class GenerationHandler:
         """
         start_time = time.time()
         token = None
+        token_attempt_started_at = None
         generation_type = None
         pending_token_state = {"active": False}
         request_id = f"gen-{int(start_time * 1000)}-{id(asyncio.current_task())}"
@@ -1397,6 +1398,7 @@ class GenerationHandler:
             return
 
         debug_logger.log_info(f"[GENERATION] 已选择Token: {token.id} ({token.email})")
+        token_attempt_started_at = time.time()
         pending_token_state["active"] = True
         await self._update_request_log_progress(
             request_log_state,
@@ -1493,7 +1495,11 @@ class GenerationHandler:
                 error_msg = generation_result.get("error_message") or "生成未成功完成"
                 debug_logger.log_warning(f"[GENERATION] 生成未成功，不扣次数: {error_msg}")
                 if token:
-                    await self.token_manager.record_error(token.id)
+                    await self._record_token_failure(
+                        token,
+                        error_msg,
+                        attempt_started_at=token_attempt_started_at,
+                    )
                 duration = time.time() - start_time
                 record_generation_result(generation_type, "failed", duration)
                 perf_trace["status"] = "failed"
@@ -1522,7 +1528,10 @@ class GenerationHandler:
 
             # 重置错误计数 (请求成功时清空连续错误计数)
             await self.token_manager.record_success(token.id)
-            await self.load_balancer.record_captcha_success(token.id)
+            await self.load_balancer.record_captcha_success(
+                token.id,
+                attempt_started_at=token_attempt_started_at,
+            )
 
             debug_logger.log_info(f"[GENERATION] ✅ 生成成功完成")
 
@@ -1598,14 +1607,11 @@ class GenerationHandler:
             error_msg = f"生成失败: {str(e)}"
             debug_logger.log_error(f"[GENERATION] 生成失败: {error_msg}")
             if token:
-                if self._is_captcha_evaluation_error(e):
-                    await self.load_balancer.record_captcha_failure(token.id, e)
-                elif self._should_count_token_error(e):
-                    await self.token_manager.record_error(token.id)
-                else:
-                    debug_logger.log_info(
-                        f"[GENERATION] 跳过 token 错误计数: token_id={token.id}, reason={str(e)[:200]}"
-                    )
+                await self._record_token_failure(
+                    token,
+                    e,
+                    attempt_started_at=token_attempt_started_at,
+                )
 
             # 先将最终失败状态落库，再返回错误响应，避免日志停在 102。
             duration = time.time() - start_time
@@ -1645,7 +1651,31 @@ class GenerationHandler:
         else:
             return "没有可用的Token进行视频生成。所有Token都处于禁用、冷却、配额耗尽或已过期状态。"
 
-    def _should_count_token_error(self, error: Exception) -> bool:
+    async def _record_token_failure(
+        self,
+        token: Any,
+        error: Any,
+        *,
+        attempt_started_at: Optional[float] = None,
+    ) -> None:
+        """Route one generation failure to the matching account-health policy."""
+        if self._is_captcha_evaluation_error(error):
+            await self.load_balancer.record_captcha_failure(
+                token.id,
+                error,
+                attempt_started_at=attempt_started_at,
+            )
+            return
+
+        if self._should_count_token_error(error):
+            await self.token_manager.record_error(token.id)
+            return
+
+        debug_logger.log_info(
+            f"[GENERATION] 跳过 token 错误计数: token_id={token.id}, reason={str(error)[:200]}"
+        )
+
+    def _should_count_token_error(self, error: Any) -> bool:
         """判断失败是否应计入 token 连续错误。
 
         reCAPTCHA 获取失败、验证码供应商错误、打码资源不足等问题通常不是账号本身异常；
@@ -1661,6 +1691,9 @@ class GenerationHandler:
             "recaptcha 验证失败",
             "recaptcha 错误",
             "public_error_unusual_activity",
+            "public_error_unsafe_generation",
+            "unsafe_generation",
+            "flow browser submit returned no http response",
             "too much traffic",
             "error_no_slot_available",
             "打码服务资源不足",
@@ -1679,7 +1712,7 @@ class GenerationHandler:
         return True
 
     @staticmethod
-    def _is_captcha_evaluation_error(error: Exception) -> bool:
+    def _is_captcha_evaluation_error(error: Any) -> bool:
         """Only upstream risk-evaluation failures trip the account circuit."""
         error_text = str(error or "").strip().lower()
         return any(marker in error_text for marker in (
@@ -1736,7 +1769,8 @@ class GenerationHandler:
                         token.at,
                         image_bytes,
                         model_config["aspect_ratio"],
-                        project_id=project_id
+                        project_id=project_id,
+                        token_id=token.id,
                     )
                     image_inputs.append({
                         "name": media_id,
@@ -2083,7 +2117,11 @@ class GenerationHandler:
                     if stream:
                         yield self._create_stream_chunk("上传首帧图片...\n")
                     start_media_id = await self.flow_client.upload_image(
-                        token.at, images[0], model_config["aspect_ratio"], project_id=project_id
+                        token.at,
+                        images[0],
+                        model_config["aspect_ratio"],
+                        project_id=project_id,
+                        token_id=token.id,
                     )
                     debug_logger.log_info(f"[I2V] 仅上传首帧: {start_media_id}")
 
@@ -2092,10 +2130,18 @@ class GenerationHandler:
                     if stream:
                         yield self._create_stream_chunk("上传首帧和尾帧图片...\n")
                     start_media_id = await self.flow_client.upload_image(
-                        token.at, images[0], model_config["aspect_ratio"], project_id=project_id
+                        token.at,
+                        images[0],
+                        model_config["aspect_ratio"],
+                        project_id=project_id,
+                        token_id=token.id,
                     )
                     end_media_id = await self.flow_client.upload_image(
-                        token.at, images[1], model_config["aspect_ratio"], project_id=project_id
+                        token.at,
+                        images[1],
+                        model_config["aspect_ratio"],
+                        project_id=project_id,
+                        token_id=token.id,
                     )
                     debug_logger.log_info(f"[I2V] 上传首尾帧: {start_media_id}, {end_media_id}")
 
@@ -2106,7 +2152,11 @@ class GenerationHandler:
 
                 for img in images:
                     media_id = await self.flow_client.upload_image(
-                        token.at, img, model_config["aspect_ratio"], project_id=project_id
+                        token.at,
+                        img,
+                        model_config["aspect_ratio"],
+                        project_id=project_id,
+                        token_id=token.id,
                     )
                     reference_images.append({
                         "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
@@ -2121,7 +2171,11 @@ class GenerationHandler:
 
                 for img in images:
                     media_id = await self.flow_client.upload_image(
-                        token.at, img, model_config["aspect_ratio"], project_id=project_id
+                        token.at,
+                        img,
+                        model_config["aspect_ratio"],
+                        project_id=project_id,
+                        token_id=token.id,
                     )
                     reference_images.append({
                         "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",

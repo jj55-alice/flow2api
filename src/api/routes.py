@@ -993,7 +993,9 @@ async def captcha_websocket_endpoint(websocket: WebSocket):
         return
 
     service = await ExtensionCaptchaService.get_instance()
-    await service.connect(websocket)
+    connected = await service.connect(websocket)
+    if not connected:
+        return
     try:
         while True:
             data = await websocket.receive_text()

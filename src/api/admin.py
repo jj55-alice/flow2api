@@ -44,8 +44,6 @@ db: Database = None
 concurrency_manager: Optional[ConcurrencyManager] = None
 captcha_runtime_prepare_tasks: Dict[str, asyncio.Task] = {}
 
-# Store active admin session tokens (in production, use Redis or database)
-active_admin_tokens = set()
 ADMIN_SESSION_COOKIE_NAME = "admin_session"
 SUPPORTED_API_CAPTCHA_METHODS = {"yescaptcha", "capmonster", "ezcaptcha", "capsolver"}
 
@@ -111,6 +109,97 @@ def _extract_error_summary(payload: Any) -> str:
         return ""
 
     return _truncate_text(payload)
+
+
+def _normalize_utc_datetime(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if getattr(value, "tzinfo", None) is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+async def _annotate_token_runtime_status(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Add scheduler-facing availability and persisted CAPTCHA cooldown state."""
+    extension_service = None
+    if config.captcha_method == "extension":
+        from ..services.browser_captcha_extension import ExtensionCaptchaService
+        extension_service = await ExtensionCaptchaService.get_instance(db)
+
+    now = datetime.now(timezone.utc)
+    annotated = []
+    for raw_row in rows:
+        row = dict(raw_row)
+        at_value = str(row.get("at") or "").strip()
+        at_expires = _normalize_utc_datetime(row.get("at_expires"))
+        at_expired = bool(at_expires and at_expires <= now)
+        cooldown_until = _normalize_utc_datetime(row.get("captcha_cooldown_until"))
+        cooldown_remaining = max(
+            0,
+            int((cooldown_until - now).total_seconds() + 0.999),
+        ) if cooldown_until else 0
+        cooling = cooldown_remaining > 0
+        failure_count = max(0, int(row.get("captcha_failure_count") or 0))
+        route_key = str(row.get("extension_route_key") or "").strip()
+        extension_connected = None
+        if extension_service is not None:
+            extension_connected = extension_service.has_connection_for_route_key(route_key)
+
+        capability_enabled = bool(row.get("image_enabled")) or bool(row.get("video_enabled"))
+        browser_enabled = bool(row.get("browser_enabled", True))
+        browser_sync_pending = bool(row.get("browser_session_sync_pending", False))
+        is_available = (
+            bool(row.get("is_active"))
+            and browser_enabled
+            and bool(at_value)
+            and not at_expired
+            and not cooling
+            and capability_enabled
+            and extension_connected is not False
+        )
+
+        if not browser_enabled:
+            availability_status = "browser_paused"
+        elif not bool(row.get("is_active")):
+            availability_status = "inactive"
+        elif browser_sync_pending:
+            availability_status = "browser_syncing"
+        elif not at_value:
+            availability_status = "at_missing"
+        elif at_expired:
+            availability_status = "at_expired"
+        elif cooling:
+            availability_status = "captcha_cooling"
+        elif not capability_enabled:
+            availability_status = "capability_disabled"
+        elif extension_connected is False:
+            availability_status = "extension_disconnected"
+        else:
+            availability_status = "available"
+
+        row.update({
+            "at_expired": at_expired,
+            "at_expiring_within_1h": bool(
+                at_expires and at_expires > now and (at_expires - now).total_seconds() < 3600
+            ),
+            "captcha_failure_count": failure_count,
+            "captcha_cooldown_until": cooldown_until,
+            "captcha_cooldown_remaining_seconds": cooldown_remaining,
+            "captcha_cooldown_stage": min(3, failure_count) if failure_count else 0,
+            "captcha_cooling": cooling,
+            "extension_connected": extension_connected,
+            "browser_enabled": browser_enabled,
+            "browser_session_sync_pending": browser_sync_pending,
+            "is_available": is_available,
+            "availability_status": availability_status,
+        })
+        annotated.append(row)
+    return annotated
 
 
 def _guess_client_hints_from_user_agent(user_agent: str) -> Dict[str, str]:
@@ -569,6 +658,7 @@ class AddTokenRequest(BaseModel):
     remark: Optional[str] = None
     captcha_proxy_url: Optional[str] = None
     extension_route_key: Optional[str] = None
+    browser_enabled: bool = True
     image_enabled: bool = True
     video_enabled: bool = True
     image_concurrency: int = -1
@@ -589,6 +679,7 @@ class UpdateTokenRequest(BaseModel):
     remark: Optional[str] = None
     captcha_proxy_url: Optional[str] = None
     extension_route_key: Optional[str] = None
+    browser_enabled: Optional[bool] = None
     image_enabled: Optional[bool] = None
     video_enabled: Optional[bool] = None
     image_concurrency: Optional[int] = None
@@ -664,6 +755,7 @@ class ImportTokenItem(BaseModel):
     is_active: bool = True
     captcha_proxy_url: Optional[str] = None
     extension_route_key: Optional[str] = None
+    browser_enabled: Optional[bool] = None
     image_enabled: bool = True
     video_enabled: bool = True
     image_concurrency: int = -1
@@ -687,6 +779,10 @@ class TokenRefreshConfigRequest(BaseModel):
     refresh_interval_minutes: Optional[int] = None
 
 
+class BrowserConnectionRequest(BaseModel):
+    enabled: bool
+
+
 # ========== Auth Middleware ==========
 
 async def verify_admin_token(request: Request, authorization: str = Header(None)):
@@ -697,10 +793,10 @@ async def verify_admin_token(request: Request, authorization: str = Header(None)
 
     cookie_token = get_admin_token_from_cookie(request) or ""
 
-    if header_token and header_token in active_admin_tokens:
+    if header_token and await db.is_admin_session_valid(header_token):
         return header_token
 
-    if cookie_token and cookie_token in active_admin_tokens:
+    if cookie_token and await db.is_admin_session_valid(cookie_token):
         return cookie_token
 
     if header_token or cookie_token:
@@ -714,9 +810,8 @@ def get_admin_token_from_cookie(request: Request) -> Optional[str]:
     return token or None
 
 
-def is_admin_session_token_valid(token: Optional[str]) -> bool:
-    normalized = str(token or "").strip()
-    return bool(normalized) and normalized in active_admin_tokens
+async def is_admin_session_token_valid(token: Optional[str]) -> bool:
+    return await db.is_admin_session_valid(token)
 
 
 # ========== Auth Endpoints ==========
@@ -732,8 +827,8 @@ async def admin_login(request: LoginRequest, response: Response):
     # Generate independent session token
     session_token = f"admin-{secrets.token_urlsafe(32)}"
 
-    # Store in active tokens
-    active_admin_tokens.add(session_token)
+    session_ttl_seconds = config.admin_session_ttl_days * 24 * 60 * 60
+    expires_at = await db.create_admin_session(session_token, session_ttl_seconds)
 
     response.set_cookie(
         key=ADMIN_SESSION_COOKIE_NAME,
@@ -742,6 +837,8 @@ async def admin_login(request: LoginRequest, response: Response):
         samesite="lax",
         secure=False,
         path="/",
+        max_age=session_ttl_seconds,
+        expires=datetime.fromtimestamp(expires_at, timezone.utc),
     )
 
     return {
@@ -754,7 +851,7 @@ async def admin_login(request: LoginRequest, response: Response):
 @router.post("/api/admin/logout")
 async def admin_logout(response: Response, token: str = Depends(verify_admin_token)):
     """Admin logout - invalidate session token"""
-    active_admin_tokens.discard(token)
+    await db.delete_admin_session(token)
     response.delete_cookie(ADMIN_SESSION_COOKIE_NAME, path="/")
     return {"success": True, "message": "退出登录成功"}
 
@@ -782,7 +879,7 @@ async def change_password(
     await db.reload_config_to_memory()
 
     # 🔑 Invalidate all admin session tokens (force re-login for security)
-    active_admin_tokens.clear()
+    await db.delete_all_admin_sessions()
 
     return {"success": True, "message": "密码修改成功,请重新登录"}
 
@@ -792,33 +889,16 @@ async def change_password(
 @router.get("/api/tokens")
 async def get_tokens(token: str = Depends(verify_admin_token)):
     """Get all tokens with statistics"""
-    token_rows = await db.get_all_tokens_with_stats()
+    token_rows = await _annotate_token_runtime_status(await db.get_all_tokens_with_stats())
     to_iso = lambda value: value.isoformat() if hasattr(value, "isoformat") else value
-    now = datetime.now(timezone.utc)
-
-    def normalize_dt(value):
-        if not value:
-            return None
-        if isinstance(value, str):
-            try:
-                value = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            except Exception:
-                return None
-        if getattr(value, "tzinfo", None) is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc)
 
     return [{
         "id": row.get("id"),
         "st": row.get("st"),  # Session Token for editing
         "at": row.get("at"),  # Access Token for editing (从ST转换而来)
         "at_expires": to_iso(row.get("at_expires")) if row.get("at_expires") else None,  # 🆕 AT过期时间
-        "at_expired": bool(normalize_dt(row.get("at_expires")) and normalize_dt(row.get("at_expires")) <= now),
-        "at_expiring_within_1h": bool(
-            normalize_dt(row.get("at_expires"))
-            and normalize_dt(row.get("at_expires")) > now
-            and (normalize_dt(row.get("at_expires")) - now).total_seconds() < 3600
-        ),
+        "at_expired": bool(row.get("at_expired")),
+        "at_expiring_within_1h": bool(row.get("at_expiring_within_1h")),
         "token": row.get("at"),  # 兼容前端 token.token 的访问方式
         "email": row.get("email"),
         "name": row.get("name"),
@@ -833,6 +913,8 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
         "current_project_name": row.get("current_project_name"),  # 🆕 项目名称
         "captcha_proxy_url": row.get("captcha_proxy_url") or "",
         "extension_route_key": row.get("extension_route_key") or "",
+        "browser_enabled": bool(row.get("browser_enabled", True)),
+        "browser_session_sync_pending": bool(row.get("browser_session_sync_pending", False)),
         "protocol_mode": row.get("protocol_mode") or "session",
         "google_cookies": row.get("google_cookies") or "",
         "login_account": row.get("login_account") or "",
@@ -854,6 +936,15 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
         "last_error_at": to_iso(row.get("last_error_at")) if row.get("last_error_at") else None,
         "ban_reason": row.get("ban_reason"),
         "banned_at": to_iso(row.get("banned_at")) if row.get("banned_at") else None,
+        "captcha_failure_count": row.get("captcha_failure_count", 0),
+        "captcha_cooldown_until": to_iso(row.get("captcha_cooldown_until")) if row.get("captcha_cooldown_until") else None,
+        "captcha_cooldown_remaining_seconds": row.get("captcha_cooldown_remaining_seconds", 0),
+        "captcha_cooldown_stage": row.get("captcha_cooldown_stage", 0),
+        "captcha_cooling": bool(row.get("captcha_cooling")),
+        "captcha_last_failure_at": to_iso(row.get("captcha_last_failure_at")) if row.get("captcha_last_failure_at") else None,
+        "extension_connected": row.get("extension_connected"),
+        "is_available": bool(row.get("is_available")),
+        "availability_status": row.get("availability_status") or "unavailable",
     } for row in token_rows]  # 直接返回数组,兼容前端
 
 
@@ -871,6 +962,7 @@ async def add_token(
             remark=request.remark,
             captcha_proxy_url=request.captcha_proxy_url.strip() if request.captcha_proxy_url is not None else None,
             extension_route_key=request.extension_route_key.strip() if request.extension_route_key is not None else None,
+            browser_enabled=request.browser_enabled,
             image_enabled=request.image_enabled,
             video_enabled=request.video_enabled,
             image_concurrency=request.image_concurrency,
@@ -942,6 +1034,7 @@ async def update_token(
             remark=request.remark,
             captcha_proxy_url=request.captcha_proxy_url.strip() if request.captcha_proxy_url is not None else None,
             extension_route_key=request.extension_route_key.strip() if request.extension_route_key is not None else None,
+            browser_enabled=request.browser_enabled,
             image_enabled=request.image_enabled,
             video_enabled=request.video_enabled,
             image_concurrency=request.image_concurrency,
@@ -1003,6 +1096,40 @@ async def disable_token(
     """Disable token"""
     await token_manager.disable_token(token_id)
     return {"success": True, "message": "Token已禁用"}
+
+
+@router.put("/api/tokens/{token_id}/browser-connection")
+async def set_browser_connection(
+    token_id: int,
+    request: BrowserConnectionRequest,
+    token: str = Depends(verify_admin_token),
+):
+    """Manually include or park one extension-backed browser account."""
+    try:
+        updated_token, connected = await token_manager.set_browser_connection_enabled(
+            token_id,
+            request.enabled,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    if request.enabled and not updated_token.is_active:
+        message = "브라우저 연결은 켰지만 429 자동 차단이 유지되어 작업에서는 제외됩니다."
+    elif request.enabled and connected:
+        message = "브라우저 사용을 켰습니다. 현재 세션을 동기화하고 있습니다."
+    elif request.enabled:
+        message = "브라우저 사용을 켰습니다. 해당 Chrome 프로필이 연결되면 세션을 자동으로 가져옵니다."
+    else:
+        message = "브라우저 사용을 껐습니다. 이 계정은 작업과 자동갱신에서 제외됩니다."
+
+    return {
+        "success": True,
+        "message": message,
+        "is_active": bool(updated_token.is_active),
+        "browser_enabled": bool(updated_token.browser_enabled),
+        "extension_connected": bool(connected),
+        "session_sync_pending": bool(updated_token.browser_session_sync_pending),
+    }
 
 
 @router.post("/api/tokens/{token_id}/refresh-credits")
@@ -1153,6 +1280,7 @@ async def import_tokens(
                         at_expires=at_expires,
                         captcha_proxy_url=item.captcha_proxy_url.strip() if item.captcha_proxy_url is not None else None,
                         extension_route_key=item.extension_route_key.strip() if item.extension_route_key is not None else None,
+                        browser_enabled=item.browser_enabled,
                         image_enabled=item.image_enabled,
                         video_enabled=item.video_enabled,
                         image_concurrency=item.image_concurrency,
@@ -1174,6 +1302,8 @@ async def import_tokens(
                     existing.at_expires = at_expires
                     existing.captcha_proxy_url = item.captcha_proxy_url
                     existing.extension_route_key = item.extension_route_key
+                    if item.browser_enabled is not None:
+                        existing.browser_enabled = item.browser_enabled
                     existing.image_enabled = item.image_enabled
                     existing.video_enabled = item.video_enabled
                     existing.image_concurrency = item.image_concurrency
@@ -1192,6 +1322,7 @@ async def import_tokens(
                         st=st,
                         captcha_proxy_url=item.captcha_proxy_url.strip() if item.captcha_proxy_url is not None else None,
                         extension_route_key=item.extension_route_key.strip() if item.extension_route_key is not None else None,
+                        browser_enabled=True if item.browser_enabled is None else item.browser_enabled,
                         image_enabled=item.image_enabled,
                         video_enabled=item.video_enabled,
                         image_concurrency=item.image_concurrency,
@@ -1469,7 +1600,14 @@ async def health_check():
 @router.get("/api/stats")
 async def get_stats(token: str = Depends(verify_admin_token)):
     """Get statistics for dashboard"""
-    return await db.get_dashboard_stats()
+    stats = await db.get_dashboard_stats()
+    rows = await _annotate_token_runtime_status(await db.get_all_tokens_with_stats())
+    stats["available_tokens"] = sum(1 for row in rows if row.get("is_available"))
+    stats["captcha_cooling_tokens"] = sum(1 for row in rows if row.get("captcha_cooling"))
+    stats["extension_connected_tokens"] = sum(
+        1 for row in rows if row.get("extension_connected") is True
+    )
+    return stats
 
 
 @router.get("/api/logs")

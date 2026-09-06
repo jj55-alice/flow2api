@@ -1,8 +1,7 @@
 """Load balancing module for Flow2API"""
 import asyncio
 import random
-import time
-from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
 from ..core.models import Token
 from ..core.config import config
@@ -15,17 +14,10 @@ from ..core.account_tiers import (
 from .concurrency_manager import ConcurrencyManager
 from ..core.logger import debug_logger
 
-
-@dataclass
-class CaptchaCircuitState:
-    """Runtime-only reCAPTCHA circuit state for one account."""
-
-    consecutive_failures: int = 0
-    cooldown_until: float = 0.0
-
-
 class LoadBalancer:
     """Token load balancer with load-aware selection"""
+
+    _CAPTCHA_COOLDOWN_MULTIPLIERS = (1, 3, 12)
 
     def __init__(self, token_manager, concurrency_manager: Optional[ConcurrencyManager] = None):
         self.token_manager = token_manager
@@ -35,60 +27,131 @@ class LoadBalancer:
         self._pending_lock = asyncio.Lock()
         self._round_robin_state: Dict[str, Optional[int]] = {"image": None, "video": None, "default": None}
         self._rr_lock = asyncio.Lock()
-        self._captcha_circuits: Dict[int, CaptchaCircuitState] = {}
         self._captcha_circuit_lock = asyncio.Lock()
 
-    async def record_captcha_failure(self, token_id: int, error: Optional[Exception] = None) -> float:
+    @staticmethod
+    def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def _event_time(value: Optional[float], fallback: datetime) -> datetime:
+        if value is None:
+            return fallback
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except Exception:
+            return fallback
+
+    async def record_captcha_failure(
+        self,
+        token_id: int,
+        error: Optional[Exception] = None,
+        *,
+        attempt_started_at: Optional[float] = None,
+    ) -> float:
         """Record a terminal CAPTCHA failure and return the active cooldown in seconds."""
         if not token_id:
             return 0.0
 
         threshold = config.captcha_failure_threshold
         cooldown_seconds = config.captcha_failure_cooldown_seconds
-        now = time.monotonic()
+        now = datetime.now(timezone.utc)
+        event_started_at = self._event_time(attempt_started_at, now)
         async with self._captcha_circuit_lock:
-            state = self._captcha_circuits.setdefault(token_id, CaptchaCircuitState())
-            state.consecutive_failures += 1
-            if state.consecutive_failures >= threshold:
-                state.cooldown_until = max(state.cooldown_until, now + cooldown_seconds)
-            remaining = max(0.0, state.cooldown_until - now)
+            token = await self.token_manager.get_token(token_id)
+            if token is None:
+                return 0.0
+
+            failure_count = max(0, int(token.captcha_failure_count or 0))
+            cooldown_until = self._as_utc(token.captcha_cooldown_until)
+            circuit_opened_at = self._as_utc(token.captcha_circuit_opened_at)
+            remaining = max(0.0, (cooldown_until - now).total_seconds()) if cooldown_until else 0.0
+
+            # A request selected before the current circuit opened is stale.
+            # Its late result must not escalate or extend the current cooldown.
+            if circuit_opened_at and event_started_at < circuit_opened_at:
+                return remaining
+
+            # Requests already in flight can fail after the first request opens
+            # the circuit. Count only the post-cooldown probe failure.
+            if remaining > 0:
+                return remaining
+
+            failure_count += 1
+            cooldown_until = None
+            if failure_count >= threshold:
+                cooldown_level = min(
+                    failure_count - threshold,
+                    len(self._CAPTCHA_COOLDOWN_MULTIPLIERS) - 1,
+                )
+                cooldown_multiplier = self._CAPTCHA_COOLDOWN_MULTIPLIERS[cooldown_level]
+                adaptive_cooldown_seconds = min(86400, cooldown_seconds * cooldown_multiplier)
+                cooldown_until = now + timedelta(seconds=adaptive_cooldown_seconds)
+
+            await self.token_manager.update_captcha_circuit(
+                token_id,
+                failure_count=failure_count,
+                cooldown_until=cooldown_until,
+                circuit_opened_at=now if cooldown_until else circuit_opened_at,
+                last_failure_at=now,
+            )
+            remaining = max(0.0, (cooldown_until - now).total_seconds()) if cooldown_until else 0.0
 
         error_text = str(error or "")[:160]
         if remaining > 0:
             debug_logger.log_warning(
                 f"[CAPTCHA_CIRCUIT] Token {token_id} temporarily isolated for "
-                f"{remaining:.0f}s after {state.consecutive_failures} terminal CAPTCHA failure(s): {error_text}"
+                f"{remaining:.0f}s after {failure_count} terminal CAPTCHA failure(s): {error_text}"
             )
         else:
             debug_logger.log_warning(
                 f"[CAPTCHA_CIRCUIT] Token {token_id} CAPTCHA failure "
-                f"{state.consecutive_failures}/{threshold}: {error_text}"
+                f"{failure_count}/{threshold}: {error_text}"
             )
         return remaining
 
-    async def record_captcha_success(self, token_id: int):
-        """Close the circuit immediately after a successful generation."""
+    async def record_captcha_success(
+        self,
+        token_id: int,
+        *,
+        attempt_started_at: Optional[float] = None,
+    ) -> bool:
+        """Reset only a post-cooldown recovery probe; ignore stale in-flight successes."""
         if not token_id:
-            return
+            return False
+        now = datetime.now(timezone.utc)
+        event_started_at = self._event_time(attempt_started_at, now)
         async with self._captcha_circuit_lock:
-            previous = self._captcha_circuits.pop(token_id, None)
-        if previous is not None:
-            debug_logger.log_info(f"[CAPTCHA_CIRCUIT] Token {token_id} recovered; circuit reset")
+            token = await self.token_manager.get_token(token_id)
+            if token is None or int(token.captcha_failure_count or 0) <= 0:
+                return False
 
-    async def get_captcha_cooldown_remaining(self, token_id: int) -> float:
+            cooldown_until = self._as_utc(token.captcha_cooldown_until)
+            circuit_opened_at = self._as_utc(token.captcha_circuit_opened_at)
+            if circuit_opened_at and event_started_at < circuit_opened_at:
+                return False
+            if cooldown_until and cooldown_until > now:
+                return False
+
+            await self.token_manager.reset_captcha_circuit(token_id)
+
+        debug_logger.log_info(f"[CAPTCHA_CIRCUIT] Token {token_id} recovered; circuit reset")
+        return True
+
+    async def get_captcha_cooldown_remaining(self, token_id: int, token: Optional[Token] = None) -> float:
         if not token_id:
             return 0.0
-        now = time.monotonic()
-        async with self._captcha_circuit_lock:
-            state = self._captcha_circuits.get(token_id)
-            if state is None:
-                return 0.0
-            remaining = max(0.0, state.cooldown_until - now)
-            if state.cooldown_until > 0 and remaining <= 0:
-                # Keep the failure count until the next success so a repeated
-                # failure after cooldown trips the circuit again immediately.
-                state.cooldown_until = 0.0
-            return remaining
+        token = token or await self.token_manager.get_token(token_id)
+        if token is None:
+            return 0.0
+        cooldown_until = self._as_utc(token.captcha_cooldown_until)
+        if cooldown_until is None:
+            return 0.0
+        return max(0.0, (cooldown_until - datetime.now(timezone.utc)).total_seconds())
 
     async def _get_pending_count(self, token_id: int, for_image_generation: bool, for_video_generation: bool) -> int:
         async with self._pending_lock:
@@ -246,12 +309,15 @@ class LoadBalancer:
         required_tier = get_required_paygate_tier_for_model(model)
 
         for token in active_tokens:
+            if config.captcha_method == "extension" and not token.browser_enabled:
+                filtered_reasons[token.id] = "브라우저 사용이 수동으로 꺼져 있음"
+                continue
             normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
             if model and not supports_model_for_tier(model, normalized_tier):
                 filtered_reasons[token.id] = '账号等级不足，需要 ' + get_paygate_tier_label(required_tier)
                 continue
 
-            captcha_cooldown = await self.get_captcha_cooldown_remaining(token.id)
+            captcha_cooldown = await self.get_captcha_cooldown_remaining(token.id, token=token)
             if captcha_cooldown > 0:
                 filtered_reasons[token.id] = f"reCAPTCHA 保护冷却中 ({captcha_cooldown:.0f}秒)"
                 continue
@@ -398,6 +464,8 @@ class LoadBalancer:
         required_tier = get_required_paygate_tier_for_model(model)
         supported_tokens = []
         for token in active_tokens:
+            if config.captcha_method == "extension" and not token.browser_enabled:
+                continue
             normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
             if model and not supports_model_for_tier(model, normalized_tier):
                 continue

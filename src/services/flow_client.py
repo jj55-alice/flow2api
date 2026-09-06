@@ -53,6 +53,10 @@ class FlowClient:
             default=None
         )
         self._remote_browser_prefill_last_sent: Dict[str, float] = {}
+        # The migrated Flow asset picker exposes uploads by file name while
+        # generation requests carry only media IDs. Keep a bounded bridge for
+        # extension-driven image-to-image generation.
+        self._uploaded_media_file_names: Dict[str, str] = {}
 
         # 仅保留当前上游仍稳定出现的最小浏览器风格头；具体 UA / Accept-Language / UA-CH
         # 统一以当前请求链路绑定的 runtime fingerprint 为准，不再兼容旧版随机平台策略。
@@ -114,6 +118,15 @@ class FlowClient:
     def clear_request_fingerprint(self):
         """清理请求链路绑定的浏览器指纹。"""
         self._set_request_fingerprint(None)
+
+    def _remember_uploaded_media_file_name(self, media_id: str, file_name: str) -> None:
+        normalized_media_id = str(media_id or "").strip()
+        normalized_file_name = str(file_name or "").strip()
+        if not normalized_media_id or not normalized_file_name:
+            return
+        self._uploaded_media_file_names[normalized_media_id] = normalized_file_name
+        while len(self._uploaded_media_file_names) > 256:
+            self._uploaded_media_file_names.pop(next(iter(self._uploaded_media_file_names)))
 
     def _get_primary_accept_language(self, fallback: str = "zh-CN,zh;q=0.9") -> str:
         fingerprint = self.get_request_fingerprint()
@@ -888,6 +901,7 @@ class FlowClient:
         """识别可重试的 TLS/连接类网络错误。"""
         error_lower = (error_str or "").lower()
         return any(keyword in error_lower for keyword in [
+            "flow browser submit returned no http response",
             "curl: (35)",
             "curl: (52)",
             "curl: (56)",
@@ -908,6 +922,16 @@ class FlowClient:
             "connection refused",
             "network is unreachable",
             "remote host closed connection",
+        ])
+
+    @staticmethod
+    def _is_generation_policy_error(error_str: str) -> bool:
+        """Return whether Flow rejected this request's prompt or content."""
+        error_lower = str(error_str or "").lower()
+        return any(keyword in error_lower for keyword in [
+            "public_error_unsafe_generation",
+            "unsafe_generation",
+            "request contains an invalid ar",
         ])
 
     def _get_control_plane_timeout(self) -> int:
@@ -934,7 +958,7 @@ class FlowClient:
             # reCAPTCHA failures are a risk signal. Retrying aggressively makes
             # the account look worse, so use the dedicated (usually smaller)
             # budget instead of inheriting the generic upstream retry count.
-            return max(1, int(config.browser_captcha_generation_retries or 2))
+            return max(1, int(config.browser_captcha_generation_retries or 1))
         return effective_max_retries
 
     def _build_realistic_video_submit_headers(self) -> Dict[str, str]:
@@ -1042,6 +1066,40 @@ class FlowClient:
         """保留接口形状，当前无需释放任何本地发车状态。"""
         return
 
+    @staticmethod
+    def _decode_browser_flow_response(response_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize a browser/extension fetch response and preserve Flow errors."""
+        status_code = int(response_payload.get("status") or 0)
+        response_text = str(response_payload.get("text") or "")
+        if status_code >= 400:
+            error_reason = f"HTTP Error {status_code}"
+            parsed_body = None
+            try:
+                parsed_body = json.loads(response_text) if response_text else None
+            except Exception:
+                parsed_body = None
+            if isinstance(parsed_body, dict) and "error" in parsed_body:
+                error_info = parsed_body["error"] or {}
+                error_message = error_info.get("message", "")
+                details = error_info.get("details", [])
+                for detail in details or []:
+                    if isinstance(detail, dict) and detail.get("reason"):
+                        error_reason = detail.get("reason")
+                        break
+                if error_message:
+                    error_reason = f"{error_reason}: {error_message}"
+            elif response_text:
+                error_reason = f"HTTP Error {status_code}: {response_text[:200]}"
+            raise Exception(error_reason)
+        if status_code <= 0:
+            raise Exception("Browser Flow submit returned an invalid HTTP status")
+        try:
+            return json.loads(response_text) if response_text else {}
+        except json.JSONDecodeError as exc:
+            raise Exception(
+                f"Browser Flow submit returned invalid JSON: {response_text[:200]}"
+            ) from exc
+
     async def _make_image_generation_request(
         self,
         url: str,
@@ -1100,7 +1158,25 @@ class FlowClient:
                     "used_media_proxy": bool(prefer_media_proxy),
                 }
             try:
-                if config.captcha_method == "browser" and project_id:
+                if config.captcha_method == "extension" and project_id:
+                    from .browser_captcha_extension import ExtensionCaptchaService
+
+                    service = await ExtensionCaptchaService.get_instance(self.db)
+                    response_payload = await service.submit_flow_request(
+                        project_id=project_id,
+                        action="IMAGE_GENERATION",
+                        token_id=token_id,
+                        url=url,
+                        at_token=at,
+                        json_data=json_data,
+                        timeout=request_timeout,
+                    )
+                    response_fingerprint = response_payload.get("fingerprint")
+                    self._set_request_fingerprint(
+                        response_fingerprint if isinstance(response_fingerprint, dict) else None
+                    )
+                    result = self._decode_browser_flow_response(response_payload)
+                elif config.captcha_method == "browser" and project_id:
                     from .browser_captcha import BrowserCaptchaService
 
                     service = await BrowserCaptchaService.get_instance(self.db)
@@ -1115,30 +1191,7 @@ class FlowClient:
                     )
                     self._set_request_fingerprint(fingerprint if fingerprint else None)
 
-                    status_code = int(response_payload.get("status") or 0)
-                    response_text = response_payload.get("text") or ""
-                    if status_code >= 400:
-                        error_reason = f"HTTP Error {status_code}"
-                        parsed_body = None
-                        try:
-                            parsed_body = json.loads(response_text) if response_text else None
-                        except Exception:
-                            parsed_body = None
-                        if isinstance(parsed_body, dict) and "error" in parsed_body:
-                            error_info = parsed_body["error"] or {}
-                            error_message = error_info.get("message", "")
-                            details = error_info.get("details", [])
-                            for detail in details or []:
-                                if isinstance(detail, dict) and detail.get("reason"):
-                                    error_reason = detail.get("reason")
-                                    break
-                            if error_message:
-                                error_reason = f"{error_reason}: {error_message}"
-                        elif response_text:
-                            error_reason = f"HTTP Error {status_code}: {response_text[:200]}"
-                        raise Exception(error_reason)
-
-                    result = json.loads(response_text) if response_text else {}
+                    result = self._decode_browser_flow_response(response_payload)
                 else:
                     result = await self._make_request(
                         method="POST",
@@ -1426,7 +1479,8 @@ class FlowClient:
         at: str,
         image_bytes: bytes,
         aspect_ratio: str = "IMAGE_ASPECT_RATIO_LANDSCAPE",
-        project_id: Optional[str] = None
+        project_id: Optional[str] = None,
+        token_id: Optional[int] = None,
     ) -> str:
         """上传图片,返回mediaId
 
@@ -1435,6 +1489,7 @@ class FlowClient:
             image_bytes: 图片字节数据
             aspect_ratio: 图片或视频宽高比（会自动转换为图片格式）
             project_id: 项目ID（新上传接口可使用）
+            token_id: token ID（extension 模式下用于选择对应 Chrome profile）
 
         Returns:
             mediaId
@@ -1457,10 +1512,16 @@ class FlowClient:
         upload_file_name = f"flow2api_upload_{int(time.time() * 1000)}.{ext}"
         new_url = f"{self.api_base_url}/flow/uploadImage"
         normalized_project_id = str(project_id or "").strip()
+        captcha_method = getattr(config, "captcha_method", "personal")
         new_client_context = {
             "sessionId": self._generate_session_id(),
-            "tool": "PINHOLE"
+            "tool": "PINHOLE",
         }
+        if captcha_method == "extension":
+            new_client_context["recaptchaContext"] = {
+                "token": "__FLOW2API_EXTENSION_BROWSER_SUBMIT__",
+                "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB",
+            }
         if normalized_project_id:
             new_client_context["projectId"] = normalized_project_id
 
@@ -1490,7 +1551,6 @@ class FlowClient:
         max_retries = config.flow_max_retries
         last_error: Optional[Exception] = None
 
-        captcha_method = getattr(config, "captcha_method", "personal")
         if captcha_method == "personal":
             try:
                 from .browser_captcha_personal import BrowserCaptchaService
@@ -1505,19 +1565,41 @@ class FlowClient:
 
         for retry_attempt in range(max_retries):
             try:
-                new_result = await self._make_request(
-                    method="POST",
-                    url=new_url,
-                    json_data=new_json_data,
-                    use_at=True,
-                    at_token=at,
-                    use_media_proxy=True
-                )
+                if captcha_method == "extension" and normalized_project_id:
+                    from .browser_captcha_extension import ExtensionCaptchaService
+
+                    service = await ExtensionCaptchaService.get_instance(self.db)
+                    response_payload = await service.submit_flow_request(
+                        project_id=normalized_project_id,
+                        action="UPLOAD_IMAGE",
+                        token_id=token_id,
+                        url=new_url,
+                        at_token=at,
+                        json_data=new_json_data,
+                        timeout=config.flow_timeout,
+                    )
+                    response_fingerprint = response_payload.get("fingerprint")
+                    self._set_request_fingerprint(
+                        response_fingerprint
+                        if isinstance(response_fingerprint, dict)
+                        else None
+                    )
+                    new_result = self._decode_browser_flow_response(response_payload)
+                else:
+                    new_result = await self._make_request(
+                        method="POST",
+                        url=new_url,
+                        json_data=new_json_data,
+                        use_at=True,
+                        at_token=at,
+                        use_media_proxy=True,
+                    )
                 media_id = (
                     self._extract_media_name(new_result.get("media"))
                     or new_result.get("mediaGenerationId", {}).get("mediaGenerationId")
                 )
                 if media_id:
+                    self._remember_uploaded_media_file_name(media_id, upload_file_name)
                     return media_id
                 raise Exception(f"Invalid upload response: missing media id, keys={list(new_result.keys())}")
             except Exception as new_upload_error:
@@ -1558,6 +1640,7 @@ class FlowClient:
                     or legacy_result.get("media", {}).get("name")
                 )
                 if media_id:
+                    self._remember_uploaded_media_file_name(media_id, upload_file_name)
                     return media_id
                 raise Exception(f"Legacy upload response missing media id: keys={list(legacy_result.keys())}")
             except Exception as legacy_upload_error:
@@ -1641,15 +1724,25 @@ class FlowClient:
                 raise last_error
 
             launch_gate_acquired = True
-            try:
-                recaptcha_token, browser_id = await self._get_recaptcha_token(
-                    project_id,
-                    action="IMAGE_GENERATION",
-                    token_id=token_id
-                )
-            finally:
-                if launch_gate_acquired:
-                    await self._release_image_launch_gate(token_id)
+            if config.captcha_method == "extension":
+                # The mapped extension solves reCAPTCHA and performs fetch() in
+                # one real Flow page. A placeholder keeps the payload shape
+                # valid until the extension replaces every token immediately
+                # before submission.
+                recaptcha_token = "__FLOW2API_EXTENSION_BROWSER_SUBMIT__"
+                browser_id = None
+                attempt_trace["captcha_via_browser_submit"] = True
+                await self._release_image_launch_gate(token_id)
+            else:
+                try:
+                    recaptcha_token, browser_id = await self._get_recaptcha_token(
+                        project_id,
+                        action="IMAGE_GENERATION",
+                        token_id=token_id
+                    )
+                finally:
+                    if launch_gate_acquired:
+                        await self._release_image_launch_gate(token_id)
             attempt_trace["recaptcha_ms"] = int((time.time() - recaptcha_started_at) * 1000)
             attempt_trace["recaptcha_ok"] = bool(recaptcha_token)
             if not recaptcha_token:
@@ -1705,6 +1798,21 @@ class FlowClient:
                 "useNewMedia": True,
                 "requests": [request_data]
             }
+            if config.captcha_method == "extension" and image_inputs:
+                input_file_names = [
+                    self._uploaded_media_file_names.get(
+                        str(item.get("name") or "").strip(),
+                        "",
+                    )
+                    for item in image_inputs
+                    if isinstance(item, dict)
+                ]
+                if input_file_names and all(input_file_names):
+                    # Private extension metadata. background.js removes it
+                    # before a request can leave the Flow page.
+                    json_data["__flow2apiUiContext"] = {
+                        "inputFileNames": input_file_names,
+                    }
 
             try:
                 result = await self._make_image_generation_request(
@@ -4051,6 +4159,9 @@ class FlowClient:
     ) -> bool:
         """统一处理生成链路的重试判定与打码自愈通知。"""
         error_str = str(error)
+        if self._is_generation_policy_error(error_str):
+            return False
+
         retry_reason = self._get_retry_reason(error_str)
         retry_delay = self._get_retry_delay_seconds(error_str, retry_attempt)
 
@@ -4107,6 +4218,11 @@ class FlowClient:
     def _get_retry_reason(self, error_str: str) -> Optional[str]:
         """判断是否需要重试，返回日志提示内容"""
         error_lower = error_str.lower()
+        # Prompt/content policy rejections are deterministic for this request.
+        # Retrying them only burns browser capacity and must not affect account
+        # health or trigger a route recycle.
+        if self._is_generation_policy_error(error_str):
+            return None
         if "error_no_slot_available_block" in error_lower:
             return "打码服务资源阻塞"
         if "error_no_slot_available" in error_lower:
@@ -4545,13 +4661,56 @@ class FlowClient:
                 from .browser_captcha_extension import ExtensionCaptchaService
                 service = await ExtensionCaptchaService.get_instance(self.db)
                 extension_timeout = 45 if action == "VIDEO_GENERATION" else 25
-                token = await service.get_token(
-                    project_id,
-                    action,
-                    timeout=extension_timeout,
-                    token_id=token_id
-                )
-                self._set_request_fingerprint(None)
+                get_token_bundle = getattr(service, "get_token_bundle", None)
+                if callable(get_token_bundle):
+                    solve_bundle = await get_token_bundle(
+                        project_id,
+                        action,
+                        timeout=extension_timeout,
+                        token_id=token_id,
+                    )
+                    token = str((solve_bundle or {}).get("token") or "").strip() or None
+                    fingerprint = (
+                        solve_bundle.get("fingerprint")
+                        if isinstance(solve_bundle, dict)
+                        and isinstance(solve_bundle.get("fingerprint"), dict)
+                        else None
+                    )
+                else:
+                    token = await service.get_token(
+                        project_id,
+                        action,
+                        timeout=extension_timeout,
+                        token_id=token_id,
+                    )
+                    fingerprint = None
+
+                if token and not str((fingerprint or {}).get("user_agent") or "").strip():
+                    fallback_user_agent = config.extension_fallback_user_agent
+                    if fallback_user_agent:
+                        fingerprint = self._build_fingerprint_from_user_agent(
+                            fallback_user_agent,
+                            accept_language=self._get_primary_accept_language(),
+                        )
+                        debug_logger.log_warning(
+                            "[reCAPTCHA Extension] 扩展尚未回传浏览器指纹，"
+                            "临时使用 extension_fallback_user_agent；请重载扩展完成迁移"
+                        )
+                    else:
+                        debug_logger.log_warning(
+                            "[reCAPTCHA Extension] 已拿到 token，但缺少浏览器指纹 UA；"
+                            "为避免 solve/submit 环境失配，丢弃本次 token"
+                        )
+                        self._set_request_fingerprint(None)
+                        return None, None
+
+                if token:
+                    next_fingerprint = dict(fingerprint or {})
+                    next_fingerprint["project_id"] = project_id
+                    next_fingerprint.setdefault("origin", "https://labs.google")
+                    next_fingerprint.setdefault("referer", self._build_flow_project_page_url(project_id))
+                    fingerprint = next_fingerprint
+                self._set_request_fingerprint(fingerprint if token else None)
                 return token, None
             except Exception as e:
                 debug_logger.log_error(f"[reCAPTCHA Extension] 错误: {str(e)}")
@@ -4916,4 +5075,3 @@ class FlowClient:
         except Exception as e:
             debug_logger.log_error(f"[reCAPTCHA {method}] error: {str(e)}")
             return None
-

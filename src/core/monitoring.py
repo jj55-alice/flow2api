@@ -520,33 +520,78 @@ async def build_public_health_snapshot(db: Any) -> dict[str, Any]:
     rows = await db.get_all_tokens_with_stats()
     now = datetime.now(timezone.utc)
 
+    extension_service = None
+    if config.captcha_method == "extension":
+        from ..services.browser_captcha_extension import ExtensionCaptchaService
+        extension_service = await ExtensionCaptchaService.get_instance(db)
+
     active_tokens = 0
+    available_tokens = 0
     missing_at_tokens = 0
     expired_tokens = 0
     expiring_soon_tokens = 0
     banned_429_tokens = 0
+    captcha_cooling_tokens = 0
+    extension_connected_tokens = 0
+    browser_enabled_tokens = 0
 
     for row in rows:
-        if bool(row.get("is_active")):
+        is_active = bool(row.get("is_active"))
+        browser_enabled = bool(row.get("browser_enabled", True))
+        if browser_enabled:
+            browser_enabled_tokens += 1
+        at_value = str(row.get("at") or "").strip()
+        if is_active:
             active_tokens += 1
-        if not str(row.get("at") or "").strip():
+        if not at_value:
             missing_at_tokens += 1
 
         at_expires = _to_utc_datetime(row.get("at_expires"))
+        at_expired = False
         if at_expires is not None:
             if at_expires <= now:
+                at_expired = True
                 expired_tokens += 1
             elif (at_expires - now).total_seconds() < 3600:
                 expiring_soon_tokens += 1
 
-        if (not bool(row.get("is_active"))) and str(row.get("ban_reason") or "").strip() == "429_rate_limit":
+        cooldown_until = _to_utc_datetime(row.get("captcha_cooldown_until"))
+        captcha_cooling = bool(cooldown_until and cooldown_until > now)
+        if captcha_cooling:
+            captcha_cooling_tokens += 1
+
+        extension_connected = True
+        if extension_service is not None:
+            route_key = str(row.get("extension_route_key") or "").strip()
+            extension_connected = extension_service.has_connection_for_route_key(route_key)
+            if extension_connected:
+                extension_connected_tokens += 1
+
+        capability_enabled = bool(row.get("image_enabled")) or bool(row.get("video_enabled"))
+        if (
+            is_active
+            and browser_enabled
+            and bool(at_value)
+            and not at_expired
+            and not captcha_cooling
+            and capability_enabled
+            and extension_connected
+        ):
+            available_tokens += 1
+
+        if (not is_active) and str(row.get("ban_reason") or "").strip() == "429_rate_limit":
             banned_429_tokens += 1
 
     return {
         "backend_running": True,
         "has_active_tokens": active_tokens > 0,
+        "has_available_tokens": available_tokens > 0,
         "total_tokens": len(rows),
         "active_tokens": active_tokens,
+        "available_tokens": available_tokens,
+        "captcha_cooling_tokens": captcha_cooling_tokens,
+        "extension_connected_tokens": extension_connected_tokens,
+        "browser_enabled_tokens": browser_enabled_tokens,
         "tokens_missing_at": missing_at_tokens,
         "tokens_expired": expired_tokens,
         "tokens_expiring_within_1h": expiring_soon_tokens,

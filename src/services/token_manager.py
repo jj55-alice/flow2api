@@ -15,6 +15,12 @@ from .proxy_manager import ProxyManager
 class TokenManager:
     """Token lifecycle manager with AT auto-refresh"""
 
+    _PROACTIVE_AT_REFRESH_WINDOW = timedelta(hours=1)
+    _PROACTIVE_AT_RETRY_BASE_SECONDS = 60
+    _PROACTIVE_AT_RETRY_MAX_SECONDS = 600
+    _BROWSER_CAPTURED_AT_VALIDITY = timedelta(minutes=90)
+    _BROWSER_COOKIE_AUTH_VALIDITY = timedelta(minutes=90)
+
     def __init__(self, db: Database, flow_client: FlowClient):
         self.db = db
         self.flow_client = flow_client
@@ -24,6 +30,9 @@ class TokenManager:
         self._project_locks: dict[int, asyncio.Lock] = {}
         self._refresh_futures: dict[int, asyncio.Task] = {}
         self._at_validation_cache: dict[int, float] = {}
+        self._proactive_at_retry_after: dict[int, float] = {}
+        self._proactive_at_failure_counts: dict[int, int] = {}
+        self._browser_auth_failure_reasons: dict[int, str] = {}
         self._protocol_refresher_task: Optional[asyncio.Task] = None
 
     async def _get_token_lock(
@@ -131,6 +140,123 @@ class TokenManager:
 
     async def _get_credits_for_token(self, token: Token, at: str) -> Dict[str, Any]:
         return await self._flow_call_for_token(token, lambda: self.flow_client.get_credits(at))
+
+    async def _refresh_at_from_extension_browser(self, token_id: int, token: Token) -> bool:
+        """Verify and adopt the current mapped Flow browser authentication."""
+        from .browser_captcha_extension import ExtensionCaptchaService
+
+        service = await ExtensionCaptchaService.get_instance(self.db)
+        credentials = await service.get_browser_credentials(
+            token_id,
+            project_id=str(token.current_project_id or "").strip(),
+            timeout=35,
+        )
+        if not isinstance(credentials, dict):
+            self._browser_auth_failure_reasons[token_id] = (
+                "current Flow browser session returned an invalid response"
+            )
+            return False
+
+        session_token = str(credentials.get("session_token") or "").strip()
+        browser_at = str(credentials.get("access_token") or "").strip()
+        browser_auth_valid = bool(credentials.get("browser_auth_valid"))
+        extension_version = str(credentials.get("extension_version") or "unknown").strip()[:32]
+        observed_auth_scheme = str(
+            credentials.get("observed_auth_scheme") or "none"
+        ).strip()[:32]
+        try:
+            browser_auth_status = int(credentials.get("browser_auth_status") or 0)
+        except (TypeError, ValueError):
+            browser_auth_status = 0
+        browser_auth_error = str(credentials.get("browser_auth_error") or "").strip()[:240]
+        observed_api_key = bool(credentials.get("observed_api_key"))
+        captured_token_rejected = False
+        now = datetime.now(timezone.utc)
+
+        if session_token and session_token != str(token.st or "").strip():
+            await self.db.update_token(token_id, st=session_token)
+            token.st = session_token
+            record_token_refresh("st", "success")
+
+        if browser_at:
+            try:
+                credits_result = await self._get_credits_for_token(token, browser_at)
+                expires_at = now + self._BROWSER_CAPTURED_AT_VALIDITY
+                await self.db.update_token(
+                    token_id,
+                    at=browser_at,
+                    at_expires=expires_at,
+                    credits=credits_result.get("credits", 0),
+                    user_paygate_tier=credits_result.get("userPaygateTier"),
+                    last_st_refresh_at=now,
+                    last_st_refresh_result="success: current Flow browser authentication",
+                )
+                token.at = browser_at
+                token.at_expires = expires_at
+                self._mark_at_valid(token_id)
+                record_token_refresh("at", "success")
+                debug_logger.log_info(
+                    f"[AT_REFRESH] Token {token_id}: current Flow browser AT verified"
+                )
+                self._browser_auth_failure_reasons.pop(token_id, None)
+                return True
+            except Exception as e:
+                captured_token_rejected = True
+                record_token_refresh("at", "failure")
+                debug_logger.log_warning(
+                    f"[AT_REFRESH] Token {token_id}: captured browser AT validation failed - {e}"
+                )
+
+        if browser_auth_valid:
+            expires_at = now + self._BROWSER_COOKIE_AUTH_VALIDITY
+            update_values: Dict[str, Any] = {
+                "at_expires": expires_at,
+                "last_st_refresh_at": now,
+                "last_st_refresh_result": "success: current Flow browser cookie authentication",
+            }
+            if credentials.get("credits") is not None:
+                update_values["credits"] = credentials.get("credits")
+            if credentials.get("user_paygate_tier"):
+                update_values["user_paygate_tier"] = credentials.get("user_paygate_tier")
+            await self.db.update_token(token_id, **update_values)
+            token.at_expires = expires_at
+            self._mark_at_valid(
+                token_id,
+                ttl_seconds=max(300, int(self._BROWSER_COOKIE_AUTH_VALIDITY.total_seconds()) - 60),
+            )
+            record_token_refresh("at", "success")
+            debug_logger.log_info(
+                f"[AT_REFRESH] Token {token_id}: current Flow browser cookie authentication verified"
+            )
+            self._browser_auth_failure_reasons.pop(token_id, None)
+            return True
+
+        diagnostic_parts = [f"extension={extension_version}"]
+        if observed_auth_scheme != "none":
+            diagnostic_parts.append(f"observed_auth={observed_auth_scheme}")
+        if browser_auth_status:
+            diagnostic_parts.append(f"browser_status={browser_auth_status}")
+        diagnostic_parts.append(f"api_key={'yes' if observed_api_key else 'no'}")
+        if captured_token_rejected:
+            diagnostic_parts.append("captured_token_validation=failed")
+        if browser_auth_error:
+            diagnostic_parts.append(f"extension_error={browser_auth_error}")
+        self._browser_auth_failure_reasons[token_id] = (
+            "current Flow browser session authentication could not be verified ("
+            + ", ".join(diagnostic_parts)
+            + ")"
+        )
+
+        if session_token:
+            debug_logger.log_info(
+                f"[AT_REFRESH] Token {token_id}: falling back to legacy session exchange"
+            )
+            refreshed = await self._do_refresh_at(token_id, session_token, token)
+            if refreshed:
+                self._browser_auth_failure_reasons.pop(token_id, None)
+            return refreshed
+
+        return False
 
     async def get_personal_warmup_project_ids(
         self,
@@ -245,6 +371,8 @@ class TokenManager:
                 pass
         self._refresh_locks.pop(token_id, None)
         self._project_locks.pop(token_id, None)
+        self._proactive_at_retry_after.pop(token_id, None)
+        self._proactive_at_failure_counts.pop(token_id, None)
 
         if config.captcha_method == "personal" and project_ids:
             try:
@@ -258,13 +386,167 @@ class TokenManager:
     async def enable_token(self, token_id: int):
         """Enable a token and reset error count"""
         # Enable the token
-        await self.db.update_token(token_id, is_active=True, ban_reason=None, banned_at=None)
+        await self.db.update_token(
+            token_id,
+            is_active=True,
+            ban_reason=None,
+            banned_at=None,
+            captcha_failure_count=0,
+            captcha_cooldown_until=None,
+            captcha_circuit_opened_at=None,
+            captcha_last_failure_at=None,
+        )
         # Reset error count when enabling (only reset total error_count, keep today_error_count)
         await self.db.reset_error_count(token_id)
 
     async def disable_token(self, token_id: int):
         """Disable a token"""
         await self.db.update_token(token_id, is_active=False)
+
+    async def set_browser_connection_enabled(self, token_id: int, enabled: bool) -> tuple[Token, bool]:
+        """Persist the manual extension-browser switch and apply it immediately.
+
+        The dashboard switch is the operator-facing work/park control for an
+        extension account. Keep the token activity flag in step with it so a
+        connected profile cannot remain unusable, and a parked profile is not
+        counted as an active worker. A 429 safety ban remains authoritative and
+        cannot be cleared by toggling the browser connection.
+        """
+        token = await self.db.get_token(token_id)
+        if token is None:
+            raise ValueError(f"Token {token_id} not found")
+
+        normalized_enabled = bool(enabled)
+        updates: Dict[str, Any] = {
+            "browser_enabled": normalized_enabled,
+            # Turning a browser off makes the next enable fetch its current
+            # session. Keeping this flag persisted also survives restarts.
+            "browser_session_sync_pending": True,
+        }
+        if not normalized_enabled:
+            updates["is_active"] = False
+        elif str(token.ban_reason or "").strip() != "429_rate_limit":
+            updates.update({
+                "is_active": True,
+                "ban_reason": None,
+                "banned_at": None,
+                "captcha_failure_count": 0,
+                "captcha_cooldown_until": None,
+                "captcha_circuit_opened_at": None,
+                "captcha_last_failure_at": None,
+            })
+
+        await self.db.update_token(token_id, **updates)
+        for field, value in updates.items():
+            setattr(token, field, value)
+        self._proactive_at_retry_after.pop(token_id, None)
+        self._proactive_at_failure_counts.pop(token_id, None)
+
+        connected = False
+        if config.captcha_method == "extension":
+            from .browser_captcha_extension import ExtensionCaptchaService
+
+            service = await ExtensionCaptchaService.get_instance(self.db)
+            await service.set_route_enabled(token.extension_route_key or "", normalized_enabled)
+            connected = service.has_connection_for_route_key(token.extension_route_key or "")
+        return token, connected
+
+    async def sync_extension_browser_session(self, token_id: int) -> bool:
+        """Fetch and verify the enabled profile's current Flow authentication."""
+        refresh_lock = await self._get_token_lock(
+            self._refresh_locks,
+            self._refresh_lock_guard,
+            token_id,
+        )
+        async with refresh_lock:
+            token = await self.db.get_token(token_id)
+            if token is None or not token.browser_enabled:
+                return False
+            if not token.browser_session_sync_pending:
+                return True
+
+            try:
+                refreshed = await self._refresh_at_from_extension_browser(token_id, token)
+                if not refreshed:
+                    await self._record_extension_st_refresh_failure(
+                        token_id,
+                        self._browser_auth_failure_reasons.pop(
+                            token_id,
+                            "current Flow browser session authentication could not be verified",
+                        ),
+                    )
+                    return False
+
+                latest_token = await self.db.get_token(token_id) or token
+                if not latest_token.browser_enabled:
+                    # A manual OFF that happened during synchronization wins;
+                    # leave the pending flag intact for the next manual ON.
+                    return False
+
+                can_reactivate = (
+                    str(latest_token.ban_reason or "").strip() != "429_rate_limit"
+                )
+                await self.db.update_token(
+                    token_id,
+                    browser_session_sync_pending=False,
+                    last_st_refresh_result="success: browser session synchronized",
+                    **({
+                        "is_active": True,
+                        "ban_reason": None,
+                        "banned_at": None,
+                    } if can_reactivate else {}),
+                )
+                if can_reactivate:
+                    await self.db.reset_error_count(token_id)
+                self._proactive_at_retry_after.pop(token_id, None)
+                self._proactive_at_failure_counts.pop(token_id, None)
+                debug_logger.log_info(
+                    f"[BROWSER_SYNC] Token {token_id}: browser authentication synchronized"
+                )
+                return True
+            except Exception as e:
+                await self._record_extension_st_refresh_failure(token_id, str(e))
+                return False
+
+    async def handle_extension_route_connected(self, route_key: str) -> None:
+        """Complete a pending session sync when an enabled Chrome profile reconnects."""
+        token = await self.db.get_token_by_extension_route_key(route_key)
+        if (
+            token is None
+            or not token.browser_enabled
+            or not token.browser_session_sync_pending
+            or not token.id
+        ):
+            return
+        await self.sync_extension_browser_session(token.id)
+
+    async def update_captcha_circuit(
+        self,
+        token_id: int,
+        *,
+        failure_count: int,
+        cooldown_until: Optional[datetime],
+        circuit_opened_at: Optional[datetime],
+        last_failure_at: Optional[datetime],
+    ) -> None:
+        """Persist one account's reCAPTCHA circuit state."""
+        await self.db.update_token(
+            token_id,
+            captcha_failure_count=max(0, int(failure_count)),
+            captcha_cooldown_until=cooldown_until,
+            captcha_circuit_opened_at=circuit_opened_at,
+            captcha_last_failure_at=last_failure_at,
+        )
+
+    async def reset_captcha_circuit(self, token_id: int) -> None:
+        """Clear persisted reCAPTCHA circuit state after a valid recovery probe."""
+        await self.update_captcha_circuit(
+            token_id,
+            failure_count=0,
+            cooldown_until=None,
+            circuit_opened_at=None,
+            last_failure_at=None,
+        )
 
     # ========== Token添加 (支持Project创建) ==========
 
@@ -280,6 +562,7 @@ class TokenManager:
         video_concurrency: int = -1,
         captcha_proxy_url: Optional[str] = None,
         extension_route_key: Optional[str] = None,
+        browser_enabled: bool = True,
         protocol_mode: str = "session",
         google_cookies: Optional[str] = None,
         login_account: Optional[str] = None,
@@ -363,6 +646,8 @@ class TokenManager:
             video_concurrency=video_concurrency,
             captcha_proxy_url=captcha_proxy_url,
             extension_route_key=extension_route_key,
+            browser_enabled=bool(browser_enabled),
+            browser_session_sync_pending=not bool(browser_enabled),
             protocol_mode=self._normalize_protocol_mode(protocol_mode),
             google_cookies=(google_cookies or "").strip(),
             login_account=(login_account or "").strip(),
@@ -374,6 +659,12 @@ class TokenManager:
 
         token_id = await self.db.add_token(token)
         token.id = token_id
+
+        if config.captcha_method == "extension" and token.extension_route_key:
+            from .browser_captcha_extension import ExtensionCaptchaService
+
+            service = await ExtensionCaptchaService.get_instance(self.db)
+            await service.set_route_enabled(token.extension_route_key, token.browser_enabled)
 
         pooled_projects[0].token_id = token_id
         pooled_projects[0].id = await self.db.add_project(pooled_projects[0])
@@ -401,6 +692,7 @@ class TokenManager:
         video_concurrency: Optional[int] = None,
         captcha_proxy_url: Optional[str] = None,
         extension_route_key: Optional[str] = None,
+        browser_enabled: Optional[bool] = None,
         protocol_mode: Optional[str] = None,
         google_cookies: Optional[str] = None,
         login_account: Optional[str] = None,
@@ -440,6 +732,8 @@ class TokenManager:
             update_fields["captcha_proxy_url"] = captcha_proxy_url
         if extension_route_key is not None:
             update_fields["extension_route_key"] = extension_route_key
+        if browser_enabled is not None:
+            update_fields["browser_enabled"] = bool(browser_enabled)
         if protocol_mode is not None:
             update_fields["protocol_mode"] = self._normalize_protocol_mode(protocol_mode)
         if google_cookies is not None:
@@ -457,6 +751,13 @@ class TokenManager:
 
         # 检查token是否因429被禁用，如果是且未过期，则清空429状态
         token = await self.db.get_token(token_id)
+        browser_state_changed = bool(
+            browser_enabled is not None
+            and token is not None
+            and token.browser_enabled != bool(browser_enabled)
+        )
+        if browser_state_changed:
+            update_fields["browser_session_sync_pending"] = True
         if credential_updated and token and not token.is_active:
             debug_logger.log_info(f"[UPDATE_TOKEN] Token {token_id} 已更新凭证，自动恢复为启用状态")
             update_fields["is_active"] = True
@@ -484,6 +785,13 @@ class TokenManager:
             if credential_updated:
                 self._clear_at_validation_cache(token_id)
             await self.db.update_token(token_id, **update_fields)
+
+            if browser_state_changed and config.captcha_method == "extension" and token:
+                from .browser_captcha_extension import ExtensionCaptchaService
+
+                service = await ExtensionCaptchaService.get_instance(self.db)
+                route_key = extension_route_key if extension_route_key is not None else token.extension_route_key
+                await service.set_route_enabled(route_key or "", bool(browser_enabled))
 
     # ========== AT自动刷新逻辑 (核心) ==========
 
@@ -561,7 +869,7 @@ class TokenManager:
         return valid_token is not None
 
 
-    async def _refresh_at_inner(self, token_id: int) -> bool:
+    async def _refresh_at_inner(self, token_id: int, *, disable_on_failure: bool = True) -> bool:
         """Perform exactly one real AT refresh attempt."""
         refresh_lock = await self._get_token_lock(
             self._refresh_locks,
@@ -573,21 +881,44 @@ class TokenManager:
             if not token:
                 return False
 
-            result = await self._do_refresh_at(token_id, token.st, token)
-            if result:
-                return True
-
-            debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: first AT refresh failed, trying ST refresh...")
-            new_st = await self._try_refresh_st(token_id, token)
+            if (
+                config.captcha_method == "extension"
+                and bool(getattr(token, "browser_enabled", True))
+            ):
+                debug_logger.log_info(
+                    f"[AT_REFRESH] Token {token_id}: trying current Flow browser auth..."
+                )
+                if await self._refresh_at_from_extension_browser(token_id, token):
+                    return True
+                new_st = None
+            else:
+                result = await self._do_refresh_at(token_id, token.st, token)
+                if result:
+                    return True
+                debug_logger.log_info(
+                    f"[AT_REFRESH] Token {token_id}: first AT refresh failed, trying ST refresh..."
+                )
+                new_st = await self._try_refresh_st(token_id, token)
             if new_st:
                 debug_logger.log_info(f"[AT_REFRESH] Token {token_id}: ST refreshed, retrying AT refresh...")
                 latest_token = await self.db.get_token(token_id) or token
                 result = await self._do_refresh_at(token_id, new_st, latest_token)
                 if result:
                     return True
+                if config.captcha_method == "extension":
+                    await self._record_extension_st_refresh_failure(
+                        token_id,
+                        "refreshed session cookie still returned an expired or invalid access token",
+                    )
 
-            debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: all refresh attempts failed, disabling token")
-            await self.disable_token(token_id)
+            if disable_on_failure and config.captcha_method != "extension":
+                debug_logger.log_error(f"[AT_REFRESH] Token {token_id}: all refresh attempts failed, disabling token")
+                await self.disable_token(token_id)
+            else:
+                debug_logger.log_warning(
+                    f"[AT_REFRESH] Token {token_id}: proactive refresh failed; "
+                    "keeping token active for a later retry"
+                )
             self._clear_at_validation_cache(token_id)
             return False
 
@@ -639,6 +970,13 @@ class TokenManager:
                     new_at_expires = datetime.fromisoformat(expires.replace('Z', '+00:00'))
                 except:
                     pass
+
+            if new_at_expires is not None:
+                normalized_expiry = self._as_utc(new_at_expires)
+                if normalized_expiry is not None and normalized_expiry <= datetime.now(timezone.utc):
+                    raise RuntimeError(
+                        f"ST-to-AT returned an already expired access token ({normalized_expiry.isoformat()})"
+                    )
 
             # 更新数据库
             await self.db.update_token(
@@ -731,6 +1069,21 @@ class TokenManager:
             record_token_refresh("st", "failure")
             return None
 
+    async def _record_extension_st_refresh_failure(self, token_id: int, reason: str) -> None:
+        """Persist extension refresh failures so the dashboard can explain retries."""
+        normalized_reason = str(reason or "unknown extension ST refresh failure").strip()
+        try:
+            await self.db.update_token(
+                token_id,
+                last_st_refresh_at=datetime.now(timezone.utc),
+                last_st_refresh_result=f"failure: {normalized_reason}"[:500],
+            )
+        except Exception as e:
+            debug_logger.log_warning(
+                f"[ST_REFRESH] Token {token_id}: failed to persist extension refresh result - {e}"
+            )
+        record_token_refresh("st", "failure")
+
     async def _try_refresh_st(self, token_id: int, token) -> Optional[str]:
         """尝试通过浏览器刷新 Session Token
 
@@ -756,6 +1109,26 @@ class TokenManager:
                     from .browser_captcha_extension import ExtensionCaptchaService
                     debug_logger.log_info(f"[ST_REFRESH] extension 模式：从对应 Chrome 配置文件读取 ST...")
                     service = await ExtensionCaptchaService.get_instance(self.db)
+
+                    project_id = str(getattr(token, "current_project_id", "") or "").strip()
+                    if project_id:
+                        try:
+                            # Existing workers open a fresh Labs tab for CAPTCHA
+                            # generation. This lets NextAuth rotate the browser
+                            # session before its cookie is read for AT recovery.
+                            await service.get_token_bundle(
+                                project_id,
+                                action="IMAGE_GENERATION",
+                                timeout=30,
+                                token_id=token_id,
+                            )
+                        except Exception as e:
+                            # Page navigation may have refreshed the cookie even
+                            # when CAPTCHA generation itself failed.
+                            debug_logger.log_warning(
+                                f"[ST_REFRESH] Token {token_id}: extension session warmup failed - {e}"
+                            )
+
                     new_st = await service.get_session_token(token_id, timeout=15)
                     if new_st and new_st != token.st:
                         await self.db.update_token(
@@ -767,8 +1140,13 @@ class TokenManager:
                         record_token_refresh("st", "success")
                         debug_logger.log_info(f"[ST_REFRESH] Token {token_id}: extension에서 ST 자동 갱신 성공")
                         return new_st
-                    debug_logger.log_warning(f"[ST_REFRESH] Token {token_id}: extension에서 새 ST를 받지 못함")
-                    record_token_refresh("st", "failure")
+                    reason = (
+                        "extension returned the unchanged session cookie"
+                        if new_st == token.st
+                        else "extension did not return a session cookie"
+                    )
+                    await self._record_extension_st_refresh_failure(token_id, reason)
+                    debug_logger.log_warning(f"[ST_REFRESH] Token {token_id}: {reason}")
                     return None
                 debug_logger.log_info(f"[ST_REFRESH] 非 personal 模式，跳过 ST 自动刷新")
                 return None
@@ -811,7 +1189,10 @@ class TokenManager:
 
         except Exception as e:
             debug_logger.log_error(f"[ST_REFRESH] Token {token_id}: 刷新 ST 失败 - {str(e)}")
-            record_token_refresh("st", "failure")
+            if config.captcha_method == "extension":
+                await self._record_extension_st_refresh_failure(token_id, str(e))
+            else:
+                record_token_refresh("st", "failure")
             return None
 
     async def _refresh_protocol_token(self, token: Token, now: datetime) -> None:
@@ -876,18 +1257,24 @@ class TokenManager:
                 debug_logger.log_error(f"[PROTOCOL_REFRESH] Token {token_id}: 协议 ST 转 AT 失败 - {e}")
 
     async def run_protocol_refresh_once(self) -> None:
-        """Refresh protocol-mode tokens whose ST refresh interval is due."""
+        """Run proactive extension AT refresh and scheduled protocol ST refresh."""
         try:
             refresh_config = await self.db.get_token_refresh_config()
         except Exception as e:
             debug_logger.log_warning(f"[PROTOCOL_REFRESH] 读取刷新配置失败: {e}")
             return
 
+        # Inactive extension accounts may be awaiting automatic session
+        # recovery. Include them in the extension refresh pass, while keeping
+        # scheduled protocol refresh limited to active accounts.
+        all_tokens = await self.db.get_all_tokens()
+        tokens = await self.db.get_active_tokens()
+        now = datetime.now(timezone.utc)
+        await self._refresh_expiring_extension_tokens(all_tokens, now)
+
         if not refresh_config or not refresh_config.enabled:
             return
 
-        tokens = await self.db.get_active_tokens()
-        now = datetime.now(timezone.utc)
         for token in tokens:
             try:
                 if not token.auto_refresh_enabled:
@@ -906,6 +1293,72 @@ class TokenManager:
                 await self._refresh_protocol_token(token, now)
             except Exception as e:
                 debug_logger.log_error(f"[PROTOCOL_REFRESH] Token {getattr(token, 'id', '?')}: 后台刷新异常 - {e}")
+
+    def _is_proactive_extension_refresh_due(self, token: Token, now: datetime) -> bool:
+        """Return whether an extension account needs background AT recovery."""
+        if config.captcha_method != "extension":
+            return False
+        if not token.auto_refresh_enabled:
+            return False
+        if not token.browser_enabled:
+            return False
+        if self._normalize_protocol_mode(token.protocol_mode) != "session":
+            return False
+
+        if token.browser_session_sync_pending:
+            return True
+
+        if not (token.at or "").strip():
+            return True
+
+        expires_at = self._as_utc(token.at_expires)
+        if expires_at is None:
+            return True
+        return expires_at - now <= self._PROACTIVE_AT_REFRESH_WINDOW
+
+    async def _refresh_expiring_extension_tokens(self, tokens: List[Token], now: datetime) -> None:
+        """Refresh expiring or expired extension ATs without disabling on transient failure."""
+        monotonic_now = time.monotonic()
+        for token in tokens:
+            if not token.id:
+                continue
+            if not self._is_proactive_extension_refresh_due(token, now):
+                self._proactive_at_retry_after.pop(token.id, None)
+                self._proactive_at_failure_counts.pop(token.id, None)
+                continue
+
+            retry_after = self._proactive_at_retry_after.get(token.id, 0.0)
+            if retry_after > monotonic_now:
+                continue
+
+            try:
+                if token.browser_session_sync_pending:
+                    refreshed = await self.sync_extension_browser_session(token.id)
+                else:
+                    refreshed = await self._refresh_at_inner(token.id, disable_on_failure=False)
+            except Exception as e:
+                refreshed = False
+                debug_logger.log_error(
+                    f"[AT_REFRESH] Token {token.id}: proactive background refresh error - {e}"
+                )
+
+            if refreshed:
+                self._proactive_at_retry_after.pop(token.id, None)
+                self._proactive_at_failure_counts.pop(token.id, None)
+                debug_logger.log_info(
+                    f"[AT_REFRESH] Token {token.id}: proactive extension AT refresh succeeded"
+                )
+            else:
+                failure_count = self._proactive_at_failure_counts.get(token.id, 0) + 1
+                self._proactive_at_failure_counts[token.id] = failure_count
+                retry_delay = min(
+                    self._PROACTIVE_AT_RETRY_MAX_SECONDS,
+                    self._PROACTIVE_AT_RETRY_BASE_SECONDS * (2 ** min(failure_count - 1, 4)),
+                )
+                self._proactive_at_retry_after[token.id] = time.monotonic() + retry_delay
+                debug_logger.log_warning(
+                    f"[AT_REFRESH] Token {token.id}: background retry scheduled in {retry_delay}s"
+                )
 
     async def _protocol_refresh_loop(self) -> None:
         while True:
@@ -986,6 +1439,27 @@ class TokenManager:
         admin_config = await self.db.get_admin_config()
 
         if stats and stats.consecutive_error_count >= admin_config.error_ban_threshold:
+            token = await self.db.get_token(token_id)
+            if (
+                config.captcha_method == "extension"
+                and token is not None
+                and token.browser_enabled
+                and str(token.ban_reason or "").strip() != "429_rate_limit"
+            ):
+                debug_logger.log_warning(
+                    f"[TOKEN_RECOVERY] Token {token_id} consecutive error count "
+                    f"({stats.consecutive_error_count}) reached threshold "
+                    f"({admin_config.error_ban_threshold}); scheduling browser session resync"
+                )
+                await self.db.update_token(
+                    token_id,
+                    is_active=False,
+                    browser_session_sync_pending=True,
+                )
+                await self.db.reset_error_count(token_id)
+                self._proactive_at_retry_after.pop(token_id, None)
+                self._proactive_at_failure_counts.pop(token_id, None)
+                return
             debug_logger.log_warning(
                 f"[TOKEN_BAN] Token {token_id} consecutive error count ({stats.consecutive_error_count}) "
                 f"reached threshold ({admin_config.error_ban_threshold}), auto-disabling"
