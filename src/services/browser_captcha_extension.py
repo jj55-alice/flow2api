@@ -249,6 +249,36 @@ class ExtensionCaptchaService:
             return False
         return (version_parts + (0, 0, 0))[:3] >= (1, 3, 3)
 
+    @staticmethod
+    def _supports_current_sid_auth(extension_version: str) -> bool:
+        try:
+            version_parts = tuple(
+                int(part) for part in str(extension_version or "").split(".")[:3]
+            )
+        except (TypeError, ValueError):
+            return False
+        return (version_parts + (0, 0, 0))[:3] >= (1, 3, 8)
+
+    @classmethod
+    def _browser_auth_was_accepted(
+        cls,
+        extension_version: str,
+        result: Dict[str, Any],
+        browser_auth_status: int,
+    ) -> bool:
+        if bool(result.get("browser_auth_valid")):
+            return True
+        # The current Flow frontend no longer issues the old GET /v1/credits
+        # shape. With its current public API key, an authenticated SID request
+        # reaches request validation and returns 400; missing or rejected SID
+        # authentication returns 401. Treat only that narrow transition as a
+        # successful session-auth probe.
+        return (
+            cls._supports_current_sid_auth(extension_version)
+            and bool(result.get("observed_api_key"))
+            and browser_auth_status == 400
+        )
+
     def describe_routes(self) -> str:
         return self._describe_routes()
 
@@ -493,11 +523,15 @@ class ExtensionCaptchaService:
                         or re.fullmatch(r"[A-Za-z0-9._~+/\-]+=*", access_token) is None
                     ):
                         access_token = ""
-                    browser_auth_valid = bool(result.get("browser_auth_valid"))
                     try:
                         browser_auth_status = int(result.get("browser_auth_status") or 0)
                     except (TypeError, ValueError):
                         browser_auth_status = 0
+                    browser_auth_valid = self._browser_auth_was_accepted(
+                        conn.extension_version,
+                        result,
+                        browser_auth_status,
+                    )
                     try:
                         credits = int(result.get("credits")) if result.get("credits") is not None else None
                     except (TypeError, ValueError):
@@ -530,7 +564,11 @@ class ExtensionCaptchaService:
                     browser_auth_status = 0
                 return {
                     "extension_version": conn.extension_version,
-                    "browser_auth_valid": False,
+                    "browser_auth_valid": self._browser_auth_was_accepted(
+                        conn.extension_version,
+                        result,
+                        browser_auth_status,
+                    ),
                     "browser_auth_status": browser_auth_status,
                     "observed_auth_scheme": str(
                         result.get("observed_auth_scheme") or "none"

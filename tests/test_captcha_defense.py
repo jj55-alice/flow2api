@@ -61,8 +61,9 @@ class _RouteDbStub:
 
 
 class _ImmediateExtensionSocket:
-    def __init__(self, service):
+    def __init__(self, service, credential_result=None):
         self.service = service
+        self.credential_result = credential_result
         self.dispatch_times = []
         self.flow_submits = []
         self.closed_codes = []
@@ -71,15 +72,18 @@ class _ImmediateExtensionSocket:
         payload = json.loads(data)
         if payload.get("type") != "get_token":
             if payload.get("type") == "get_session_cookie":
+                credential_result = self.credential_result or {
+                    "status": "success",
+                    "session_token": "labs-session-token",
+                    "access_token": "opaque-flow-token_" + ("captured" * 8),
+                    "access_token_captured_at": 123456789,
+                }
                 await self.service.handle_message(
                     self,
                     json.dumps({
                         "type": "session_cookie_result",
                         "req_id": payload["req_id"],
-                        "status": "success",
-                        "session_token": "labs-session-token",
-                        "access_token": "opaque-flow-token_" + ("captured" * 8),
-                        "access_token_captured_at": 123456789,
+                        **credential_result,
                     }),
                 )
             elif payload.get("type") == "submit_flow_request":
@@ -346,6 +350,38 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(credentials["access_token"].startswith("opaque-flow-token_"))
         self.assertEqual(credentials["session_token"], "labs-session-token")
         self.assertEqual(credentials["extension_version"], "1.3.0")
+
+    async def test_current_sid_probe_400_counts_as_authenticated(self):
+        service = ExtensionCaptchaService(db=_RouteDbStub())
+        websocket = _ImmediateExtensionSocket(service, credential_result={
+            "status": "error",
+            "error": "Flow auth probe returned a non-success response",
+            "browser_auth_status": 400,
+            "observed_auth_scheme": "none",
+            "observed_api_key": True,
+        })
+        service.active_connections.append(
+            ExtensionConnection(
+                websocket=websocket,
+                route_key="google-1",
+                extension_version="1.3.8",
+            )
+        )
+
+        credentials = await service.get_browser_credentials(
+            token_id=1,
+            project_id="project-a",
+        )
+
+        self.assertTrue(credentials["browser_auth_valid"])
+        self.assertEqual(credentials["browser_auth_status"], 400)
+
+    async def test_legacy_probe_400_is_not_treated_as_authenticated(self):
+        self.assertFalse(ExtensionCaptchaService._browser_auth_was_accepted(
+            "1.3.7",
+            {"observed_api_key": True},
+            400,
+        ))
 
     async def test_token_bundle_preserves_browser_fingerprint(self):
         service = ExtensionCaptchaService(db=_RouteDbStub())
