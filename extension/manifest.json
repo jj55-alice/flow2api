@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Flow2API Captcha Worker",
-  "version": "1.3.9",
+  "version": "1.3.10",
   "description": "Solve reCAPTCHA and submit Flow requests in the mapped Chrome profile for Flow2API.",
   "permissions": [
     "storage",
@@ -14,6 +14,8 @@
   "host_permissions": [
     "https://labs.google/*",
     "https://flow.google.com/*",
+    "https://lh3.google.com/*",
+    "https://*.googleusercontent.com/*",
     "https://aisandbox-pa.googleapis.com/*"
   ],
   "background": {

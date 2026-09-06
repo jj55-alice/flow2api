@@ -1,3 +1,4 @@
+import base64
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -142,40 +143,26 @@ class FlowClientUploadImageTests(unittest.IsolatedAsyncioTestCase):
             request_calls[1]["json_data"]["clientContext"],
         )
 
-    async def test_extension_upload_runs_in_mapped_profile_with_upload_action(self):
+    async def test_extension_upload_is_staged_for_native_flow_ui(self):
         client = FlowClient(proxy_manager=None)
-        service = AsyncMock()
-        service.submit_flow_request.return_value = {
-            "status": 200,
-            "text": '{"media":{"name":"extension-media-id"}}',
-            "headers": {"content-type": "application/json"},
-            "fingerprint": {"user_agent": "Chrome/151"},
-        }
         client._make_request = AsyncMock()
         self.config.captcha_method = "extension"
 
-        with patch(
-            "src.services.browser_captcha_extension.ExtensionCaptchaService.get_instance",
-            new=AsyncMock(return_value=service),
-        ):
-            media_id = await client.upload_image(
-                at="test-at",
-                image_bytes=JPEG_BYTES,
-                project_id="project-123",
-                token_id=17,
-            )
-
-        self.assertEqual(media_id, "extension-media-id")
-        client._make_request.assert_not_awaited()
-        submit = service.submit_flow_request.await_args.kwargs
-        self.assertEqual(submit["action"], "UPLOAD_IMAGE")
-        self.assertEqual(submit["project_id"], "project-123")
-        self.assertEqual(submit["token_id"], 17)
-        self.assertEqual(
-            submit["json_data"]["clientContext"]["recaptchaContext"]["token"],
-            "__FLOW2API_EXTENSION_BROWSER_SUBMIT__",
+        media_id = await client.upload_image(
+            at="test-at",
+            image_bytes=JPEG_BYTES,
+            project_id="project-123",
+            token_id=17,
         )
-        self.assertEqual(client.get_request_fingerprint()["user_agent"], "Chrome/151")
+
+        self.assertTrue(media_id.startswith("flow2api-ui-upload-"))
+        client._make_request.assert_not_awaited()
+        staged = client._staged_ui_uploads[media_id]
+        self.assertEqual(staged["mimeType"], "image/jpeg")
+        self.assertEqual(
+            staged["imageBytes"],
+            base64.b64encode(JPEG_BYTES).decode("utf-8"),
+        )
 
     async def test_extension_generation_carries_uploaded_file_name_for_ui_picker(self):
         client = FlowClient(proxy_manager=None)
@@ -204,6 +191,45 @@ class FlowClientUploadImageTests(unittest.IsolatedAsyncioTestCase):
             submitted["__flow2apiUiContext"]["inputFileNames"],
             ["flow2api_upload_123.jpg"],
         )
+
+    async def test_extension_generation_carries_staged_upload_bytes(self):
+        client = FlowClient(proxy_manager=None)
+        client._remember_uploaded_media_file_name(
+            "staged-media-id",
+            "flow2api_upload_456.jpg",
+        )
+        client._stage_ui_upload(
+            "staged-media-id",
+            "flow2api_upload_456.jpg",
+            "image/jpeg",
+            "encoded-image",
+        )
+        client._make_image_generation_request = AsyncMock(return_value={"media": []})
+        self.config.captcha_method = "extension"
+
+        await client.generate_image(
+            at="test-at",
+            project_id="project-123",
+            prompt="use my reference",
+            model_name="NARWHAL",
+            aspect_ratio="IMAGE_ASPECT_RATIO_SQUARE",
+            image_inputs=[{
+                "name": "staged-media-id",
+                "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE",
+            }],
+            token_id=17,
+        )
+
+        submitted = client._make_image_generation_request.await_args.kwargs["json_data"]
+        self.assertEqual(
+            submitted["__flow2apiUiContext"]["inputUploads"],
+            [{
+                "fileName": "flow2api_upload_456.jpg",
+                "mimeType": "image/jpeg",
+                "imageBytes": "encoded-image",
+            }],
+        )
+        self.assertNotIn("staged-media-id", client._staged_ui_uploads)
 
 
 if __name__ == "__main__":
