@@ -471,13 +471,19 @@ class FileCache:
             )
             raise Exception(f"Failed to cache base64 video: {str(e)}")
 
-    async def cache_base64_image(self, base64_data: str, resolution: str = "") -> str:
+    async def cache_base64_image(
+        self,
+        base64_data: str,
+        resolution: str = "",
+        mime_type: str = "image/jpeg",
+    ) -> str:
         """
         Cache base64 encoded image data to local file
 
         Args:
             base64_data: Base64 encoded image data (without data:image/... prefix)
             resolution: Resolution info for filename (e.g., "4K", "2K")
+            mime_type: Encoded image MIME type
 
         Returns:
             Local cache filename
@@ -488,7 +494,14 @@ class FileCache:
         # Generate unique filename
         unique_id = hashlib.md5(f"{uuid.uuid4()}{time.time()}".encode()).hexdigest()
         suffix = f"_{resolution}" if resolution else ""
-        filename = f"{unique_id}{suffix}.jpg"
+        normalized_mime = str(mime_type or "").lower().split(";", 1)[0].strip()
+        extension = {
+            "image/png": ".png",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+            "image/avif": ".avif",
+        }.get(normalized_mime, ".jpg")
+        filename = f"{unique_id}{suffix}{extension}"
         file_path = self.cache_dir / filename
 
         try:

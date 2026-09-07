@@ -268,6 +268,16 @@ class ExtensionCaptchaService:
             return False
         return (version_parts + (0, 0, 0))[:3] >= (1, 3, 8)
 
+    @staticmethod
+    def _supports_current_flow_ui(extension_version: str) -> bool:
+        try:
+            version_parts = tuple(
+                int(part) for part in str(extension_version or "").split(".")[:3]
+            )
+        except (TypeError, ValueError):
+            return False
+        return (version_parts + (0, 0, 0))[:3] >= (1, 3, 11)
+
     @classmethod
     def _browser_auth_was_accepted(
         cls,
@@ -667,6 +677,15 @@ class ExtensionCaptchaService:
                 f"(connected version: {conn.extension_version or 'legacy'}, required: 1.2.0+)"
             )
         if (
+            str(action or "").strip().upper() == "IMAGE_GENERATION"
+            and not self._supports_current_flow_ui(conn.extension_version)
+        ):
+            raise ExtensionCaptchaError(
+                f"Chrome Extension route_key='{route_key}' must be reloaded "
+                f"(connected version: {conn.extension_version or 'legacy'}, required: 1.3.11+)",
+                code="extension_reload_required",
+            )
+        if (
             not str(at_token or "").strip()
             and not self._supports_browser_cookie_auth(conn.extension_version)
         ):
@@ -694,6 +713,15 @@ class ExtensionCaptchaService:
                 raise RuntimeError(
                     f"Chrome Extension route_key='{route_key}' must be reloaded "
                     f"(connected version: {conn.extension_version or 'legacy'}, required: 1.2.0+)"
+                )
+            if (
+                str(action or "").strip().upper() == "IMAGE_GENERATION"
+                and not self._supports_current_flow_ui(conn.extension_version)
+            ):
+                raise ExtensionCaptchaError(
+                    f"Chrome Extension route_key='{route_key}' must be reloaded "
+                    f"(connected version: {conn.extension_version or 'legacy'}, required: 1.3.11+)",
+                    code="extension_reload_required",
                 )
 
             req_id = f"req_{uuid.uuid4().hex}"

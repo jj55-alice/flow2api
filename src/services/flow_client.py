@@ -57,6 +57,7 @@ class FlowClient:
         # generation requests carry only media IDs. Keep a bounded bridge for
         # extension-driven image-to-image generation.
         self._uploaded_media_file_names: Dict[str, str] = {}
+        self._staged_ui_uploads: Dict[str, Dict[str, str]] = {}
 
         # 仅保留当前上游仍稳定出现的最小浏览器风格头；具体 UA / Accept-Language / UA-CH
         # 统一以当前请求链路绑定的 runtime fingerprint 为准，不再兼容旧版随机平台策略。
@@ -127,6 +128,24 @@ class FlowClient:
         self._uploaded_media_file_names[normalized_media_id] = normalized_file_name
         while len(self._uploaded_media_file_names) > 256:
             self._uploaded_media_file_names.pop(next(iter(self._uploaded_media_file_names)))
+
+    def _stage_ui_upload(
+        self,
+        media_id: str,
+        file_name: str,
+        mime_type: str,
+        image_base64: str,
+    ) -> None:
+        """Keep a bounded in-memory upload for the mapped Flow UI request."""
+        self._staged_ui_uploads[media_id] = {
+            "fileName": file_name,
+            "mimeType": mime_type,
+            "imageBytes": image_base64,
+        }
+        # Reference-image requests are short lived. Bounding the bridge avoids
+        # retaining unbounded base64 payloads if a client abandons a request.
+        while len(self._staged_ui_uploads) > 32:
+            self._staged_ui_uploads.pop(next(iter(self._staged_ui_uploads)))
 
     def _get_primary_accept_language(self, fallback: str = "zh-CN,zh;q=0.9") -> str:
         fingerprint = self.get_request_fingerprint()
@@ -1162,6 +1181,10 @@ class FlowClient:
                     from .browser_captcha_extension import ExtensionCaptchaService
 
                     service = await ExtensionCaptchaService.get_instance(self.db)
+                    # Flow's agent UI can take substantially longer than the
+                    # direct image API. Give the mapped tab enough time to
+                    # render and expose the generated asset once.
+                    browser_request_timeout = max(request_timeout, 180)
                     response_payload = await service.submit_flow_request(
                         project_id=project_id,
                         action="IMAGE_GENERATION",
@@ -1169,7 +1192,7 @@ class FlowClient:
                         url=url,
                         at_token=at,
                         json_data=json_data,
-                        timeout=request_timeout,
+                        timeout=browser_request_timeout,
                     )
                     response_fingerprint = response_payload.get("fingerprint")
                     self._set_request_fingerprint(
@@ -1513,6 +1536,21 @@ class FlowClient:
         new_url = f"{self.api_base_url}/flow/uploadImage"
         normalized_project_id = str(project_id or "").strip()
         captcha_method = getattr(config, "captcha_method", "personal")
+
+        # The current Flow frontend no longer accepts the old project-scoped
+        # upload request reliably. Keep extension uploads local until the image
+        # generation tab is open, then let that tab use Flow's native uploader.
+        if captcha_method == "extension" and normalized_project_id:
+            staged_media_id = f"flow2api-ui-upload-{uuid.uuid4().hex}"
+            self._remember_uploaded_media_file_name(staged_media_id, upload_file_name)
+            self._stage_ui_upload(
+                staged_media_id,
+                upload_file_name,
+                mime_type,
+                image_base64,
+            )
+            return staged_media_id
+
         new_client_context = {
             "sessionId": self._generate_session_id(),
             "tool": "PINHOLE",
@@ -1799,13 +1837,14 @@ class FlowClient:
                 "requests": [request_data]
             }
             if config.captcha_method == "extension" and image_inputs:
-                input_file_names = [
-                    self._uploaded_media_file_names.get(
-                        str(item.get("name") or "").strip(),
-                        "",
-                    )
+                input_media_ids = [
+                    str(item.get("name") or "").strip()
                     for item in image_inputs
                     if isinstance(item, dict)
+                ]
+                input_file_names = [
+                    self._uploaded_media_file_names.get(media_id, "")
+                    for media_id in input_media_ids
                 ]
                 if input_file_names and all(input_file_names):
                     # Private extension metadata. background.js removes it
@@ -1813,6 +1852,12 @@ class FlowClient:
                     json_data["__flow2apiUiContext"] = {
                         "inputFileNames": input_file_names,
                     }
+                    input_uploads = [
+                        self._staged_ui_uploads.get(media_id)
+                        for media_id in input_media_ids
+                    ]
+                    if input_uploads and all(isinstance(item, dict) for item in input_uploads):
+                        json_data["__flow2apiUiContext"]["inputUploads"] = input_uploads
 
             try:
                 result = await self._make_image_generation_request(
@@ -1827,6 +1872,12 @@ class FlowClient:
                 attempt_trace["duration_ms"] = int((time.time() - attempt_started_at) * 1000)
                 perf_trace["generation_attempts"].append(attempt_trace)
                 perf_trace["final_success_attempt"] = retry_attempt + 1
+                for item in image_inputs or []:
+                    if isinstance(item, dict):
+                        self._staged_ui_uploads.pop(
+                            str(item.get("name") or "").strip(),
+                            None,
+                        )
                 return result, session_id, perf_trace
             except Exception as e:
                 last_error = e
@@ -1844,12 +1895,24 @@ class FlowClient:
                 )
                 if should_retry:
                     continue
+                for item in image_inputs or []:
+                    if isinstance(item, dict):
+                        self._staged_ui_uploads.pop(
+                            str(item.get("name") or "").strip(),
+                            None,
+                        )
                 raise
             finally:
                 await self._notify_browser_captcha_request_finished(browser_id)
         
         # 所有重试都失败
         perf_trace["final_success_attempt"] = None
+        for item in image_inputs or []:
+            if isinstance(item, dict):
+                self._staged_ui_uploads.pop(
+                    str(item.get("name") or "").strip(),
+                    None,
+                )
         raise last_error
 
     async def upsample_image(

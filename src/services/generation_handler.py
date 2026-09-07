@@ -1853,7 +1853,14 @@ class GenerationHandler:
                 yield self._create_error_response("生成结果为空", status_code=502)
                 return
 
-            image_url = media[0]["image"]["generatedImage"]["fifeUrl"]
+            generated_image = media[0]["image"]["generatedImage"]
+            image_url = str(generated_image.get("fifeUrl") or "").strip()
+            encoded_image = str(generated_image.get("encodedImage") or "").strip()
+            image_mime_type = str(generated_image.get("mimeType") or "image/jpeg").strip()
+            if not image_url and not encoded_image:
+                self._mark_generation_failed(generation_result, "生成图片缺少可用内容")
+                yield self._create_error_response("生成图片缺少可用内容", status_code=502)
+                return
             media_id = media[0].get("name")  # 用于 upsample
             response_state["generated_assets"] = {
                 "type": "image",
@@ -1978,7 +1985,31 @@ class GenerationHandler:
 
             local_url = image_url
             cache_started_at = time.time()
-            if config.cache_enabled:
+            if encoded_image:
+                await self._update_request_log_progress(
+                    request_log_state,
+                    token_id=token.id,
+                    status_text="caching_image",
+                    progress=90,
+                )
+                if stream:
+                    yield self._create_stream_chunk("正在缓存 1K 图片文件...\n")
+                try:
+                    cached_filename = await self.file_cache.cache_base64_image(
+                        encoded_image,
+                        "1K",
+                        image_mime_type,
+                    )
+                    local_url = f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
+                    if stream:
+                        yield self._create_stream_chunk("✅ 1K 图片缓存成功,准备返回缓存地址...\n")
+                except Exception as e:
+                    debug_logger.log_error(f"Failed to cache 1K image: {str(e)}")
+                    local_url = f"data:{image_mime_type};base64,{encoded_image}"
+                    if stream:
+                        cache_error = self._normalize_error_message(e, max_length=120)
+                        yield self._create_stream_chunk(f"⚠️ 缓存失败: {cache_error}\n正在返回源链接...\n")
+            elif config.cache_enabled:
                 await self._update_request_log_progress(
                     request_log_state,
                     token_id=token.id,

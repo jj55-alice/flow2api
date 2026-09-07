@@ -9,7 +9,11 @@ from types import SimpleNamespace
 from src.core.config import config
 from src.core.database import Database
 from src.core.models import Token
-from src.services.browser_captcha_extension import ExtensionCaptchaService, ExtensionConnection
+from src.services.browser_captcha_extension import (
+    ExtensionCaptchaError,
+    ExtensionCaptchaService,
+    ExtensionConnection,
+)
 from src.services.flow_client import FlowClient
 from src.services.load_balancer import LoadBalancer
 
@@ -304,7 +308,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.2.0",
+                extension_version="1.3.11",
             )
         )
 
@@ -403,7 +407,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.2.0",
+                extension_version="1.3.11",
             )
         )
 
@@ -434,7 +438,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.3.3",
+                extension_version="1.3.11",
             )
         )
 
@@ -466,7 +470,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "access token or extension version 1.3.3"):
             await service.submit_flow_request(
                 project_id="project-a",
-                action="IMAGE_GENERATION",
+                action="UPLOAD_IMAGE",
                 token_id=1,
                 url=(
                     "https://aisandbox-pa.googleapis.com/v1/projects/project-a/"
@@ -497,6 +501,33 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
                 json_data={},
                 timeout=15,
             )
+
+    async def test_current_flow_image_submit_requires_version_1_3_11(self):
+        service = ExtensionCaptchaService(db=_RouteDbStub())
+        websocket = _ImmediateExtensionSocket(service)
+        service.active_connections.append(
+            ExtensionConnection(
+                websocket=websocket,
+                route_key="google-1",
+                extension_version="1.3.9",
+            )
+        )
+
+        with self.assertRaisesRegex(ExtensionCaptchaError, "required: 1.3.11") as raised:
+            await service.submit_flow_request(
+                project_id="project-a",
+                action="IMAGE_GENERATION",
+                token_id=1,
+                url=(
+                    "https://aisandbox-pa.googleapis.com/v1/projects/project-a/"
+                    "flowMedia:batchGenerateImages"
+                ),
+                at_token="access-token",
+                json_data={},
+                timeout=15,
+            )
+        self.assertEqual(raised.exception.http_status, 503)
+        self.assertEqual(raised.exception.code, "extension_reload_required")
 
     async def test_flow_submit_rejects_non_google_target(self):
         service = ExtensionCaptchaService(db=_RouteDbStub())

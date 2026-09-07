@@ -191,6 +191,7 @@ class ApiCaptchaFingerprintTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(service.flow_submits), 1)
         self.assertEqual(service.flow_submits[0]["token_id"], 7)
         self.assertEqual(service.flow_submits[0]["at_token"], "access-token")
+        self.assertEqual(service.flow_submits[0]["timeout"], 180)
         self.assertEqual(flow.get_request_fingerprint(), browser_fingerprint)
 
     async def test_extension_browser_submit_preserves_flow_recaptcha_error(self):

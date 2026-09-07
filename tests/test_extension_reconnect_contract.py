@@ -13,13 +13,16 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn("alarms", manifest["permissions"])
         self.assertGreaterEqual(
             tuple(int(part) for part in manifest["version"].split(".")),
-            (1, 3, 9),
+            (1, 3, 11),
         )
 
     def test_manifest_allows_current_flow_host(self):
         manifest = json.loads((REPO_ROOT / "extension" / "manifest.json").read_text())
 
         self.assertIn("https://flow.google.com/*", manifest["host_permissions"])
+        self.assertIn("https://flow-content.google/*", manifest["host_permissions"])
+        self.assertIn("https://lh3.google.com/*", manifest["host_permissions"])
+        self.assertIn("https://*.googleusercontent.com/*", manifest["host_permissions"])
         self.assertIn(
             "https://flow.google.com/*",
             manifest["content_scripts"][0]["matches"],
@@ -90,6 +93,15 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn(".settings-trigger-button", background)
         self.assertIn("Nano Banana 2 Lite", background)
         self.assertIn("flow-add-menu-popover-content", background)
+        self.assertIn("inputUploads", background)
+        self.assertIn("Flow native upload", background)
+        self.assertIn("HTMLInputElement.prototype.click", background)
+        self.assertIn('parsed.pathname.startsWith("/asb/")', background)
+        self.assertIn('parsed.hostname === "flow-content.google"', background)
+        self.assertIn('parsed.searchParams.get("name")', background)
+        self.assertIn("embedCurrentFlowImages", background)
+        self.assertIn("encodedImage", background)
+        self.assertIn("Math.max(180000, timeoutMs)", background)
         self.assertIn("__flow2apiUiContext", background)
         self.assertIn("delete body.__flow2apiUiContext", background)
         self.assertIn("flow_google_ui", background)
