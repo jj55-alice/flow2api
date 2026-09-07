@@ -9,7 +9,11 @@ from types import SimpleNamespace
 from src.core.config import config
 from src.core.database import Database
 from src.core.models import Token
-from src.services.browser_captcha_extension import ExtensionCaptchaService, ExtensionConnection
+from src.services.browser_captcha_extension import (
+    ExtensionCaptchaError,
+    ExtensionCaptchaService,
+    ExtensionConnection,
+)
 from src.services.flow_client import FlowClient
 from src.services.load_balancer import LoadBalancer
 
@@ -509,7 +513,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        with self.assertRaisesRegex(RuntimeError, "required: 1.3.10"):
+        with self.assertRaisesRegex(ExtensionCaptchaError, "required: 1.3.10") as raised:
             await service.submit_flow_request(
                 project_id="project-a",
                 action="IMAGE_GENERATION",
@@ -522,6 +526,8 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
                 json_data={},
                 timeout=15,
             )
+        self.assertEqual(raised.exception.http_status, 503)
+        self.assertEqual(raised.exception.code, "extension_reload_required")
 
     async def test_flow_submit_rejects_non_google_target(self):
         service = ExtensionCaptchaService(db=_RouteDbStub())
