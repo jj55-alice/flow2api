@@ -572,6 +572,14 @@ async function connectWS() {
 function isCurrentFlowImageUrl(rawUrl) {
     try {
         const parsed = new URL(String(rawUrl || ""));
+        const mediaId = String(parsed.searchParams.get("name") || "").trim();
+        const hasMediaId = /^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(mediaId);
+        const isGoogleImageHost = (
+            parsed.hostname === "flow.google.com"
+            || parsed.hostname === "flow-content.google"
+            || parsed.hostname === "lh3.google.com"
+            || /(^|\.)googleusercontent\.com$/.test(parsed.hostname)
+        );
         return (
             parsed.hostname === "flow.google.com"
             && parsed.pathname.startsWith("/asb/")
@@ -581,6 +589,11 @@ function isCurrentFlowImageUrl(rawUrl) {
         ) || (
             parsed.hostname === "lh3.google.com"
             && parsed.pathname.startsWith("/rd-asb/")
+        ) || (
+            parsed.hostname === "flow-content.google"
+            && /^\/image\/[0-9a-f]{8}-[0-9a-f-]{27,}/i.test(parsed.pathname)
+        ) || (
+            isGoogleImageHost && hasMediaId
         );
     } catch (error) {
         return false;
@@ -929,13 +942,19 @@ async function handleSubmitFlowRequest(data, socket) {
                         try {
                             const parsed = new URL(String(rawUrl || ""), location.href);
                             let mediaId = "";
+                            const isGoogleImageHost = (
+                                parsed.hostname === "flow.google.com"
+                                || parsed.hostname === "flow-content.google"
+                                || parsed.hostname === "lh3.google.com"
+                                || /(^|\.)googleusercontent\.com$/.test(parsed.hostname)
+                            );
                             if (parsed.hostname === "flow-content.google") {
                                 const match = parsed.pathname.match(
                                     /^\/image\/([0-9a-f]{8}-[0-9a-f-]{27,})/i
                                 );
                                 mediaId = match ? match[1] : "";
                             }
-                            if (!mediaId) {
+                            if (!mediaId && isGoogleImageHost) {
                                 const candidate = parsed.searchParams.get("name") || "";
                                 if (/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(candidate)) {
                                     mediaId = candidate;

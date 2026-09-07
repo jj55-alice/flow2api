@@ -276,7 +276,7 @@ class ExtensionCaptchaService:
             )
         except (TypeError, ValueError):
             return False
-        return (version_parts + (0, 0, 0))[:3] >= (1, 3, 10)
+        return (version_parts + (0, 0, 0))[:3] >= (1, 3, 11)
 
     @classmethod
     def _browser_auth_was_accepted(
@@ -682,7 +682,7 @@ class ExtensionCaptchaService:
         ):
             raise ExtensionCaptchaError(
                 f"Chrome Extension route_key='{route_key}' must be reloaded "
-                f"(connected version: {conn.extension_version or 'legacy'}, required: 1.3.10+)",
+                f"(connected version: {conn.extension_version or 'legacy'}, required: 1.3.11+)",
                 code="extension_reload_required",
             )
         if (
@@ -720,7 +720,7 @@ class ExtensionCaptchaService:
             ):
                 raise ExtensionCaptchaError(
                     f"Chrome Extension route_key='{route_key}' must be reloaded "
-                    f"(connected version: {conn.extension_version or 'legacy'}, required: 1.3.10+)",
+                    f"(connected version: {conn.extension_version or 'legacy'}, required: 1.3.11+)",
                     code="extension_reload_required",
                 )
 
