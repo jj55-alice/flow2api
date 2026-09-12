@@ -526,6 +526,24 @@ class Config:
             return 2
 
     @property
+    def extension_progress_stall_timeout_seconds(self) -> float:
+        """扩展未报告页面进度多久后判定当前 Flow 标签页卡死。"""
+        value = self._config.get("captcha", {}).get("extension_progress_stall_timeout_seconds", 30.0)
+        try:
+            return max(0.05, min(120.0, float(value)))
+        except Exception:
+            return 30.0
+
+    @property
+    def extension_stall_cooldown_seconds(self) -> int:
+        """卡死的扩展账号在重新参与图片调度前的冷却时间。"""
+        value = self._config.get("captcha", {}).get("extension_stall_cooldown_seconds", 120)
+        try:
+            return max(30, min(1800, int(value)))
+        except Exception:
+            return 120
+
+    @property
     def extension_global_min_interval_seconds(self) -> float:
         """所有扩展路由之间的最小发车间隔，用于平滑同一出口 IP 的突发。"""
         value = self._config.get("captcha", {}).get("extension_global_min_interval_seconds", 1.0)

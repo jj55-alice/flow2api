@@ -13,7 +13,7 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn("alarms", manifest["permissions"])
         self.assertGreaterEqual(
             tuple(int(part) for part in manifest["version"].split(".")),
-            (1, 3, 11),
+            (1, 3, 13),
         )
 
     def test_manifest_allows_current_flow_host(self):
@@ -120,6 +120,14 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn("__flow2apiUiContext", background)
         self.assertIn("delete body.__flow2apiUiContext", background)
         self.assertIn("flow_google_ui", background)
+
+    def test_current_flow_submit_reports_liveness_to_the_server(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        self.assertIn('type: "flow_submit_progress"', background)
+        self.assertIn("__FLOW2API_BROWSER_SUBMIT_PROGRESS__", background)
+        self.assertIn("FLOW_PROGRESS_POLL_INTERVAL_MS", background)
+        self.assertIn("FLOW_SUBMIT_HARD_TIMEOUT_PADDING_MS", background)
 
 
 if __name__ == "__main__":

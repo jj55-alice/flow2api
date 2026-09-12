@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch, AsyncMock, MagicMock
 
 from src.services.flow_client import FlowClient
+from src.services.browser_captcha_extension import ExtensionCaptchaError
 
 
 class _FakeProxyManager:
@@ -234,6 +235,39 @@ class ApiCaptchaFingerprintTests(unittest.IsolatedAsyncioTestCase):
                     project_id="project-1",
                     token_id=7,
                 )
+
+    async def test_extension_transport_failure_is_not_retried_on_same_profile(self):
+        service = _FakeExtensionService({})
+        service.submit_flow_request = AsyncMock(side_effect=ExtensionCaptchaError(
+            "Flow browser progress stalled",
+            code="extension_flow_stalled",
+        ))
+        flow = FlowClient(proxy_manager=None)
+
+        with patch("src.services.flow_client.config") as cfg, patch(
+            "src.services.browser_captcha_extension.ExtensionCaptchaService.get_instance",
+            new=AsyncMock(return_value=service),
+        ):
+            cfg.captcha_method = "extension"
+            cfg.flow_image_request_timeout = 30
+            cfg.flow_image_timeout_retry_count = 4
+            cfg.flow_image_timeout_retry_delay = 0
+            cfg.flow_image_timeout_use_media_proxy_fallback = False
+            cfg.flow_image_prefer_media_proxy = False
+            with self.assertRaises(ExtensionCaptchaError) as raised:
+                await flow._make_image_generation_request(
+                    url=(
+                        "https://aisandbox-pa.googleapis.com/v1/projects/project-1/"
+                        "flowMedia:batchGenerateImages"
+                    ),
+                    json_data={"clientContext": {"projectId": "project-1"}},
+                    at="access-token",
+                    project_id="project-1",
+                    token_id=7,
+                )
+
+        self.assertEqual(raised.exception.code, "extension_flow_stalled")
+        self.assertEqual(service.submit_flow_request.await_count, 1)
 
     async def test_extension_image_generation_skips_standalone_captcha_token(self):
         flow = FlowClient(proxy_manager=None)

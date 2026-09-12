@@ -1147,6 +1147,11 @@ class FlowClient:
         """图片生成请求使用更短超时，并在网络超时时快速重试。"""
         request_timeout = config.flow_image_request_timeout
         total_attempts = max(1, config.flow_image_timeout_retry_count + 1)
+        if config.captcha_method == "extension" and project_id:
+            # Extension transport failures are retried by the generation
+            # handler on a different account. Retrying here would hold the same
+            # broken Chrome profile for another full timeout window.
+            total_attempts = 1
         retry_delay = config.flow_image_timeout_retry_delay
 
         # 对于浏览器/远程浏览器打码链路，优先保持与打码时一致的出口。
@@ -1256,6 +1261,13 @@ class FlowClient:
                     http_attempt_info["timeout_error"] = bool(self._is_timeout_error(e))
                     http_attempt_info["error"] = str(e)[:240]
                     attempt_trace.setdefault("http_attempts", []).append(http_attempt_info)
+                if getattr(e, "code", "") in {
+                    "extension_disconnected",
+                    "extension_flow_stalled",
+                    "extension_flow_timeout",
+                    "extension_flow_transport_failed",
+                }:
+                    raise
                 if not self._is_timeout_error(e) or attempt_index >= total_attempts - 1:
                     raise
 
@@ -4239,6 +4251,13 @@ class FlowClient:
         """统一处理生成链路的重试判定与打码自愈通知。"""
         error_str = str(error)
         if self._is_generation_policy_error(error_str):
+            return False
+        if getattr(error, "code", "") in {
+            "extension_disconnected",
+            "extension_flow_stalled",
+            "extension_flow_timeout",
+            "extension_flow_transport_failed",
+        }:
             return False
 
         retry_reason = self._get_retry_reason(error_str)

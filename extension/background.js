@@ -18,6 +18,8 @@ const FLOW_REQUEST_AUTH_STORAGE_KEY = "flowRequestAuthObservation";
 const FLOW_ACCESS_TOKEN_MAX_AGE_MS = 2 * 60 * 1000;
 const FLOW_REQUEST_AUTH_MAX_AGE_MS = 5 * 60 * 1000;
 const FLOW_API_ROOT_URL = "https://aisandbox-pa.googleapis.com/v1";
+const FLOW_PROGRESS_POLL_INTERVAL_MS = 5000;
+const FLOW_SUBMIT_HARD_TIMEOUT_PADDING_MS = 30000;
 
 const DEFAULT_SETTINGS = {
     serverUrl: "ws://127.0.0.1:8000/captcha_ws",
@@ -773,8 +775,20 @@ async function handleGetSessionCookie(data, socket) {
     }
 }
 
+function sendFlowSubmitProgress(data, socket, phase) {
+    sendSocketMessage({
+        type: "flow_submit_progress",
+        req_id: data.req_id,
+        phase: String(phase || "active").slice(0, 64),
+    }, socket);
+}
+
 async function handleSubmitFlowRequest(data, socket) {
     let newTabId = null;
+    let progressMonitor = null;
+    let hardTimeoutHandle = null;
+    let progressPollRunning = false;
+    let lastProgressUpdatedAt = 0;
     try {
         const targetUrl = new URL(String(data.url || ""));
         if (
@@ -792,11 +806,13 @@ async function handleSubmitFlowRequest(data, socket) {
         const flowPageUrl = buildFlowPageUrl(projectId);
         const authCaptureStartedAt = Date.now();
         console.log("[Flow2API] Opening mapped Flow project for browser-side submit...");
+        sendFlowSubmitProgress(data, socket, "opening_tab");
         const newTab = await chrome.tabs.create({ url: flowPageUrl, active: false });
         newTabId = newTab.id;
 
         await waitForTabReady(newTabId);
         await sleep(1200);
+        sendFlowSubmitProgress(data, socket, "tab_ready");
 
         const pageAuthContext = await readFlowPageAuthContext(newTabId);
         let requestAuthorization = await getRecentFlowRequestAuthorization(authCaptureStartedAt);
@@ -819,7 +835,7 @@ async function handleSubmitFlowRequest(data, socket) {
             ignoredFlowAuthorizationTabIds.add(newTabId);
         }
         try {
-            results = await chrome.scripting.executeScript({
+            const executionPromise = chrome.scripting.executeScript({
                 target: { tabId: newTabId },
                 world: "MAIN",
                 func: async (
@@ -830,9 +846,18 @@ async function handleSubmitFlowRequest(data, socket) {
                 googleAuthUser,
                 googleApiKey,
                 requestBody,
-                timeoutMs
+                timeoutMs,
+                requestId
             ) => {
                 const websiteKey = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
+                const reportProgress = phase => {
+                    window.__FLOW2API_BROWSER_SUBMIT_PROGRESS__ = {
+                        request_id: requestId,
+                        phase: String(phase || "active").slice(0, 64),
+                        updated_at: Date.now(),
+                    };
+                };
+                reportProgress("script_started");
                 const browserFingerprint = () => {
                     const languages = Array.from(
                         new Set(
@@ -902,6 +927,7 @@ async function handleSubmitFlowRequest(data, socket) {
                 };
 
                 const submitImageThroughCurrentFlowUi = async (rawBody) => {
+                    reportProgress("ui_preparing");
                     const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
                     const isVisible = element => {
                         if (!(element instanceof Element)) return false;
@@ -1338,6 +1364,7 @@ async function handleSubmitFlowRequest(data, socket) {
                         8000,
                         "Flow prompt composer"
                     );
+                    reportProgress("composer_ready");
                     composer.focus();
                     let inserted = false;
                     if (typeof document.execCommand === "function") {
@@ -1372,6 +1399,7 @@ async function handleSubmitFlowRequest(data, socket) {
                         "enabled Flow image submit button"
                     );
                     clickElement(submitButton);
+                    reportProgress("submitted");
 
                     const uiTimeoutMs = Math.min(240000, Math.max(180000, timeoutMs));
                     const deadline = Date.now() + uiTimeoutMs;
@@ -1380,6 +1408,7 @@ async function handleSubmitFlowRequest(data, socket) {
                     let confirmationClicked = false;
                     while (Date.now() < deadline) {
                         await pause(700);
+                        reportProgress("generating");
                         if (!confirmationClicked) {
                             const confirmation = Array.from(document.querySelectorAll("button"))
                                 .find(button => {
@@ -1401,6 +1430,7 @@ async function handleSubmitFlowRequest(data, socket) {
                             stablePolls = ids === stableIds ? stablePolls + 1 : 1;
                             stableIds = ids;
                             if (stablePolls >= 3) {
+                                reportProgress("image_ready");
                                 return {
                                     http_status: 200,
                                     response_text: JSON.stringify({
@@ -1528,9 +1558,58 @@ async function handleSubmitFlowRequest(data, socket) {
                     googleApiKey,
                     data.body || {},
                     Math.max(5000, Number(data.timeout_ms || 60000)),
+                    String(data.req_id || ""),
                 ],
             });
+            if (usesCurrentFlowUi) {
+                const pollProgress = async () => {
+                    if (!newTabId || progressPollRunning) return;
+                    progressPollRunning = true;
+                    try {
+                        const snapshots = await chrome.scripting.executeScript({
+                            target: { tabId: newTabId },
+                            world: "MAIN",
+                            func: requestId => {
+                                const progress = window.__FLOW2API_BROWSER_SUBMIT_PROGRESS__;
+                                if (!progress || progress.request_id !== requestId) return null;
+                                return {
+                                    phase: String(progress.phase || "active").slice(0, 64),
+                                    updated_at: Number(progress.updated_at || 0),
+                                };
+                            },
+                            args: [String(data.req_id || "")],
+                        });
+                        const progress = snapshots && snapshots[0] && snapshots[0].result;
+                        const updatedAt = Number(progress && progress.updated_at || 0);
+                        if (updatedAt > lastProgressUpdatedAt) {
+                            lastProgressUpdatedAt = updatedAt;
+                            sendFlowSubmitProgress(data, socket, progress.phase);
+                        }
+                    } catch (error) {
+                        // A navigation or destroyed execution context intentionally
+                        // stops progress. The server-side stall watchdog decides
+                        // whether to fail over to another mapped account.
+                    } finally {
+                        progressPollRunning = false;
+                    }
+                };
+                progressMonitor = setInterval(pollProgress, FLOW_PROGRESS_POLL_INTERVAL_MS);
+                void pollProgress();
+            }
+            const hardTimeoutMs = Math.max(
+                45000,
+                Number(data.timeout_ms || 60000) + FLOW_SUBMIT_HARD_TIMEOUT_PADDING_MS
+            );
+            const hardTimeoutPromise = new Promise((_, reject) => {
+                hardTimeoutHandle = setTimeout(
+                    () => reject(new Error("Flow browser submit hard timeout")),
+                    hardTimeoutMs
+                );
+            });
+            results = await Promise.race([executionPromise, hardTimeoutPromise]);
         } finally {
+            if (progressMonitor) clearInterval(progressMonitor);
+            if (hardTimeoutHandle) clearTimeout(hardTimeoutHandle);
             if (!usesCurrentFlowUi) {
                 ignoredFlowAuthorizationTabIds.delete(newTabId);
             }

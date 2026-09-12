@@ -1400,7 +1400,11 @@ class GenerationHandler:
 
         debug_logger.log_info(f"[GENERATION] 已选择Token: {token.id} ({token.email})")
         token_attempt_started_at = time.time()
-        pending_token_state["active"] = True
+        pending_token_state.update({
+            "active": True,
+            "token": token,
+            "attempt_started_at": token_attempt_started_at,
+        })
         await self._update_request_log_progress(
             request_log_state,
             token_id=token.id,
@@ -1469,7 +1473,7 @@ class GenerationHandler:
             if generation_type == "image":
                 debug_logger.log_info(f"[GENERATION] 开始图片生成流程...")
                 async for chunk in self._handle_image_generation(
-                    token, project_id, model_config, prompt, images, stream,
+                    token, project_id, model_config, model, prompt, images, stream,
                     perf_trace=perf_trace,
                     generation_result=generation_result,
                     response_state=response_state,
@@ -1477,6 +1481,11 @@ class GenerationHandler:
                     pending_token_state=pending_token_state
                 ):
                     yield chunk
+                token = pending_token_state.get("token") or token
+                token_attempt_started_at = (
+                    pending_token_state.get("attempt_started_at")
+                    or token_attempt_started_at
+                )
             else:  # video
                 debug_logger.log_info(f"[GENERATION] 开始视频生成流程...")
                 async for chunk in self._handle_video_generation(
@@ -1533,6 +1542,8 @@ class GenerationHandler:
                 token.id,
                 attempt_started_at=token_attempt_started_at,
             )
+            if generation_type == "image":
+                await self.load_balancer.record_extension_transport_success(token.id)
 
             debug_logger.log_info(f"[GENERATION] ✅ 生成成功完成")
 
@@ -1605,6 +1616,11 @@ class GenerationHandler:
             )
             raise
         except Exception as e:
+            token = pending_token_state.get("token") or token
+            token_attempt_started_at = (
+                pending_token_state.get("attempt_started_at")
+                or token_attempt_started_at
+            )
             error_msg = f"生成失败: {str(e)}"
             error_status, error_code = self._classify_generation_error(e)
             debug_logger.log_error(f"[GENERATION] 生成失败: {error_msg}")
@@ -1641,9 +1657,10 @@ class GenerationHandler:
                 error_code=error_code,
             )
         finally:
-            if pending_token_state.get("active") and token and self.load_balancer:
+            pending_token = pending_token_state.get("token") or token
+            if pending_token_state.get("active") and pending_token and self.load_balancer:
                 await self.load_balancer.release_pending(
-                    token.id,
+                    pending_token.id,
                     for_image_generation=(generation_type == "image"),
                     for_video_generation=(generation_type == "video"),
                 )
@@ -1748,6 +1765,7 @@ class GenerationHandler:
         token,
         project_id: str,
         model_config: dict,
+        api_model: str,
         prompt: str,
         images: Optional[List[bytes]],
         stream: bool,
@@ -1755,7 +1773,7 @@ class GenerationHandler:
         generation_result: Optional[Dict[str, Any]] = None,
         response_state: Optional[Dict[str, Any]] = None,
         request_log_state: Optional[Dict[str, Any]] = None,
-        pending_token_state: Optional[Dict[str, bool]] = None
+        pending_token_state: Optional[Dict[str, Any]] = None
     ) -> AsyncGenerator:
         """处理图片生成 (同步返回)"""
 
@@ -1779,66 +1797,151 @@ class GenerationHandler:
             await self._update_request_log_progress(request_log_state, token_id=token.id, status_text="submitting_image", progress=28)
 
         try:
-            # 上传图片 (如果有)
-            upload_started_at = time.time()
-            image_inputs = []
-            if images and len(images) > 0:
-                if stream:
-                    yield self._create_stream_chunk(f"上传 {len(images)} 张参考图片...\n")
+            attempted_token_ids: set[int] = set()
+            failover_count = 0
+            max_route_attempts = max(
+                1,
+                int(config.extension_transport_generation_retries or 1),
+            )
+            while True:
+                attempted_token_ids.add(token.id)
+                route_attempt_started_at = time.time()
+                try:
+                    # 上传图片 (如果有). A failover uses the new account's
+                    # project, so reference inputs must be uploaded again.
+                    upload_started_at = time.time()
+                    image_inputs = []
+                    if images and len(images) > 0:
+                        if stream:
+                            yield self._create_stream_chunk(f"上传 {len(images)} 张参考图片...\n")
 
-                # 支持多图输入
-                for idx, image_bytes in enumerate(images):
-                    media_id = await self.flow_client.upload_image(
-                        token.at,
-                        image_bytes,
-                        model_config["aspect_ratio"],
+                        for idx, image_bytes in enumerate(images):
+                            media_id = await self.flow_client.upload_image(
+                                token.at,
+                                image_bytes,
+                                model_config["aspect_ratio"],
+                                project_id=project_id,
+                                token_id=token.id,
+                            )
+                            image_inputs.append({
+                                "name": media_id,
+                                "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE"
+                            })
+                            if stream:
+                                yield self._create_stream_chunk(f"已上传第 {idx + 1}/{len(images)} 张图片\n")
+                    if image_trace is not None:
+                        image_trace["upload_images_ms"] = (
+                            int(image_trace.get("upload_images_ms") or 0)
+                            + int((time.time() - upload_started_at) * 1000)
+                        )
+
+                    if stream:
+                        if images and len(images) > 0:
+                            yield self._create_stream_chunk("参考图片上传完成，正在进行打码验证...\n")
+                        else:
+                            yield self._create_stream_chunk("正在进行打码验证并提交图片生成请求...\n")
+
+                    async def _image_progress_callback(status_text: str, progress: int):
+                        await self._update_request_log_progress(
+                            request_log_state,
+                            token_id=token.id,
+                            status_text=status_text,
+                            progress=progress,
+                        )
+
+                    generate_started_at = time.time()
+                    result, generation_session_id, upstream_trace = await self.flow_client.generate_image(
+                        at=token.at,
                         project_id=project_id,
+                        prompt=prompt,
+                        model_name=model_config["model_name"],
+                        aspect_ratio=model_config["aspect_ratio"],
+                        image_inputs=image_inputs,
+                        token_id=token.id,
+                        token_image_concurrency=token.image_concurrency,
+                        progress_callback=_image_progress_callback,
+                    )
+                    if image_trace is not None:
+                        image_trace["generate_api_ms"] = (
+                            int(image_trace.get("generate_api_ms") or 0)
+                            + int((time.time() - generate_started_at) * 1000)
+                        )
+                        image_trace["upstream_trace"] = upstream_trace
+                        attempts = upstream_trace.get("generation_attempts") if isinstance(upstream_trace, dict) else None
+                        if isinstance(attempts, list) and attempts:
+                            first_attempt = attempts[0] if isinstance(attempts[0], dict) else {}
+                            image_trace["launch_queue_wait_ms"] = int(first_attempt.get("launch_queue_ms") or 0)
+                            image_trace["launch_stagger_wait_ms"] = int(first_attempt.get("launch_stagger_ms") or 0)
+                    break
+                except Exception as generation_error:
+                    error_code = str(getattr(generation_error, "code", "") or "")
+                    can_fail_over = (
+                        config.captcha_method == "extension"
+                        and error_code in {
+                            "extension_disconnected",
+                            "extension_flow_stalled",
+                            "extension_flow_transport_failed",
+                        }
+                        and failover_count < max_route_attempts - 1
+                    )
+                    if not can_fail_over:
+                        raise
+
+                    await self.load_balancer.record_extension_transport_failure(token.id)
+                    if image_trace is not None:
+                        image_trace.setdefault("failovers", []).append({
+                            "from_token_id": token.id,
+                            "reason": error_code,
+                            "failed_after_ms": int((time.time() - route_attempt_started_at) * 1000),
+                        })
+
+                    if pending_token_state and pending_token_state.get("active"):
+                        await self.load_balancer.release_pending(
+                            token.id,
+                            for_image_generation=True,
+                        )
+                        pending_token_state["active"] = False
+
+                    next_token = await self.load_balancer.select_token(
+                        for_image_generation=True,
+                        model=api_model,
+                        reserve=False,
+                        enforce_concurrency_filter=False,
+                        track_pending=True,
+                        exclude_token_ids=set(attempted_token_ids),
+                    )
+                    if next_token is None:
+                        raise
+
+                    failover_count += 1
+                    token = next_token
+                    token_attempt_started_at = time.time()
+                    if pending_token_state is not None:
+                        pending_token_state.update({
+                            "active": True,
+                            "token": token,
+                            "attempt_started_at": token_attempt_started_at,
+                        })
+                    project_id = await self.token_manager.ensure_project_exists(token.id)
+                    normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
+                    if hasattr(self.flow_client, "clear_request_fingerprint"):
+                        self.flow_client.clear_request_fingerprint()
+                    await self._update_request_log_progress(
+                        request_log_state,
+                        token_id=token.id,
+                        status_text="switching_image_account",
+                        progress=32,
+                        response_extra={"failover_count": failover_count},
+                    )
+                    await self.flow_client.prefill_remote_browser_pool(
+                        project_id=project_id,
+                        action="IMAGE_GENERATION",
                         token_id=token.id,
                     )
-                    image_inputs.append({
-                        "name": media_id,
-                        "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE"
-                    })
                     if stream:
-                        yield self._create_stream_chunk(f"已上传第 {idx + 1}/{len(images)} 张图片\n")
-            if image_trace is not None:
-                image_trace["upload_images_ms"] = int((time.time() - upload_started_at) * 1000)
-
-            # 调用生成API
-            if stream:
-                if images and len(images) > 0:
-                    yield self._create_stream_chunk("参考图片上传完成，正在进行打码验证...\n")
-                else:
-                    yield self._create_stream_chunk("正在进行打码验证并提交图片生成请求...\n")
-
-            async def _image_progress_callback(status_text: str, progress: int):
-                await self._update_request_log_progress(
-                    request_log_state,
-                    token_id=token.id,
-                    status_text=status_text,
-                    progress=progress,
-                )
-
-            generate_started_at = time.time()
-            result, generation_session_id, upstream_trace = await self.flow_client.generate_image(
-                at=token.at,
-                project_id=project_id,
-                prompt=prompt,
-                model_name=model_config["model_name"],
-                aspect_ratio=model_config["aspect_ratio"],
-                image_inputs=image_inputs,
-                token_id=token.id,
-                token_image_concurrency=token.image_concurrency,
-                progress_callback=_image_progress_callback,
-            )
-            if image_trace is not None:
-                image_trace["generate_api_ms"] = int((time.time() - generate_started_at) * 1000)
-                image_trace["upstream_trace"] = upstream_trace
-                attempts = upstream_trace.get("generation_attempts") if isinstance(upstream_trace, dict) else None
-                if isinstance(attempts, list) and attempts:
-                    first_attempt = attempts[0] if isinstance(attempts[0], dict) else {}
-                    image_trace["launch_queue_wait_ms"] = int(first_attempt.get("launch_queue_ms") or 0)
-                    image_trace["launch_stagger_wait_ms"] = int(first_attempt.get("launch_stagger_ms") or 0)
+                        yield self._create_stream_chunk(
+                            "⚠️ 브라우저 응답이 멈춰 다른 계정으로 전환합니다...\n"
+                        )
             await self._update_request_log_progress(
                 request_log_state,
                 token_id=token.id,
@@ -2070,7 +2173,7 @@ class GenerationHandler:
         generation_result: Optional[Dict[str, Any]] = None,
         response_state: Optional[Dict[str, Any]] = None,
         request_log_state: Optional[Dict[str, Any]] = None,
-        pending_token_state: Optional[Dict[str, bool]] = None,
+        pending_token_state: Optional[Dict[str, Any]] = None,
         video_media_id: Optional[str] = None,
     ) -> AsyncGenerator:
         """处理视频生成 (异步轮询)"""

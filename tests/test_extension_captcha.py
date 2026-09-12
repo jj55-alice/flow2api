@@ -94,16 +94,21 @@ class ExtensionCaptchaServiceTests(unittest.IsolatedAsyncioTestCase):
         websocket = _FakeWebSocket(service, {
             "status": "success",
             "token": "captcha-token",
-            "user_agent": "Mozilla/5.0 Chrome/147.0.0.0",
-            "accept_language": "ko-KR,ko,en-US,en",
+            "fingerprint": {
+                "user_agent": "Mozilla/5.0 Chrome/147.0.0.0",
+                "accept_language": "ko-KR,ko,en-US,en",
+            },
         })
         service.active_connections.append(ExtensionConnection(websocket, route_key="9223"))
 
         solution = await service.get_token_bundle("project", token_id=1)
 
         self.assertEqual(solution["token"], "captcha-token")
-        self.assertIn("Chrome/147", solution["user_agent"])
-        self.assertEqual(solution["accept_language"], "ko-KR,ko,en-US,en")
+        self.assertIn("Chrome/147", solution["fingerprint"]["user_agent"])
+        self.assertEqual(
+            solution["fingerprint"]["accept_language"],
+            "ko-KR,ko,en-US,en",
+        )
 
 
 class CaptchaErrorResponseTests(unittest.TestCase):
@@ -153,8 +158,10 @@ class ExtensionFingerprintTests(unittest.IsolatedAsyncioTestCase):
         websocket = _FakeWebSocket(service, {
             "status": "success",
             "token": "captcha-token",
-            "user_agent": "Mozilla/5.0 Chrome/147.0.0.0",
-            "accept_language": "ko-KR,ko,en-US,en",
+            "fingerprint": {
+                "user_agent": "Mozilla/5.0 Chrome/147.0.0.0",
+                "accept_language": "ko-KR,ko,en-US,en",
+            },
         })
         service.active_connections.append(ExtensionConnection(websocket, route_key="9223"))
         ExtensionCaptchaService._instance = service
@@ -173,7 +180,7 @@ class ExtensionFingerprintTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fingerprint["accept_language"], "ko-KR,ko,en-US,en")
         self.assertIn("project-1", fingerprint["referer"])
 
-    async def test_old_extension_without_fingerprint_is_rejected(self):
+    async def test_old_extension_without_fingerprint_is_discarded(self):
         database = _FakeDB("9223")
         service = ExtensionCaptchaService(db=database)
         websocket = _FakeWebSocket(service, {
@@ -186,12 +193,14 @@ class ExtensionFingerprintTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("src.services.flow_client.config") as runtime_config:
             runtime_config.captcha_method = "extension"
-            with self.assertRaises(ExtensionCaptchaError) as raised:
-                await flow._get_recaptcha_token(
-                    "project-1", action="IMAGE_GENERATION", token_id=1
-                )
+            runtime_config.extension_fallback_user_agent = ""
+            token, browser_id = await flow._get_recaptcha_token(
+                "project-1", action="IMAGE_GENERATION", token_id=1
+            )
 
-        self.assertEqual(raised.exception.code, "extension_fingerprint_missing")
+        self.assertIsNone(token)
+        self.assertIsNone(browser_id)
+        self.assertIsNone(flow.get_request_fingerprint())
 
 
 class CaptchaAdminUiTests(unittest.TestCase):

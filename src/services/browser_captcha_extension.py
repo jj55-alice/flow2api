@@ -42,6 +42,7 @@ class ExtensionCaptchaService:
         self.db = db
         self.active_connections: list[ExtensionConnection] = []
         self.pending_requests: dict[str, tuple[asyncio.Future, WebSocket]] = {}
+        self._pending_flow_activity: dict[str, tuple[float, str]] = {}
         # A Chrome profile represents one Google account. Serialize requests
         # per route and space them out so a burst cannot open many hidden Flow
         # tabs for the same account at once.
@@ -120,8 +121,12 @@ class ExtensionCaptchaService:
                 for req_id, (future, owner_websocket) in list(self.pending_requests.items()):
                     if owner_websocket is websocket:
                         self.pending_requests.pop(req_id, None)
+                        self._pending_flow_activity.pop(req_id, None)
                         if not future.done():
-                            future.set_exception(RuntimeError("Chrome Extension disconnected"))
+                            future.set_exception(ExtensionCaptchaError(
+                                "Chrome Extension disconnected during Flow submit",
+                                code="extension_disconnected",
+                            ))
                 return
 
     def _find_connection(self, websocket: WebSocket) -> Optional[ExtensionConnection]:
@@ -306,6 +311,16 @@ class ExtensionCaptchaService:
             return False
         return (version_parts + (0, 0, 0))[:3] >= (1, 3, 11)
 
+    @staticmethod
+    def _supports_flow_progress(extension_version: str) -> bool:
+        try:
+            version_parts = tuple(
+                int(part) for part in str(extension_version or "").split(".")[:3]
+            )
+        except (TypeError, ValueError):
+            return False
+        return (version_parts + (0, 0, 0))[:3] >= (1, 3, 13)
+
     @classmethod
     def _browser_auth_was_accepted(
         cls,
@@ -335,6 +350,7 @@ class ExtensionCaptchaService:
             {
                 "route_key": conn.route_key,
                 "client_label": conn.client_label,
+                "extension_version": conn.extension_version,
                 "connected_at": conn.connected_at,
             }
             for conn in self.active_connections
@@ -437,6 +453,20 @@ class ExtensionCaptchaService:
                 return
 
             req_id = payload.get("req_id")
+            if message_type == "flow_submit_progress" and req_id:
+                pending = self.pending_requests.get(req_id)
+                if pending is None:
+                    return
+                _future, owner_websocket = pending
+                if websocket is not owner_websocket:
+                    debug_logger.log_warning(
+                        f"[Extension Captcha] Ignoring progress from non-owner connection: {req_id}"
+                    )
+                    return
+                phase = str(payload.get("phase") or "active").strip()[:64] or "active"
+                self._pending_flow_activity[req_id] = (time.monotonic(), phase)
+                return
+
             if req_id and req_id in self.pending_requests:
                 future, owner_websocket = self.pending_requests[req_id]
                 if websocket is not owner_websocket:
@@ -669,6 +699,55 @@ class ExtensionCaptchaService:
         credentials = await self.get_browser_credentials(token_id, timeout=timeout)
         return str(credentials.get("session_token") or "").strip() or None
 
+    async def _wait_for_flow_submit_result(
+        self,
+        *,
+        future: asyncio.Future,
+        req_id: str,
+        timeout: int,
+        supports_progress: bool,
+    ) -> Dict[str, Any]:
+        """Wait for a browser result while distinguishing slow work from a dead tab."""
+        hard_timeout = max(60.0, float(timeout) + 45.0)
+        if not supports_progress:
+            return await asyncio.wait_for(future, timeout=hard_timeout)
+
+        started_at = time.monotonic()
+        hard_deadline = started_at + hard_timeout
+        stall_timeout = config.extension_progress_stall_timeout_seconds
+        # Preserve an early heartbeat that may arrive while send_text() is
+        # still yielding control back to the event loop.
+        self._pending_flow_activity.setdefault(req_id, (started_at, "dispatched"))
+
+        while True:
+            now = time.monotonic()
+            last_activity_at, last_phase = self._pending_flow_activity.get(
+                req_id,
+                (started_at, "dispatched"),
+            )
+            hard_remaining = hard_deadline - now
+            stall_remaining = stall_timeout - (now - last_activity_at)
+            if hard_remaining <= 0:
+                raise ExtensionCaptchaError(
+                    f"Chrome extension Flow submit exceeded the {hard_timeout:.0f}s hard limit",
+                    code="extension_flow_timeout",
+                )
+            if stall_remaining <= 0:
+                raise ExtensionCaptchaError(
+                    f"Chrome extension Flow progress stalled for {stall_timeout:.1f}s "
+                    f"during phase '{last_phase}'",
+                    code="extension_flow_stalled",
+                )
+
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(future),
+                    timeout=min(hard_remaining, stall_remaining),
+                )
+            except asyncio.TimeoutError:
+                if future.done():
+                    return future.result()
+
     async def submit_flow_request(
         self,
         *,
@@ -760,6 +839,10 @@ class ExtensionCaptchaService:
                     code="extension_reload_required",
                 )
 
+            supports_progress = (
+                str(action or "").strip().upper() == "IMAGE_GENERATION"
+                and self._supports_flow_progress(conn.extension_version)
+            )
             req_id = f"req_{uuid.uuid4().hex}"
             future = asyncio.get_running_loop().create_future()
             self.pending_requests[req_id] = (future, conn.websocket)
@@ -791,13 +874,26 @@ class ExtensionCaptchaService:
                 )
                 self._route_last_dispatch_at[route_guard_key] = time.monotonic()
                 await conn.websocket.send_text(json.dumps(request_data))
-                result = await asyncio.wait_for(
-                    future,
-                    timeout=max(60, int(timeout) + 45),
+                result = await self._wait_for_flow_submit_result(
+                    future=future,
+                    req_id=req_id,
+                    timeout=timeout,
+                    supports_progress=supports_progress,
                 )
 
                 if result.get("status") != "success":
                     error_message = str(result.get("error") or "Chrome extension Flow submit failed")
+                    error_lower = error_message.lower()
+                    if "returned no http response" in error_lower:
+                        raise ExtensionCaptchaError(
+                            error_message,
+                            code="extension_flow_transport_failed",
+                        )
+                    if "hard timeout" in error_lower:
+                        raise ExtensionCaptchaError(
+                            error_message,
+                            code="extension_flow_timeout",
+                        )
                     raise RuntimeError(error_message)
 
                 fingerprint = self._normalize_fingerprint(result.get("fingerprint"))
@@ -820,9 +916,15 @@ class ExtensionCaptchaService:
                     "fingerprint": fingerprint,
                 }
             except asyncio.TimeoutError as exc:
-                raise RuntimeError("Chrome extension Flow submit timed out") from exc
+                raise ExtensionCaptchaError(
+                    "Chrome extension Flow submit timed out",
+                    code="extension_flow_timeout",
+                ) from exc
             finally:
                 self.pending_requests.pop(req_id, None)
+                self._pending_flow_activity.pop(req_id, None)
+                if not future.done():
+                    future.cancel()
 
     async def _dispatch_token_request(
         self,
