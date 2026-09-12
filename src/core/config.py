@@ -508,6 +508,24 @@ class Config:
             return 3.0
 
     @property
+    def extension_route_queue_timeout_seconds(self) -> float:
+        """扩展路由繁忙时允许单个请求排队的最长时间。"""
+        value = self._config.get("captcha", {}).get("extension_route_queue_timeout_seconds", 30.0)
+        try:
+            return max(0.01, min(300.0, float(value)))
+        except Exception:
+            return 30.0
+
+    @property
+    def extension_transport_generation_retries(self) -> int:
+        """扩展浏览器传输异常时单次生成允许的总尝试次数。"""
+        value = self._config.get("captcha", {}).get("extension_transport_generation_retries", 2)
+        try:
+            return max(1, min(3, int(value)))
+        except Exception:
+            return 2
+
+    @property
     def extension_global_min_interval_seconds(self) -> float:
         """所有扩展路由之间的最小发车间隔，用于平滑同一出口 IP 的突发。"""
         value = self._config.get("captcha", {}).get("extension_global_min_interval_seconds", 1.0)

@@ -4,7 +4,7 @@ let connectionGeneration = 0;
 let reconnectTimeout = null;
 let heartbeatInterval = null;
 let routeEnabled = true;
-let ignoreFlowAuthorizationCaptureUntil = 0;
+const ignoredFlowAuthorizationTabIds = new Set();
 
 const RECONNECT_ALARM_NAME = "flow2api-reconnect";
 const RECONNECT_ALARM_PERIOD_MINUTES = 0.5;
@@ -484,7 +484,11 @@ async function connectWS() {
             }, 20000);
         };
 
-        let requestQueue = Promise.resolve();
+        // Generation can occupy a Flow tab for several minutes. Credential
+        // refresh uses a separate temporary tab and must not wait behind that
+        // work, otherwise an expiring session can disconnect while queued.
+        let generationRequestQueue = Promise.resolve();
+        let credentialRequestQueue = Promise.resolve();
 
         socket.onmessage = async (event) => {
             if (ws !== socket) return;
@@ -515,19 +519,19 @@ async function connectWS() {
             }
 
             if (data.type === "get_token") {
-                requestQueue = requestQueue.then(() => handleGetToken(data, socket)).catch(err => {
+                generationRequestQueue = generationRequestQueue.then(() => handleGetToken(data, socket)).catch(err => {
                     console.error("[Flow2API] Queue Error:", err);
                 });
             }
 
             if (data.type === "get_session_cookie") {
-                requestQueue = requestQueue.then(() => handleGetSessionCookie(data, socket)).catch(err => {
+                credentialRequestQueue = credentialRequestQueue.then(() => handleGetSessionCookie(data, socket)).catch(err => {
                     console.error("[Flow2API] Session cookie queue error:", err);
                 });
             }
 
             if (data.type === "submit_flow_request") {
-                requestQueue = requestQueue.then(() => handleSubmitFlowRequest(data, socket)).catch(err => {
+                generationRequestQueue = generationRequestQueue.then(() => handleSubmitFlowRequest(data, socket)).catch(err => {
                     console.error("[Flow2API] Flow submit queue error:", err);
                 });
             }
@@ -671,9 +675,6 @@ async function handleGetSessionCookie(data, socket) {
         const authCaptureStartedAt = Date.now();
         let pageAuthContext = { auth_user: "0", api_key: "" };
         if (projectId) {
-            // Discard any authorization replayed by an earlier extension
-            // probe. Only trust a header observed from this fresh Flow page.
-            await writeSessionStorage({ [FLOW_REQUEST_AUTH_STORAGE_KEY]: null });
             const newTab = await chrome.tabs.create({
                 url: buildFlowPageUrl(projectId),
                 active: false,
@@ -686,7 +687,7 @@ async function handleGetSessionCookie(data, socket) {
         let requestAuthorization = projectId
             ? await waitForRecentFlowRequestAuthorization(authCaptureStartedAt, 3000)
             : null;
-        if (!requestAuthorization) {
+        if (!requestAuthorization && !projectId) {
             requestAuthorization = await getRecentFlowRequestAuthorization();
         }
         const observedBearer = accessTokenFromAuthorization(
@@ -706,7 +707,7 @@ async function handleGetSessionCookie(data, socket) {
             : "";
         const browserAuth = !capturedAuth && newTabId
             ? await (async () => {
-                ignoreFlowAuthorizationCaptureUntil = Date.now() + 15000;
+                ignoredFlowAuthorizationTabIds.add(newTabId);
                 try {
                     return await probeBrowserFlowAuthentication(
                         newTabId,
@@ -717,7 +718,7 @@ async function handleGetSessionCookie(data, socket) {
                             || pageAuthContext.api_key
                     );
                 } finally {
-                    ignoreFlowAuthorizationCaptureUntil = Date.now() + 500;
+                    ignoredFlowAuthorizationTabIds.delete(newTabId);
                 }
             })()
             : null;
@@ -810,10 +811,13 @@ async function handleSubmitFlowRequest(data, socket) {
             || pageAuthContext.api_key;
 
         let results;
-        ignoreFlowAuthorizationCaptureUntil = Date.now() + Math.max(
-            45000,
-            Number(data.timeout_ms || 60000) + 30000
+        const usesCurrentFlowUi = (
+            String(data.action || "").trim().toUpperCase() === "IMAGE_GENERATION"
+            && /\/flowMedia:batchGenerateImages$/.test(targetUrl.pathname)
         );
+        if (!usesCurrentFlowUi) {
+            ignoredFlowAuthorizationTabIds.add(newTabId);
+        }
         try {
             results = await chrome.scripting.executeScript({
                 target: { tabId: newTabId },
@@ -1527,7 +1531,9 @@ async function handleSubmitFlowRequest(data, socket) {
                 ],
             });
         } finally {
-            ignoreFlowAuthorizationCaptureUntil = Date.now() + 500;
+            if (!usesCurrentFlowUi) {
+                ignoredFlowAuthorizationTabIds.delete(newTabId);
+            }
         }
 
         const executionResult = results && results[0];
@@ -1746,7 +1752,7 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 
 chrome.webRequest.onBeforeSendHeaders.addListener(
     (details) => {
-        if (Date.now() < ignoreFlowAuthorizationCaptureUntil) return;
+        if (ignoredFlowAuthorizationTabIds.has(details.tabId)) return;
         const authorization = (details.requestHeaders || []).find(
             (header) => String(header && header.name || "").toLowerCase() === "authorization"
         );

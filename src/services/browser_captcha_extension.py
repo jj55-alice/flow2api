@@ -3,8 +3,9 @@ import json
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, Iterable, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Iterable, Optional
 from urllib.parse import urlparse
 
 from fastapi import WebSocket
@@ -45,11 +46,38 @@ class ExtensionCaptchaService:
         # per route and space them out so a burst cannot open many hidden Flow
         # tabs for the same account at once.
         self._route_locks: dict[str, asyncio.Lock] = {}
+        # Credential refresh opens its own Flow tab in the extension. Keep it
+        # independent from long-running image submits so expiring sessions do
+        # not wait behind generation work for the same account.
+        self._credential_route_locks: dict[str, asyncio.Lock] = {}
         self._route_last_dispatch_at: dict[str, float] = {}
         self._global_dispatch_lock = asyncio.Lock()
         self._global_last_dispatch_at = 0.0
         self._disabled_route_keys: set[str] = set()
         self._route_connected_callback: Optional[Callable[[str], Awaitable[None]]] = None
+
+    @asynccontextmanager
+    async def _bounded_route_guard(
+        self,
+        locks: dict[str, asyncio.Lock],
+        route_guard_key: str,
+        operation: str,
+    ) -> AsyncIterator[None]:
+        """Acquire a per-route queue slot without allowing unbounded backlog."""
+        route_lock = locks.setdefault(route_guard_key, asyncio.Lock())
+        queue_timeout = config.extension_route_queue_timeout_seconds
+        try:
+            await asyncio.wait_for(route_lock.acquire(), timeout=queue_timeout)
+        except asyncio.TimeoutError as exc:
+            raise ExtensionCaptchaError(
+                f"Chrome extension route '{route_guard_key}' remained busy for "
+                f"{queue_timeout:.1f}s while waiting to {operation}. Retry on another route.",
+                code="extension_route_busy",
+            ) from exc
+        try:
+            yield
+        finally:
+            route_lock.release()
 
     @classmethod
     async def get_instance(cls, db=None) -> "ExtensionCaptchaService":
@@ -460,9 +488,11 @@ class ExtensionCaptchaService:
                 code="extension_route_mismatch",
             )
         route_guard_key = route_key or "(empty)"
-        route_lock = self._route_locks.setdefault(route_guard_key, asyncio.Lock())
-
-        async with route_lock:
+        async with self._bounded_route_guard(
+            self._route_locks,
+            route_guard_key,
+            "request a reCAPTCHA token",
+        ):
             min_interval = config.extension_route_min_interval_seconds
             last_dispatch_at = self._route_last_dispatch_at.get(route_guard_key, 0.0)
             wait_seconds = max(0.0, min_interval - (time.monotonic() - last_dispatch_at))
@@ -528,8 +558,11 @@ class ExtensionCaptchaService:
                 )
 
         route_guard_key = route_key or "(empty)"
-        route_lock = self._route_locks.setdefault(route_guard_key, asyncio.Lock())
-        async with route_lock:
+        async with self._bounded_route_guard(
+            self._credential_route_locks,
+            route_guard_key,
+            "refresh browser credentials",
+        ):
             conn = self._select_connection(route_key)
             if conn is None:
                 raise RuntimeError(f"Chrome Extension disconnected for route_key='{route_key}'")
@@ -694,8 +727,11 @@ class ExtensionCaptchaService:
             )
 
         route_guard_key = route_key or "(empty)"
-        route_lock = self._route_locks.setdefault(route_guard_key, asyncio.Lock())
-        async with route_lock:
+        async with self._bounded_route_guard(
+            self._route_locks,
+            route_guard_key,
+            "submit a Flow request",
+        ):
             min_interval = config.extension_route_min_interval_seconds
             last_dispatch_at = self._route_last_dispatch_at.get(route_guard_key, 0.0)
             wait_seconds = max(0.0, min_interval - (time.monotonic() - last_dispatch_at))

@@ -60,8 +60,9 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn("flow_request_authorization", capture_script)
         self.assertIn("flow_request_authorization", bridge_script)
         self.assertIn("rememberFlowRequestAuthorization", background)
-        self.assertIn("ignoreFlowAuthorizationCaptureUntil", background)
-        self.assertIn("[FLOW_REQUEST_AUTH_STORAGE_KEY]: null", background)
+        self.assertIn("ignoredFlowAuthorizationTabIds", background)
+        self.assertNotIn("ignoreFlowAuthorizationCaptureUntil", background)
+        self.assertNotIn("[FLOW_REQUEST_AUTH_STORAGE_KEY]: null", background)
         self.assertIn('headers["x-goog-api-key"]', background)
         self.assertIn("readFlowPageAuthContext", background)
         self.assertIn("globals.K21R3e", background)
@@ -84,6 +85,20 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn("handleGetSessionCookie(data, socket)", background)
         self.assertIn("sendSocketMessage(payload, socket = ws)", background)
         self.assertIn("connectWS();", background)
+
+    def test_session_refresh_is_not_blocked_by_generation_queue(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        self.assertIn("let generationRequestQueue = Promise.resolve()", background)
+        self.assertIn("let credentialRequestQueue = Promise.resolve()", background)
+        self.assertIn(
+            "credentialRequestQueue = credentialRequestQueue.then(() => handleGetSessionCookie(data, socket))",
+            background,
+        )
+        self.assertIn(
+            "generationRequestQueue = generationRequestQueue.then(() => handleSubmitFlowRequest(data, socket))",
+            background,
+        )
 
     def test_current_flow_image_generation_uses_ui_transport(self):
         background = (REPO_ROOT / "extension" / "background.js").read_text()

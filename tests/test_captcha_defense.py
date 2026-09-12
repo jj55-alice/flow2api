@@ -294,6 +294,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
         self.captcha_config = config._config.setdefault("captcha", {})
         self.original = dict(self.captcha_config)
         self.captcha_config["extension_route_min_interval_seconds"] = 0.05
+        self.captcha_config["extension_route_queue_timeout_seconds"] = 0.02
         self.captcha_config["extension_global_min_interval_seconds"] = 0.0
         self.captcha_config["captcha_method"] = "extension"
 
@@ -334,6 +335,59 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
         session_token = await service.get_session_token(token_id=1)
 
         self.assertEqual(session_token, "labs-session-token")
+
+    async def test_session_refresh_does_not_wait_for_image_route(self):
+        service = ExtensionCaptchaService(db=_RouteDbStub())
+        websocket = _ImmediateExtensionSocket(service)
+        service.active_connections.append(
+            ExtensionConnection(
+                websocket=websocket,
+                route_key="google-1",
+                extension_version="1.3.12",
+            )
+        )
+        generation_lock = service._route_locks.setdefault("google-1", asyncio.Lock())
+        await generation_lock.acquire()
+        try:
+            credentials = await asyncio.wait_for(
+                service.get_browser_credentials(token_id=1, project_id="project-a"),
+                timeout=0.1,
+            )
+        finally:
+            generation_lock.release()
+
+        self.assertTrue(credentials["access_token"].startswith("opaque-flow-token_"))
+
+    async def test_busy_image_route_fails_after_bounded_queue_wait(self):
+        service = ExtensionCaptchaService(db=_RouteDbStub())
+        websocket = _ImmediateExtensionSocket(service)
+        service.active_connections.append(
+            ExtensionConnection(
+                websocket=websocket,
+                route_key="google-1",
+                extension_version="1.3.12",
+            )
+        )
+        generation_lock = service._route_locks.setdefault("google-1", asyncio.Lock())
+        await generation_lock.acquire()
+        try:
+            with self.assertRaises(ExtensionCaptchaError) as raised:
+                await service.submit_flow_request(
+                    project_id="project-a",
+                    action="IMAGE_GENERATION",
+                    token_id=1,
+                    url=(
+                        "https://aisandbox-pa.googleapis.com/v1/projects/project-a/"
+                        "flowMedia:batchGenerateImages"
+                    ),
+                    at_token="access-token",
+                    json_data={},
+                    timeout=15,
+                )
+        finally:
+            generation_lock.release()
+
+        self.assertEqual(raised.exception.code, "extension_route_busy")
 
     async def test_current_flow_access_token_can_be_read_for_mapped_profile(self):
         service = ExtensionCaptchaService(db=_RouteDbStub())
@@ -624,6 +678,7 @@ class RecaptchaRetryBudgetTests(unittest.TestCase):
         self.captcha_config = config._config.setdefault("captcha", {})
         self.original = dict(self.captcha_config)
         self.captcha_config["browser_captcha_generation_retries"] = 1
+        self.captcha_config["extension_transport_generation_retries"] = 2
 
     def tearDown(self):
         self.captcha_config.clear()
@@ -634,6 +689,26 @@ class RecaptchaRetryBudgetTests(unittest.TestCase):
         resolved = client._resolve_generation_retry_budget(
             5,
             "PUBLIC_ERROR_UNUSUAL_ACTIVITY: reCAPTCHA evaluation failed",
+        )
+        self.assertEqual(resolved, 1)
+
+    def test_extension_transport_failure_gets_only_one_recovery_retry(self):
+        client = FlowClient(proxy_manager=None)
+
+        self.assertEqual(client._resolve_generation_retry_budget(
+            5,
+            "Flow browser submit returned no HTTP response",
+        ), 2)
+        self.assertEqual(client._resolve_generation_retry_budget(
+            5,
+            "Chrome extension Flow submit timed out",
+        ), 2)
+
+    def test_busy_extension_route_is_not_retried_on_same_account(self):
+        client = FlowClient(proxy_manager=None)
+        resolved = client._resolve_generation_retry_budget(
+            5,
+            "Chrome extension route 'google-1' remained busy for 30.0s",
         )
         self.assertEqual(resolved, 1)
 
