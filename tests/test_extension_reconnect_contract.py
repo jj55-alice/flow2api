@@ -129,6 +129,19 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn("FLOW_PROGRESS_POLL_INTERVAL_MS", background)
         self.assertIn("FLOW_SUBMIT_HARD_TIMEOUT_PADDING_MS", background)
 
+    def test_user_action_tab_is_revealed_and_preserved(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        self.assertIn("flowUiNeedsUserAction(responseText)", background)
+        self.assertIn("chrome.tabs.update(newTabId, { active: true })", background)
+        self.assertIn("newTabId && !preserveTabForUserAction", background)
+        self.assertIn("projectUnavailable", background)
+
+    def test_native_upload_does_not_require_duplicate_detail_preview_image(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        self.assertNotIn("uploaded product image detail preview", background)
+
 
 if __name__ == "__main__":
     unittest.main()

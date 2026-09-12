@@ -42,6 +42,7 @@ class ExtensionCaptchaService:
         self.db = db
         self.active_connections: list[ExtensionConnection] = []
         self.pending_requests: dict[str, tuple[asyncio.Future, WebSocket]] = {}
+        self._video_ui_blocked_routes: dict[str, str] = {}
         self._pending_flow_activity: dict[str, tuple[float, str]] = {}
         # A Chrome profile represents one Google account. Serialize requests
         # per route and space them out so a burst cannot open many hidden Flow
@@ -352,6 +353,9 @@ class ExtensionCaptchaService:
                 "client_label": conn.client_label,
                 "extension_version": conn.extension_version,
                 "connected_at": conn.connected_at,
+                "flow_ui_error": self._video_ui_blocked_routes.get(conn.route_key, ""),
+                # Backward-compatible key for the current admin UI.
+                "video_ui_error": self._video_ui_blocked_routes.get(conn.route_key, ""),
             }
             for conn in self.active_connections
         ]
@@ -422,6 +426,7 @@ class ExtensionCaptchaService:
                 if conn:
                     conn.route_key = (payload.get("route_key") or conn.route_key or "").strip()
                     conn.client_label = (payload.get("client_label") or conn.client_label or "").strip()
+                    self._video_ui_blocked_routes.pop(conn.route_key, None)
                     conn.extension_version = str(
                         payload.get("extension_version") or conn.extension_version or ""
                     ).strip()[:32]
@@ -706,6 +711,7 @@ class ExtensionCaptchaService:
         req_id: str,
         timeout: int,
         supports_progress: bool,
+        preparation_timeout: float = 0,
     ) -> Dict[str, Any]:
         """Wait for a browser result while distinguishing slow work from a dead tab."""
         hard_timeout = max(60.0, float(timeout) + 45.0)
@@ -726,7 +732,8 @@ class ExtensionCaptchaService:
                 (started_at, "dispatched"),
             )
             hard_remaining = hard_deadline - now
-            stall_remaining = stall_timeout - (now - last_activity_at)
+            phase_timeout = max(stall_timeout, preparation_timeout) if last_phase == "ui_preparing" else stall_timeout
+            stall_remaining = phase_timeout - (now - last_activity_at)
             if hard_remaining <= 0:
                 raise ExtensionCaptchaError(
                     f"Chrome extension Flow submit exceeded the {hard_timeout:.0f}s hard limit",
@@ -747,6 +754,72 @@ class ExtensionCaptchaService:
             except asyncio.TimeoutError:
                 if future.done():
                     return future.result()
+
+    def _check_flow_ui_result(self, route_key: str, response_text: str) -> None:
+        """Turn known Flow UI blockers into actionable transport errors."""
+        try:
+            payload = json.loads(response_text)
+            error_info = payload.get("error") or {}
+            native_code = error_info.get("code")
+            if native_code in {
+                "flow_video_audio_failed", "flow_video_generation_failed",
+                "flow_video_policy_rejected", "flow_video_agent_reported_failure",
+            } and error_info.get("source") in {"flow_error_tile", "flow_agent_text"}:
+                error = ExtensionCaptchaError(str(error_info.get("message") or native_code)[:500], code=native_code)
+                error.http_status = 502
+                error.source = error_info["source"]
+                error.upstream_message = str(error_info.get("upstream_message") or "")[:500]
+                raise error
+            message = str((payload.get("error") or {}).get("message") or "")
+            diagnostics = json.loads(message.rsplit("; UI: ", 1)[1])
+            buttons = set(diagnostics.get("buttons") or [])
+            dialogs = " ".join(diagnostics.get("dialogs") or [])
+            project_unavailable = diagnostics.get("projectUnavailable") is True
+        except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+            return
+        if project_unavailable:
+            raise ExtensionCaptchaError(
+                "Flow project is unavailable for the mapped Chrome account",
+                code="extension_project_unavailable",
+            )
+        if "이 이미지를 사용할 권리" in dialogs:
+            raise ExtensionCaptchaError(
+                "Flow에서 이 상품 사진을 사용할 권리 확인이 필요합니다. "
+                f"업로드 처리: {message.split(chr(59) + ' UI:', 1)[0][:250]}",
+                code="extension_image_rights_confirmation_required",
+            )
+        if {"동의함", "나중에"}.issubset(buttons) or {"I agree", "Not now"}.issubset(buttons):
+            message = "이 Chrome 프로필의 Flow 초기 안내 확인이 필요합니다. 확인 후 확장을 새로고침하세요."
+            self._video_ui_blocked_routes[route_key] = message
+            raise ExtensionCaptchaError(message, code="extension_user_action_required")
+
+    def _check_video_ui_result(self, route_key: str, response_text: str) -> None:
+        """Backward-compatible wrapper for callers and tests using the old name."""
+        self._check_flow_ui_result(route_key, response_text)
+
+    @staticmethod
+    def _require_image_ui_version(extension_version: str) -> None:
+        try:
+            version = tuple(int(part) for part in str(extension_version or "").split(".")[:3])
+        except ValueError:
+            version = ()
+        if (version + (0, 0, 0))[:3] < (1, 3, 22):
+            raise ExtensionCaptchaError(
+                "Flow image generation needs Chrome extension 1.3.22+ to reject reference images as results. Reload the updated Flow2API extension.",
+                code="extension_reload_required",
+            )
+
+    @staticmethod
+    def _require_video_ui_version(extension_version: str) -> None:
+        try:
+            version = tuple(int(part) for part in str(extension_version or "").split(".")[:3])
+        except ValueError:
+            version = ()
+        if (version + (0, 0, 0))[:3] < (1, 3, 21):
+            raise ExtensionCaptchaError(
+                "Flow video needs Chrome extension 1.3.21+. Reload the updated Flow2API extension.",
+                code="extension_reload_required",
+            )
 
     async def submit_flow_request(
         self,
@@ -777,6 +850,13 @@ class ExtensionCaptchaService:
 
         route_key = await self._resolve_route_key(token_id)
         conn = self._select_connection(route_key)
+        native_image = str(url).endswith("flowMedia:batchGenerateImages")
+        native_video = str(url).endswith(("video:batchAsyncGenerateVideoStartImage", "video:batchAsyncGenerateVideoText"))
+        current_flow_ui = native_image or native_video
+        if conn is not None and native_image:
+            self._require_image_ui_version(conn.extension_version)
+        if conn is not None and native_video:
+            self._require_video_ui_version(conn.extension_version)
         if conn is None:
             available = self._describe_routes() or "none"
             raise RuntimeError(
@@ -839,8 +919,13 @@ class ExtensionCaptchaService:
                     code="extension_reload_required",
                 )
 
+            if native_image:
+                self._require_image_ui_version(conn.extension_version)
+            if native_video:
+                self._require_video_ui_version(conn.extension_version)
+
             supports_progress = (
-                str(action or "").strip().upper() == "IMAGE_GENERATION"
+                str(action or "").strip().upper() in {"IMAGE_GENERATION", "VIDEO_GENERATION"}
                 and self._supports_flow_progress(conn.extension_version)
             )
             req_id = f"req_{uuid.uuid4().hex}"
@@ -879,6 +964,7 @@ class ExtensionCaptchaService:
                     req_id=req_id,
                     timeout=timeout,
                     supports_progress=supports_progress,
+                    preparation_timeout=90 if native_video else 0,
                 )
 
                 if result.get("status") != "success":
@@ -908,6 +994,9 @@ class ExtensionCaptchaService:
                     http_status = 0
                 if http_status <= 0:
                     raise RuntimeError("Chrome extension returned an invalid Flow HTTP status")
+
+                if current_flow_ui and http_status >= 400:
+                    self._check_flow_ui_result(route_key, str(result.get("response_text") or ""))
 
                 return {
                     "status": http_status,

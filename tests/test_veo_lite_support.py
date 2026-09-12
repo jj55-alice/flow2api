@@ -225,12 +225,12 @@ class VeoLiteFlowClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_generate_video_text_uses_v2_payload_for_lite(self):
         captured = {}
 
-        async def fake_make_request(method, url, json_data, use_at, at_token, **kwargs):
+        async def fake_make_request(*, url, json_data, **kwargs):
             captured["url"] = url
             captured["json_data"] = json_data
             return {"operations": [{"operation": {"name": "task-1"}}]}
 
-        self.client._make_request = AsyncMock(side_effect=fake_make_request)
+        self.client._make_video_api_request = AsyncMock(side_effect=fake_make_request)
 
         await self.client.generate_video_text(
             at="at-token",
@@ -259,7 +259,7 @@ class VeoLiteFlowClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_generate_video_text_normalizes_media_only_create_response(self):
         captured = {}
 
-        async def fake_make_request(method, url, json_data, use_at, at_token, **kwargs):
+        async def fake_make_request(*, url, json_data, **kwargs):
             captured["json_data"] = json_data
             return {
                 "remainingCredits": 30,
@@ -283,7 +283,7 @@ class VeoLiteFlowClientTests(unittest.IsolatedAsyncioTestCase):
                 ],
             }
 
-        self.client._make_request = AsyncMock(side_effect=fake_make_request)
+        self.client._make_video_api_request = AsyncMock(side_effect=fake_make_request)
 
         result = await self.client.generate_video_text(
             at="at-token",
@@ -340,7 +340,7 @@ class RouteNormalizationTests(unittest.IsolatedAsyncioTestCase):
     async def test_check_video_status_uses_media_payload_and_normalizes_response(self):
         captured = {}
 
-        async def fake_make_request(method, url, json_data, use_at, at_token, **kwargs):
+        async def fake_make_request(*, url, json_data, **kwargs):
             captured["json_data"] = json_data
             return {
                 "media": [
@@ -362,7 +362,7 @@ class RouteNormalizationTests(unittest.IsolatedAsyncioTestCase):
                 ]
             }
 
-        self.client._make_request = AsyncMock(side_effect=fake_make_request)
+        self.client._make_video_api_request = AsyncMock(side_effect=fake_make_request)
 
         result = await self.client.check_video_status(
             at="at-token",
@@ -389,12 +389,12 @@ class RouteNormalizationTests(unittest.IsolatedAsyncioTestCase):
     async def test_generate_video_start_end_uses_v2_payload_for_interpolation_lite(self):
         captured = {}
 
-        async def fake_make_request(method, url, json_data, use_at, at_token, **kwargs):
+        async def fake_make_request(*, url, json_data, **kwargs):
             captured["url"] = url
             captured["json_data"] = json_data
             return {"operations": [{"operation": {"name": "task-2"}}]}
 
-        self.client._make_request = AsyncMock(side_effect=fake_make_request)
+        self.client._make_video_api_request = AsyncMock(side_effect=fake_make_request)
 
         await self.client.generate_video_start_end(
             at="at-token",

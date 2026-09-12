@@ -1388,6 +1388,31 @@ class TokenManager:
         except Exception as e:
             debug_logger.log_warning(f"[PROTOCOL_REFRESH] 停止后台任务时出错: {e}")
 
+    async def reset_project_pool(self, token_id: int) -> int:
+        """Forget stale local project mappings so the pool can be recreated."""
+        project_lock = await self._get_token_lock(
+            self._project_locks,
+            self._project_lock_guard,
+            token_id,
+        )
+        async with project_lock:
+            token = await self.db.get_token(token_id)
+            if not token:
+                raise ValueError("Token not found")
+
+            projects = await self.db.get_projects_by_token(token_id)
+            for project in projects:
+                await self.db.delete_project(project.project_id)
+            await self.db.update_token(
+                token_id,
+                current_project_id=None,
+                current_project_name=None,
+            )
+            debug_logger.log_warning(
+                f"[PROJECT] Reset {len(projects)} stale project mapping(s) for token {token_id}"
+            )
+            return len(projects)
+
     async def ensure_project_exists(self, token_id: int) -> str:
         """Ensure a token has a pooled set of projects and return one in round-robin order."""
         project_lock = await self._get_token_lock(

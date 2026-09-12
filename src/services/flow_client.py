@@ -9,11 +9,14 @@ import base64
 import gzip
 import ssl
 import re
+import hashlib
+from pathlib import Path
 from typing import Dict, Any, Optional, List, Union, Callable, Awaitable
 from urllib.parse import quote, urljoin, urlparse
 import urllib.error
 import urllib.request
 from curl_cffi.requests import AsyncSession
+from ..core.image_rights import has_request_image_consent
 from ..core.logger import debug_logger
 from ..core.config import config, get_yescaptcha_min_score
 
@@ -57,7 +60,9 @@ class FlowClient:
         # generation requests carry only media IDs. Keep a bounded bridge for
         # extension-driven image-to-image generation.
         self._uploaded_media_file_names: Dict[str, str] = {}
-        self._staged_ui_uploads: Dict[str, Dict[str, str]] = {}
+        self._staged_ui_uploads: Dict[str, Dict[str, Any]] = {}
+        self._image_rights_path = Path(__file__).resolve().parents[2] / "data" / "video-image-consents.json"
+        self._browser_video_results: Dict[str, Dict[str, Any]] = {}
 
         # 仅保留当前上游仍稳定出现的最小浏览器风格头；具体 UA / Accept-Language / UA-CH
         # 统一以当前请求链路绑定的 runtime fingerprint 为准，不再兼容旧版随机平台策略。
@@ -129,6 +134,24 @@ class FlowClient:
         while len(self._uploaded_media_file_names) > 256:
             self._uploaded_media_file_names.pop(next(iter(self._uploaded_media_file_names)))
 
+    def _has_image_rights_consent(self, image_base64: str) -> bool:
+        """Consent applies only to image bytes explicitly approved by the user."""
+        if has_request_image_consent(image_base64):
+            return True
+        try:
+            with self._image_rights_path.open("rb") as source:
+                raw = source.read(65537)
+            if len(raw) > 65536:
+                return False
+            manifest = json.loads(raw)
+            if manifest.get("version") != 1:
+                return False
+            digest = hashlib.sha256(base64.b64decode(image_base64, validate=True)).hexdigest()
+            return any(isinstance(item, dict) and item.get("allowed") is True and item.get("sha256") == digest
+                       for item in manifest.get("images", []))
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
+
     def _stage_ui_upload(
         self,
         media_id: str,
@@ -142,6 +165,8 @@ class FlowClient:
             "mimeType": mime_type,
             "imageBytes": image_base64,
         }
+        if self._has_image_rights_consent(image_base64):
+            self._staged_ui_uploads[media_id]["rightsConfirmed"] = True
         # Reference-image requests are short lived. Bounding the bridge avoids
         # retaining unbounded base64 payloads if a client abandons a request.
         while len(self._staged_ui_uploads) > 32:
@@ -950,6 +975,8 @@ class FlowClient:
         return any(keyword in error_lower for keyword in [
             "public_error_unsafe_generation",
             "unsafe_generation",
+            "flow content policy rejected",
+            "safety filters",
             "request contains an invalid ar",
         ])
 
@@ -1054,6 +1081,43 @@ class FlowClient:
         action: str = "VIDEO_GENERATION",
     ) -> Dict[str, Any]:
         """视频 API 加硬截止，避免 curl_cffi 底层偶发卡住导致整条请求悬挂。"""
+        if config.captcha_method == "extension":
+            if not project_id or token_id is None:
+                raise ValueError("Extension video requests require the originating project and account")
+            from .browser_captcha_extension import ExtensionCaptchaService
+            service = await ExtensionCaptchaService.get_instance(self.db)
+            native_ui = url.endswith(("video:batchAsyncGenerateVideoStartImage", "video:batchAsyncGenerateVideoText"))
+            reference_ids = []
+            if native_ui:
+                for request in json_data.get("requests", []):
+                    media_id = (request.get("startImage") or {}).get("mediaId")
+                    if media_id:
+                        reference_ids.append(media_id)
+                if any(media_id not in self._staged_ui_uploads for media_id in reference_ids):
+                    raise ValueError("Native Flow video requires the original reference image bytes")
+                json_data = dict(json_data)
+                json_data["__flow2apiUiContext"] = {
+                    "inputUploads": [self._staged_ui_uploads[media_id] for media_id in reference_ids],
+                    "inputFileNames": [self._uploaded_media_file_names[media_id] for media_id in reference_ids],
+                }
+            response = await service.submit_flow_request(
+                project_id=project_id, action=action, token_id=token_id,
+                url=url, at_token=at, json_data=json_data,
+                timeout=max(timeout, 300) if native_ui else timeout,
+            )
+            fingerprint = response.get("fingerprint")
+            self._set_request_fingerprint(fingerprint if isinstance(fingerprint, dict) else None)
+            result = self._decode_browser_flow_response(response)
+            if result.get("flow2apiTransport") == "flow_google_video_ui":
+                normalized = self._normalize_video_generation_response(result, fallback_project_id=project_id)
+                for operation in normalized.get("operations", []):
+                    self._browser_video_results[str(operation.get("mediaName") or "")] = operation
+                while len(self._browser_video_results) > 32:
+                    self._browser_video_results.pop(next(iter(self._browser_video_results)))
+                for media_id in reference_ids:
+                    self._staged_ui_uploads.pop(media_id, None)
+                return normalized
+            return result
         raw_body = json.dumps(json_data, ensure_ascii=False, separators=(",", ":"))
         headers = self._build_realistic_video_submit_headers()
         headers.update(self._build_labs_request_context_headers(project_id))
@@ -1532,6 +1596,7 @@ class FlowClient:
         aspect_ratio: str = "IMAGE_ASPECT_RATIO_LANDSCAPE",
         project_id: Optional[str] = None,
         token_id: Optional[int] = None,
+        defer_to_image_ui: bool = True,
     ) -> str:
         """上传图片,返回mediaId
 
@@ -1541,6 +1606,7 @@ class FlowClient:
             aspect_ratio: 图片或视频宽高比（会自动转换为图片格式）
             project_id: 项目ID（新上传接口可使用）
             token_id: token ID（extension 模式下用于选择对应 Chrome profile）
+            defer_to_image_ui: stage references for image UI; video calls require a real media ID
 
         Returns:
             mediaId
@@ -1568,7 +1634,7 @@ class FlowClient:
         # The current Flow frontend no longer accepts the old project-scoped
         # upload request reliably. Keep extension uploads local until the image
         # generation tab is open, then let that tab use Flow's native uploader.
-        if captcha_method == "extension" and normalized_project_id:
+        if captcha_method == "extension" and normalized_project_id and defer_to_image_ui:
             staged_media_id = f"flow2api-ui-upload-{uuid.uuid4().hex}"
             self._remember_uploaded_media_file_name(staged_media_id, upload_file_name)
             self._stage_ui_upload(
@@ -2168,6 +2234,8 @@ class FlowClient:
             video_metadata["model"] = model_name
         if duration:
             video_metadata["duration"] = duration
+        if generated_video.get("encodedVideo"):
+            video_metadata["encodedVideo"] = generated_video["encodedVideo"]
 
         embedded_url = self._extract_video_url_from_media(media)
         if embedded_url:
@@ -4069,7 +4137,7 @@ class FlowClient:
 
     # ========== 任务轮询 (使用AT) ==========
 
-    async def check_video_status(self, at: str, operations: List[Dict]) -> dict:
+    async def check_video_status(self, at: str, operations: List[Dict], *, project_id: Optional[str] = None, token_id: Optional[int] = None) -> dict:
         """查询视频生成状态
 
         Args:
@@ -4093,6 +4161,9 @@ class FlowClient:
         if not media_refs:
             raise ValueError("视频状态查询缺少 media 引用，无法按当前上游结构发起查询")
 
+        cached = [self._browser_video_results.get(item["name"]) for item in media_refs]
+        if cached and all(cached):
+            return {"operations": cached}
         json_data = {"media": media_refs}
         max_retries = config.flow_max_retries
         last_error: Optional[Exception] = None
@@ -4103,7 +4174,9 @@ class FlowClient:
                     url=url,
                     json_data=json_data,
                     at=at,
-                    timeout=self._get_video_poll_timeout()
+                    timeout=self._get_video_poll_timeout(),
+                    project_id=project_id,
+                    token_id=token_id,
                 )
                 try:
                     media_preview = result.get("media") if isinstance(result, dict) else None
@@ -4257,6 +4330,10 @@ class FlowClient:
             "extension_flow_stalled",
             "extension_flow_timeout",
             "extension_flow_transport_failed",
+            "flow_video_audio_failed",
+            "flow_video_generation_failed",
+            "flow_video_policy_rejected",
+            "flow_video_agent_reported_failure",
         }:
             return False
 
@@ -4756,7 +4833,7 @@ class FlowClient:
 
         if captcha_method == "extension":
             try:
-                from .browser_captcha_extension import ExtensionCaptchaService
+                from .browser_captcha_extension import ExtensionCaptchaError, ExtensionCaptchaService
                 service = await ExtensionCaptchaService.get_instance(self.db)
                 extension_timeout = 45 if action == "VIDEO_GENERATION" else 25
                 get_token_bundle = getattr(service, "get_token_bundle", None)

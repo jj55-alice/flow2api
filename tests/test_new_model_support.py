@@ -82,12 +82,12 @@ class OmniFlashPayloadTests(unittest.IsolatedAsyncioTestCase):
         client._notify_browser_captcha_request_finished = AsyncMock()
         captured = {}
 
-        async def fake_make_request(method, url, json_data, use_at, at_token, **kwargs):
+        async def fake_make_request(*, url, json_data, **kwargs):
             captured["url"] = url
             captured["json_data"] = json_data
             return {"operations": [{"operation": {"name": "task-omni"}}]}
 
-        client._make_request = AsyncMock(side_effect=fake_make_request)
+        client._make_video_api_request = AsyncMock(side_effect=fake_make_request)
 
         await client.generate_video_text(
             at="at-token",

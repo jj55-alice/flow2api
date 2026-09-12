@@ -1,6 +1,6 @@
 """Data models for Flow2API"""
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Optional, List, Union, Any, Literal
 from datetime import datetime
 
@@ -306,6 +306,8 @@ class GeminiGenerateContentRequest(BaseModel):
     contents: List[GeminiContent]
     generationConfig: Optional[GenerationConfigParam] = None
     systemInstruction: Optional[GeminiContent] = None
+    # Authenticated caller confirms rights only for these exact input bytes.
+    imageRightsConsents: List[str] = Field(default_factory=list, max_length=16)
 
     model_config = ConfigDict(extra="allow")
 

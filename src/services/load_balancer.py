@@ -268,7 +268,13 @@ class LoadBalancer:
             self._round_robin_state[scenario] = selected["token"].id
         return selected
 
-    async def _check_extension_route(self, token: Token) -> tuple[bool, str]:
+    async def _check_extension_route(
+        self,
+        token: Token,
+        *,
+        require_image_ui: bool = False,
+        require_video_ui: bool = False,
+    ) -> tuple[bool, str]:
         """Ensure extension captcha requests are routed to the selected account."""
         if config.captcha_method != "extension":
             return True, ""
@@ -279,6 +285,15 @@ class LoadBalancer:
             service = await ExtensionCaptchaService.get_instance(getattr(self.token_manager, "db", None))
             has_connection, route_key = await service.has_connection_for_token(token.id)
             if has_connection:
+                routes = service.get_runtime_status()["routes"]
+                route = next((item for item in routes if item["route_key"] == route_key), {})
+                flow_ui_error = route.get("flow_ui_error") or route.get("video_ui_error")
+                if flow_ui_error:
+                    return False, flow_ui_error
+                if require_image_ui:
+                    service._require_image_ui_version(route.get("extension_version", ""))
+                if require_video_ui:
+                    service._require_video_ui_version(route.get("extension_version", ""))
                 return True, ""
 
             available = service.describe_routes() or "none"
@@ -360,7 +375,10 @@ class LoadBalancer:
                     filtered_reasons[token.id] = f"扩展传输冷却中 ({transport_cooldown:.0f}秒)"
                     continue
 
-                route_ok, route_reason = await self._check_extension_route(token)
+                route_ok, route_reason = await self._check_extension_route(
+                    token,
+                    require_image_ui=True,
+                )
                 if not route_ok:
                     filtered_reasons[token.id] = route_reason
                     continue
@@ -378,7 +396,9 @@ class LoadBalancer:
                     filtered_reasons[token.id] = "视频生成已禁用"
                     continue
 
-                route_ok, route_reason = await self._check_extension_route(token)
+                route_ok, route_reason = await self._check_extension_route(
+                    token, require_video_ui=bool(model and ("_t2v_" in model or "_i2v_s_" in model)),
+                )
                 if not route_ok:
                     filtered_reasons[token.id] = route_reason
                     continue

@@ -1,3 +1,4 @@
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -31,7 +32,148 @@ class GenerationErrorRecoveryTests(unittest.TestCase):
         )
 
 
+class FlowUiDiagnosticsTests(unittest.TestCase):
+    def test_image_ui_requires_the_fixed_extension_version(self):
+        from src.services.browser_captcha_extension import ExtensionCaptchaService
+
+        with self.assertRaises(ExtensionCaptchaError) as caught:
+            ExtensionCaptchaService._require_image_ui_version("1.3.20")
+        self.assertEqual(caught.exception.code, "extension_reload_required")
+        with self.assertRaises(ExtensionCaptchaError):
+            ExtensionCaptchaService._require_image_ui_version("1.3.21")
+        ExtensionCaptchaService._require_image_ui_version("1.3.22")
+
+    def test_missing_project_has_a_specific_recovery_code(self):
+        from src.services.browser_captcha_extension import ExtensionCaptchaService
+
+        service = ExtensionCaptchaService(None)
+        response = json.dumps({
+            "error": {
+                "message": "Timed out; UI: " + json.dumps({
+                    "dialogs": [],
+                    "buttons": [],
+                    "projectUnavailable": True,
+                }),
+            },
+        })
+        with self.assertRaises(ExtensionCaptchaError) as caught:
+            service._check_flow_ui_result("google-h", response)
+
+        self.assertEqual(caught.exception.code, "extension_project_unavailable")
+        self.assertNotIn("google-h", service._video_ui_blocked_routes)
+
+    def test_onboarding_blocks_the_route_without_accepting_it(self):
+        from src.services.browser_captcha_extension import ExtensionCaptchaService
+
+        service = ExtensionCaptchaService(None)
+        response = json.dumps({
+            "error": {
+                "message": "Timed out; UI: " + json.dumps({
+                    "dialogs": [],
+                    "buttons": ["동의함", "나중에"],
+                    "projectUnavailable": False,
+                }),
+            },
+        })
+        with self.assertRaises(ExtensionCaptchaError) as caught:
+            service._check_flow_ui_result("google-h", response)
+
+        self.assertEqual(caught.exception.code, "extension_user_action_required")
+        self.assertIn("google-h", service._video_ui_blocked_routes)
+
+
 class ImageAccountFailoverTests(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_flow_project_resets_pool_and_retries_same_account(self):
+        token = SimpleNamespace(
+            id=9,
+            at="at-9",
+            email="recovery@example.invalid",
+            user_paygate_tier="PAYGATE_TIER_NOT_PAID",
+            image_concurrency=-1,
+        )
+        missing = ExtensionCaptchaError(
+            "Flow project is unavailable",
+            code="extension_project_unavailable",
+        )
+        flow_client = SimpleNamespace(
+            generate_image=AsyncMock(side_effect=[
+                missing,
+                (
+                    {
+                        "media": [{
+                            "name": "media-9",
+                            "image": {
+                                "generatedImage": {
+                                    "fifeUrl": "https://example.com/generated.jpg",
+                                },
+                            },
+                        }],
+                    },
+                    "session-9",
+                    {"generation_attempts": [{}]},
+                ),
+            ]),
+            prefill_remote_browser_pool=AsyncMock(),
+            clear_request_fingerprint=MagicMock(),
+        )
+        token_manager = SimpleNamespace(
+            reset_project_pool=AsyncMock(return_value=4),
+            ensure_project_exists=AsyncMock(return_value="project-new"),
+        )
+        load_balancer = SimpleNamespace(
+            record_extension_transport_failure=AsyncMock(),
+            release_pending=AsyncMock(),
+            select_token=AsyncMock(),
+        )
+        handler = object.__new__(GenerationHandler)
+        handler.flow_client = flow_client
+        handler.load_balancer = load_balancer
+        handler.token_manager = token_manager
+        handler._update_request_log_progress = AsyncMock()
+
+        generation_result = handler._create_generation_result()
+        response_state = handler._create_response_state()
+        cache_config = config._config.setdefault("cache", {})
+        captcha_config = config._config.setdefault("captcha", {})
+        original_cache = dict(cache_config)
+        original_captcha = dict(captcha_config)
+        cache_config["enabled"] = False
+        captcha_config["captcha_method"] = "extension"
+        captcha_config["extension_transport_generation_retries"] = 2
+        try:
+            chunks = [
+                chunk
+                async for chunk in handler._handle_image_generation(
+                    token,
+                    "project-stale",
+                    {
+                        "model_name": "NARWHAL",
+                        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE",
+                    },
+                    "gemini-3.1-flash-image-landscape",
+                    "test prompt",
+                    None,
+                    False,
+                    generation_result=generation_result,
+                    response_state=response_state,
+                )
+            ]
+        finally:
+            cache_config.clear()
+            cache_config.update(original_cache)
+            captcha_config.clear()
+            captcha_config.update(original_captcha)
+
+        self.assertTrue(generation_result["success"])
+        self.assertTrue(chunks)
+        token_manager.reset_project_pool.assert_awaited_once_with(9)
+        token_manager.ensure_project_exists.assert_awaited_once_with(9)
+        self.assertEqual(
+            [call.kwargs["project_id"] for call in flow_client.generate_image.await_args_list],
+            ["project-stale", "project-new"],
+        )
+        load_balancer.select_token.assert_not_awaited()
+
     async def test_stalled_extension_route_switches_to_another_account_once(self):
         first = SimpleNamespace(
             id=1,

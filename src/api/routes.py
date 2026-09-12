@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..core.auth import AuthManager, verify_api_key_flexible
+from ..core.image_rights import image_rights_scope, validate_image_rights_consents
 from ..core.logger import debug_logger
 from ..core.model_resolver import get_base_model_aliases, resolve_model_name
 from ..core.models import (
@@ -80,6 +81,7 @@ class NormalizedGenerationRequest:
     images: List[bytes]
     messages: Optional[List[ChatMessage]] = None
     video_media_id: Optional[str] = None
+    image_rights_consents: tuple[str, ...] = ()
 
 
 def set_generation_handler(handler: GenerationHandler):
@@ -459,6 +461,10 @@ async def _normalize_gemini_request(
     request: GeminiGenerateContentRequest,
 ) -> NormalizedGenerationRequest:
     prompt, images = await _extract_prompt_and_images_from_gemini_contents(request.contents)
+    try:
+        image_rights_consents = validate_image_rights_consents(request.imageRightsConsents, images)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     resolved_model = _resolve_request_model(model, request, images=images)
     system_instruction = _extract_text_from_gemini_content(request.systemInstruction)
     model_config = MODEL_CONFIG.get(resolved_model)
@@ -481,6 +487,7 @@ async def _normalize_gemini_request(
         model=resolved_model,
         prompt=prompt,
         images=images,
+        image_rights_consents=image_rights_consents,
     )
 
 
@@ -490,23 +497,25 @@ async def _collect_non_stream_result(
     images: List[bytes],
     base_url_override: Optional[str] = None,
     video_media_id: Optional[str] = None,
+    image_rights_consents: tuple[str, ...] = (),
 ) -> str:
-    handler = _ensure_generation_handler()
-    result = None
-    async for chunk in handler.handle_generation(
-        model=model,
-        prompt=prompt,
-        images=images if images else None,
-        stream=False,
-        base_url_override=base_url_override,
-        video_media_id=video_media_id,
-    ):
-        result = chunk
+    with image_rights_scope(image_rights_consents):
+        handler = _ensure_generation_handler()
+        result = None
+        async for chunk in handler.handle_generation(
+            model=model,
+            prompt=prompt,
+            images=images if images else None,
+            stream=False,
+            base_url_override=base_url_override,
+            video_media_id=video_media_id,
+        ):
+            result = chunk
 
-    if result is None:
-        raise HTTPException(status_code=500, detail="Generation failed: No response")
+        if result is None:
+            raise HTTPException(status_code=500, detail="Generation failed: No response")
 
-    return result
+        return result
 
 
 def _parse_handler_result(result: str) -> Dict[str, Any]:
@@ -745,20 +754,36 @@ async def _iterate_gemini_stream(
     response_model: str,
     base_url_override: Optional[str] = None,
 ):
-    handler = _ensure_generation_handler()
-    async for chunk in handler.handle_generation(
-        model=normalized.model,
-        prompt=normalized.prompt,
-        images=normalized.images if normalized.images else None,
-        stream=True,
-        base_url_override=base_url_override,
-        video_media_id=normalized.video_media_id,
-    ):
-        if chunk.startswith("data: "):
-            payload_text = chunk[6:].strip()
-            if payload_text == "[DONE]":
+    with image_rights_scope(normalized.image_rights_consents):
+        handler = _ensure_generation_handler()
+        async for chunk in handler.handle_generation(
+            model=normalized.model,
+            prompt=normalized.prompt,
+            images=normalized.images if normalized.images else None,
+            stream=True,
+            base_url_override=base_url_override,
+            video_media_id=normalized.video_media_id,
+        ):
+            if chunk.startswith("data: "):
+                payload_text = chunk[6:].strip()
+                if payload_text == "[DONE]":
+                    continue
+                payload = _parse_handler_result(payload_text)
+                if "error" in payload:
+                    yield (
+                        f"data: {json.dumps(_build_gemini_error_payload(_get_error_status_code(payload), payload['error'].get('message', 'Generation failed')), ensure_ascii=False)}\n\n"
+                    )
+                    return
+
+                event = await _convert_openai_stream_chunk_to_gemini_event(
+                    payload,
+                    response_model,
+                )
+                if event:
+                    yield event
                 continue
-            payload = _parse_handler_result(payload_text)
+
+            payload = _parse_handler_result(chunk)
             if "error" in payload:
                 yield (
                     f"data: {json.dumps(_build_gemini_error_payload(_get_error_status_code(payload), payload['error'].get('message', 'Generation failed')), ensure_ascii=False)}\n\n"
@@ -771,21 +796,6 @@ async def _iterate_gemini_stream(
             )
             if event:
                 yield event
-            continue
-
-        payload = _parse_handler_result(chunk)
-        if "error" in payload:
-            yield (
-                f"data: {json.dumps(_build_gemini_error_payload(_get_error_status_code(payload), payload['error'].get('message', 'Generation failed')), ensure_ascii=False)}\n\n"
-            )
-            return
-
-        event = await _convert_openai_stream_chunk_to_gemini_event(
-            payload,
-            response_model,
-        )
-        if event:
-            yield event
 
 
 @router.get("/v1/models")
@@ -916,6 +926,7 @@ async def generate_content(
                     normalized.images,
                     base_url_override=request_base_url,
                     video_media_id=normalized.video_media_id,
+                    image_rights_consents=normalized.image_rights_consents,
                 )
             )
         )

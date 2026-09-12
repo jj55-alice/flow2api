@@ -1187,7 +1187,17 @@ class GenerationHandler:
         )
 
         video_url = ""
-        if media_name and getattr(token, "st", None):
+        encoded_video = video_info.pop("encodedVideo", "")
+        if encoded_video:
+            if len(encoded_video) > 4 * ((10 * 1024 * 1024 + 2) // 3):
+                raise ValueError("Browser video exceeds the 10MB transfer limit")
+            import base64
+            video_bytes = base64.b64decode(encoded_video, validate=True)
+            if len(video_bytes) < 12 or video_bytes[4:8] != b"ftyp":
+                raise ValueError("Browser video is not an MP4")
+            filename = await self.file_cache.cache_base64_video(encoded_video)
+            video_url = f"{self._get_base_url()}/tmp/{filename}"
+        elif media_name and getattr(token, "st", None):
             video_url = await self.flow_client.get_media_url_redirect(
                 token.st,
                 media_name,
@@ -1631,6 +1641,14 @@ class GenerationHandler:
                     attempt_started_at=token_attempt_started_at,
                 )
 
+            failure_evidence = {}
+            if getattr(e, "source", "") in {"flow_error_tile", "flow_agent_text"}:
+                failure_evidence = {
+                    "error_code": error_code,
+                    "error_source": e.source,
+                    "upstream_message": str(getattr(e, "upstream_message", ""))[:500],
+                }
+
             # 先将最终失败状态落库，再返回错误响应，避免日志停在 102。
             duration = time.time() - start_time
             record_generation_result(generation_type or "unknown", "failed", duration)
@@ -1642,7 +1660,7 @@ class GenerationHandler:
                 token.id if token else None,
                 request_operation if generation_type else "generate_unknown",
                 request_payload if 'request_payload' in locals() else {"model": model},
-                {"error": error_msg, "performance": perf_trace},
+                {"error": error_msg, "performance": perf_trace, **failure_evidence},
                 error_status,
                 duration,
                 log_id=request_log_state.get("id"),
@@ -1798,6 +1816,7 @@ class GenerationHandler:
 
         try:
             attempted_token_ids: set[int] = set()
+            recovered_project_token_ids: set[int] = set()
             failover_count = 0
             max_route_attempts = max(
                 1,
@@ -1875,12 +1894,39 @@ class GenerationHandler:
                     break
                 except Exception as generation_error:
                     error_code = str(getattr(generation_error, "code", "") or "")
+                    if (
+                        error_code == "extension_project_unavailable"
+                        and token.id not in recovered_project_token_ids
+                    ):
+                        recovered_project_token_ids.add(token.id)
+                        if image_trace is not None:
+                            image_trace.setdefault("project_recoveries", []).append({
+                                "token_id": token.id,
+                                "stale_project_id": project_id,
+                            })
+                        await self._update_request_log_progress(
+                            request_log_state,
+                            token_id=token.id,
+                            status_text="recreating_flow_project",
+                            progress=30,
+                        )
+                        await self.token_manager.reset_project_pool(token.id)
+                        project_id = await self.token_manager.ensure_project_exists(token.id)
+                        if hasattr(self.flow_client, "clear_request_fingerprint"):
+                            self.flow_client.clear_request_fingerprint()
+                        await self.flow_client.prefill_remote_browser_pool(
+                            project_id=project_id,
+                            action="IMAGE_GENERATION",
+                            token_id=token.id,
+                        )
+                        continue
                     can_fail_over = (
                         config.captcha_method == "extension"
                         and error_code in {
                             "extension_disconnected",
                             "extension_flow_stalled",
                             "extension_flow_transport_failed",
+                            "extension_user_action_required",
                         }
                         and failover_count < max_route_attempts - 1
                     )
@@ -2292,6 +2338,7 @@ class GenerationHandler:
                         model_config["aspect_ratio"],
                         project_id=project_id,
                         token_id=token.id,
+                        defer_to_image_ui=False,
                     )
                     end_media_id = await self.flow_client.upload_image(
                         token.at,
@@ -2299,6 +2346,7 @@ class GenerationHandler:
                         model_config["aspect_ratio"],
                         project_id=project_id,
                         token_id=token.id,
+                        defer_to_image_ui=False,
                     )
                     debug_logger.log_info(f"[I2V] 上传首尾帧: {start_media_id}, {end_media_id}")
 
@@ -2314,6 +2362,7 @@ class GenerationHandler:
                         model_config["aspect_ratio"],
                         project_id=project_id,
                         token_id=token.id,
+                        defer_to_image_ui=False,
                     )
                     reference_images.append({
                         "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
@@ -2333,6 +2382,7 @@ class GenerationHandler:
                         model_config["aspect_ratio"],
                         project_id=project_id,
                         token_id=token.id,
+                        defer_to_image_ui=False,
                     )
                     reference_images.append({
                         "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
@@ -2545,7 +2595,9 @@ class GenerationHandler:
             await asyncio.sleep(poll_interval)
 
             try:
-                result = await self.flow_client.check_video_status(token.at, operations)
+                result = await self.flow_client.check_video_status(
+                    token.at, operations, project_id=project_id, token_id=token.id
+                )
                 checked_operations = result.get("operations", [])
                 consecutive_poll_errors = 0
                 last_poll_error = None
@@ -2739,7 +2791,7 @@ class GenerationHandler:
 
                     # 缓存视频 (如果启用)
                     local_url = video_url
-                    if config.cache_enabled:
+                    if config.cache_enabled and not video_url.startswith(f"{self._get_base_url(response_state)}/tmp/"):
                         await self._update_request_log_progress(request_log_state, token_id=token.id, status_text="caching_video", progress=92)
                         try:
                             if stream:
@@ -2755,7 +2807,7 @@ class GenerationHandler:
                             if stream:
                                 cache_error = self._normalize_error_message(e, max_length=120)
                                 yield self._create_stream_chunk(f"⚠️ 缓存失败: {cache_error}\n正在返回源链接...\n")
-                    else:
+                    elif not config.cache_enabled:
                         if stream:
                             yield self._create_stream_chunk("缓存已关闭,正在返回源链接...\n")
 

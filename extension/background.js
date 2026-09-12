@@ -622,14 +622,14 @@ async function fetchCurrentFlowImage(rawUrl) {
     let lastStatus = 0;
     for (const candidate of [...new Set(candidates)]) {
         try {
-            const response = await fetch(candidate, { credentials: "include" });
+            const response = await fetch(candidate, { credentials: "include", signal: AbortSignal.timeout(10000) });
             lastStatus = response.status;
             const mimeType = String(response.headers.get("content-type") || "")
                 .split(";", 1)[0]
                 .trim();
             if (!response.ok || !mimeType.startsWith("image/")) continue;
             const bytes = new Uint8Array(await response.arrayBuffer());
-            if (!bytes.length) continue;
+            if (!bytes.length || bytes.length > 20_000_000) continue;
             let binary = "";
             const chunkSize = 0x8000;
             for (let offset = 0; offset < bytes.length; offset += chunkSize) {
@@ -649,7 +649,71 @@ async function fetchCurrentFlowImage(rawUrl) {
     );
 }
 
-async function embedCurrentFlowImages(responseText) {
+// Google recompresses uploads, so byte hashes cannot distinguish a reference
+// thumbnail from a newly generated image. Decode in the extension worker,
+// whose existing host permissions allow reading Flow's image pixels.
+async function flowImageFingerprint(encoded, mimeType) {
+    if (!encoded || encoded.length > 28_000_000) throw new Error("Invalid Flow image for result validation");
+    const bytes = Uint8Array.from(atob(encoded), character => character.charCodeAt(0));
+    const bitmap = await createImageBitmap(new Blob([bytes], { type: mimeType || "image/jpeg" }));
+    try {
+        const canvas = new OffscreenCanvas(64, 64);
+        const context = canvas.getContext("2d", { willReadFrequently: true });
+        if (!context) throw new Error("Flow result validation is unavailable");
+        context.fillStyle = "white";
+        context.fillRect(0, 0, 64, 64);
+        context.drawImage(bitmap, 0, 0, 64, 64);
+        return { aspect: bitmap.width / bitmap.height, pixels: context.getImageData(0, 0, 64, 64).data };
+    } finally {
+        bitmap.close();
+    }
+}
+
+function sameFlowImage(left, right) {
+    if (Math.abs(left.aspect - right.aspect) > 0.02 || left.pixels.length !== right.pixels.length) return false;
+    let difference = 0;
+    let changed = 0;
+    for (let index = 0; index < left.pixels.length; index += 4) {
+        let pixelDifference = 0;
+        for (let channel = 0; channel < 3; channel++) pixelDifference += Math.abs(left.pixels[index + channel] - right.pixels[index + channel]);
+        difference += pixelDifference;
+        if (pixelDifference / 3 > 15) changed++;
+    }
+    const count = left.pixels.length / 4;
+    return count > 0 && difference / (count * 3) <= 2 && changed / count <= 0.03;
+}
+
+function createFlowResultValidator(uploads, download = fetchCurrentFlowImage, fingerprint = flowImageFingerprint) {
+    let references;
+    const checked = new Map();
+    const accepted = new Map();
+    return {
+        accepted,
+        async check(asset) {
+            // Validate before fetching; page-visible candidates cannot change destinations.
+            if (!asset || !asset.identity || !isCurrentFlowImageUrl(asset.url)) return { status: "error" };
+            const cacheKey = `${asset.identity}|${asset.url}`;
+            if (checked.has(cacheKey)) return checked.get(cacheKey);
+            if (checked.size >= 32) return { status: "error" };
+            try {
+                references ||= Promise.all(uploads.map(upload => fingerprint(upload.imageBytes, upload.mimeType)));
+                const referenceImages = await references;
+                const payload = await download(asset.url);
+                const candidate = await fingerprint(payload.encodedImage, payload.mimeType);
+                const status = referenceImages.some(reference => sameFlowImage(reference, candidate)) ? "reference" : "accepted";
+                if (status === "accepted") accepted.set(asset.url, payload);
+                const result = { identity: asset.identity, url: asset.url, status };
+                checked.set(cacheKey, result);
+                return result;
+            } catch (_) {
+                // Never accept an image whose pixels could not be checked.
+                return { identity: asset.identity, url: asset.url, status: "error" };
+            }
+        },
+    };
+}
+
+async function embedCurrentFlowImages(responseText, acceptedImages = new Map()) {
     let payload;
     try {
         payload = JSON.parse(String(responseText || ""));
@@ -662,7 +726,7 @@ async function embedCurrentFlowImages(responseText) {
     for (const media of payload.media) {
         const generatedImage = media && media.image && media.image.generatedImage;
         if (!generatedImage || generatedImage.encodedImage) continue;
-        const imagePayload = await fetchCurrentFlowImage(generatedImage.fifeUrl);
+        const imagePayload = acceptedImages.get(generatedImage.fifeUrl) || await fetchCurrentFlowImage(generatedImage.fifeUrl);
         generatedImage.fifeUrl = imagePayload.url;
         generatedImage.encodedImage = imagePayload.encodedImage;
         generatedImage.mimeType = imagePayload.mimeType;
@@ -783,12 +847,33 @@ function sendFlowSubmitProgress(data, socket, phase) {
     }, socket);
 }
 
+function flowUiNeedsUserAction(responseText) {
+    try {
+        const payload = JSON.parse(String(responseText || ""));
+        const message = String(payload && payload.error && payload.error.message || "");
+        const diagnostics = JSON.parse(message.split("; UI: ").pop());
+        const buttons = new Set((diagnostics.buttons || []).map(value => String(value || "").trim()));
+        const dialogs = (diagnostics.dialogs || []).map(value => String(value || "")).join(" ");
+        return (
+            (buttons.has("동의함") && buttons.has("나중에"))
+            || (buttons.has("I agree") && buttons.has("Not now"))
+            || /이 이미지를 사용할 권리|rights to use this image/i.test(dialogs)
+        );
+    } catch (error) {
+        return false;
+    }
+}
+
 async function handleSubmitFlowRequest(data, socket) {
     let newTabId = null;
+    let preserveTabForUserAction = false;
     let progressMonitor = null;
     let hardTimeoutHandle = null;
     let progressPollRunning = false;
     let lastProgressUpdatedAt = 0;
+    let imageValidator = null;
+    let imageValidationRunning = false;
+    let imageValidationClosed = false;
     try {
         const targetUrl = new URL(String(data.url || ""));
         if (
@@ -807,7 +892,7 @@ async function handleSubmitFlowRequest(data, socket) {
         const authCaptureStartedAt = Date.now();
         console.log("[Flow2API] Opening mapped Flow project for browser-side submit...");
         sendFlowSubmitProgress(data, socket, "opening_tab");
-        const newTab = await chrome.tabs.create({ url: flowPageUrl, active: false });
+        const newTab = await chrome.tabs.create({ url: flowPageUrl, active: String(data.action || "").toUpperCase() === "VIDEO_GENERATION" });
         newTabId = newTab.id;
 
         await waitForTabReady(newTabId);
@@ -828,9 +913,17 @@ async function handleSubmitFlowRequest(data, socket) {
 
         let results;
         const usesCurrentFlowUi = (
-            String(data.action || "").trim().toUpperCase() === "IMAGE_GENERATION"
-            && /\/flowMedia:batchGenerateImages$/.test(targetUrl.pathname)
+            (String(data.action || "").trim().toUpperCase() === "IMAGE_GENERATION"
+            && /\/flowMedia:batchGenerateImages$/.test(targetUrl.pathname))
+            || (String(data.action || "").trim().toUpperCase() === "VIDEO_GENERATION"
+            && /\/video:batchAsyncGenerateVideo(?:StartImage|Text)$/.test(targetUrl.pathname))
         );
+        if (usesCurrentFlowUi && String(data.action || "").toUpperCase() === "IMAGE_GENERATION") {
+            const uploads = data.body?.__flow2apiUiContext?.inputUploads || [];
+            const inputs = data.body?.requests?.[0]?.imageInputs || [];
+            if (uploads.length !== inputs.length) throw new Error("Flow reference result validation requires the original reference bytes");
+            imageValidator = createFlowResultValidator(uploads);
+        }
         if (!usesCurrentFlowUi) {
             ignoredFlowAuthorizationTabIds.add(newTabId);
         }
@@ -927,6 +1020,7 @@ async function handleSubmitFlowRequest(data, socket) {
                 };
 
                 const submitImageThroughCurrentFlowUi = async (rawBody) => {
+                    const isVideo = action === "VIDEO_GENERATION";
                     reportProgress("ui_preparing");
                     const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
                     const isVisible = element => {
@@ -947,6 +1041,7 @@ async function handleSubmitFlowRequest(data, socket) {
                         while (Date.now() < deadline) {
                             const value = probe();
                             if (value) return value;
+                            reportProgress(`waiting:${label}`);
                             await pause(200);
                         }
                         throw new Error(`Timed out waiting for ${label}`);
@@ -980,7 +1075,7 @@ async function handleSubmitFlowRequest(data, socket) {
                             );
                             if (parsed.hostname === "flow-content.google") {
                                 const match = parsed.pathname.match(
-                                    /^\/image\/([0-9a-f]{8}-[0-9a-f-]{27,})/i
+                                    /^\/(?:image|video)\/([0-9a-f]{8}-[0-9a-f-]{27,})/i
                                 );
                                 mediaId = match ? match[1] : "";
                             }
@@ -1000,7 +1095,8 @@ async function handleSubmitFlowRequest(data, socket) {
                                 parsed.hostname === "lh3.google.com"
                                 && parsed.pathname.startsWith("/rd-asb/")
                             );
-                            if (!mediaId && !isCurrentFlowAsset) return null;
+                            const isLocalVideoBlob = isVideo && parsed.protocol === "blob:" && parsed.origin === location.origin;
+                            if (!mediaId && !isCurrentFlowAsset && !isLocalVideoBlob) return null;
 
                             const canonicalUrl = parsed.toString().replace(
                                 /=s\d+(?:-[a-z0-9-]+)?(?=$|[?#])/i,
@@ -1017,21 +1113,72 @@ async function handleSubmitFlowRequest(data, socket) {
                     };
                     const currentMediaAssets = () => {
                         const assets = new Map();
-                        document.querySelectorAll("img").forEach(image => {
-                            const asset = mediaAssetFromUrl(image.currentSrc || image.src);
-                            if (asset) assets.set(asset.identity, asset);
+                        document.querySelectorAll(isVideo ? "video" : "img").forEach(image => {
+                            if (!isVideo && (!image.complete || !image.naturalWidth
+                                || image.closest('flow-prompt-box, flow-add-menu-popover-content, [contenteditable="true"]'))) return;
+                            if (isVideo && (!Number.isFinite(image.duration) || image.duration < 7.9)) return;
+                            const asset = mediaAssetFromUrl(image.currentSrc || image.src || image.querySelector("source")?.src);
+                            if (asset) assets.set(asset.identity, isVideo ? { ...asset, duration: image.duration } : asset);
                         });
                         return assets;
                     };
+                    // Read actual generation cards separately from the agent's prose.
+                    const readVideoFailures = () => ({
+                        cards: new Map(Array.from(document.querySelectorAll("flow-error-tile"))
+                            .filter(isVisible).map(element => [element, normalizedText(element.innerText || element.textContent)])),
+                        reports: new Map(Array.from(document.querySelectorAll("flow-a2ui-text"))
+                            .filter(isVisible).map(element => [element, normalizedText(element.innerText || element.textContent)])),
+                    });
+                    const newVideoFailure = (baseline, current) => {
+                        const addedTexts = (before, after) => {
+                            const remaining = new Map();
+                            for (const text of before.values()) remaining.set(text, (remaining.get(text) || 0) + 1);
+                            return Array.from(after.values()).filter(text => {
+                                const count = remaining.get(text) || 0;
+                                if (count) { remaining.set(text, count - 1); return false; }
+                                return Boolean(text);
+                            });
+                        };
+                        for (const text of addedTexts(baseline.cards, current.cards)) {
+                            let code = "flow_video_generation_failed";
+                            let message = "Flow video generation failed; the error card did not specify a cause";
+                            if (/오디오를 생성할 수 없습니다|could(?:n['’]t| not) generate audio|audio generation failed/i.test(text)) {
+                                code = "flow_video_audio_failed";
+                                message = "Flow video audio generation failed";
+                            } else if (/unsafe_generation|safety filters|안전 필터|content policy|정책.*위반/i.test(text)) {
+                                code = "flow_video_policy_rejected";
+                                message = "Flow content policy rejected the video request";
+                            }
+                            return { code, message, source: "flow_error_tile", upstream_message: text.slice(0, 500) };
+                        }
+                        for (const text of addedTexts(baseline.reports, current.reports)) {
+                            if (/flagged by .*safety filters|blocked by .*safety filters|에이전트가 실패|생성할 수 없|unable to generate|couldn['’]t generate|can['’]t (?:create|generate)|not able to generate/i.test(text)) {
+                                return {
+                                    code: "flow_video_agent_reported_failure",
+                                    message: "Flow agent reported a failure; the generation cause is unverified",
+                                    source: "flow_agent_text",
+                                    upstream_message: text.slice(0, 500),
+                                };
+                            }
+                        }
+                        return null;
+                    };
+
                     const countFailureSignals = () => {
                         const text = normalizedText(document.body && document.body.innerText).toLowerCase();
                         const signals = [
                             "이미지를 생성할 수 없습니다",
+                            "영상을 생성할 수 없습니다",
+                            "오디오를 생성할 수 없습니다",
+                            "couldn't generate audio",
+                            "audio generation failed",
                             "unable to generate",
                             "couldn't generate",
                             "can't create",
                             "not able to generate",
                             "content policy",
+                            "safety filters",
+                            "안전 필터",
                             "에이전트가 실패했습니다",
                             "agent failed",
                         ];
@@ -1046,10 +1193,34 @@ async function handleSubmitFlowRequest(data, socket) {
                         }, 0);
                     };
 
+                    const imageGenerationIsActive = () => Array.from(document.querySelectorAll("button"))
+                        .filter(isVisible)
+                        .some(button => {
+                            const label = normalizedText([
+                                button.getAttribute("aria-label"),
+                                button.getAttribute("title"),
+                                button.textContent,
+                            ].filter(Boolean).join(" ")).toLowerCase();
+                            const icons = Array.from(button.querySelectorAll("mat-icon, i"))
+                                .map(icon => normalizedText(icon.textContent).toLowerCase());
+                            return icons.includes("stop")
+                                || /initiating image generation|generating (?:an )?image|이미지 생성 (?:시작|중)|이미지를 생성 중/.test(label);
+                        });
+
+                    const nextImageFailurePollCount = (hasNewFailure, generationActive, previousCount) => (
+                        hasNewFailure && !generationActive ? previousCount + 1 : 0
+                    );
+
                     const requests = Array.isArray(rawBody && rawBody.requests)
                         ? rawBody.requests
                         : [];
-                    const imageRequest = requests[0] || {};
+                    const rawRequest = requests[0] || {};
+                    const imageRequest = isVideo ? {
+                        ...rawRequest,
+                        structuredPrompt: rawRequest.textInput?.structuredPrompt,
+                        imageAspectRatio: String(rawRequest.aspectRatio || "").replace("VIDEO_", "IMAGE_"),
+                        imageInputs: rawRequest.startImage ? [rawRequest.startImage] : [],
+                    } : rawRequest;
                     const promptParts = imageRequest.structuredPrompt
                         && Array.isArray(imageRequest.structuredPrompt.parts)
                         ? imageRequest.structuredPrompt.parts
@@ -1059,7 +1230,7 @@ async function handleSubmitFlowRequest(data, socket) {
                         .filter(Boolean)
                         .join("\n");
                     if (!prompt) {
-                        throw new Error("Flow UI image fallback requires a prompt");
+                        throw new Error("Flow UI generation requires a prompt");
                     }
 
                     const aspectLabels = {
@@ -1077,7 +1248,7 @@ async function handleSubmitFlowRequest(data, socket) {
                         HARBOR_SEAL: "Nano Banana 2 Lite",
                     };
                     const requestedAspect = aspectLabels[imageRequest.imageAspectRatio] || "";
-                    const requestedModel = modelLabels[imageRequest.imageModelName] || "Nano Banana 2";
+                    const requestedModel = isVideo ? "Veo 3.1 Fast" : modelLabels[imageRequest.imageModelName] || "Nano Banana 2";
                     const privateUiContext = rawBody && rawBody.__flow2apiUiContext || {};
                     const inputFileNames = Array.isArray(privateUiContext.inputFileNames)
                         ? privateUiContext.inputFileNames.map(normalizedText).filter(Boolean)
@@ -1101,7 +1272,7 @@ async function handleSubmitFlowRequest(data, socket) {
                     // The current flow.google.com editor keeps image defaults in
                     // a sticky settings panel. Align them before submitting so
                     // the browser fallback preserves the API request semantics.
-                    try {
+                    if (!isVideo) try {
                         const settingsTrigger = await waitFor(
                             () => {
                                 const legacy = document.querySelector(".settings-trigger-button");
@@ -1200,11 +1371,6 @@ async function handleSubmitFlowRequest(data, socket) {
                         }
 
                         const picker = await openAssetPicker();
-                        const baselineAssets = new Set(
-                            Array.from(picker.querySelectorAll('button.asset-item[role="option"] img'))
-                                .map(image => String(image.currentSrc || image.src || "").trim())
-                                .filter(Boolean)
-                        );
                         const uploadButton = await waitFor(
                             () => {
                                 const legacy = picker.querySelector(".sidebar-upload-btn");
@@ -1243,6 +1409,22 @@ async function handleSubmitFlowRequest(data, socket) {
                         }
                         try {
                             clickElement(uploadButton);
+                            const uploadGate = await waitFor(() => {
+                                const dialog = Array.from(document.querySelectorAll('[role="dialog"], mat-dialog-container'))
+                                    .find(element => isVisible(element) && /이 이미지를 사용할 권리|rights to use this image/i.test(normalizedText(element.textContent)));
+                                if (dialog) return { dialog };
+                                return capturedInput ? { input: capturedInput } : null;
+                            }, 6000, "Flow upload permission or file input");
+                            if (uploadGate.dialog) {
+                                if (upload.rightsConfirmed !== true) {
+                                    throw new Error("Flow image rights confirmation is required for this reference image");
+                                }
+                                const agree = Array.from(uploadGate.dialog.querySelectorAll("button"))
+                                    .find(button => isVisible(button) && /^(동의|agree|i agree)$/i.test(normalizedText(button.textContent)));
+                                if (!agree) throw new Error("Flow image rights confirmation button is unavailable");
+                                clickElement(agree);
+                                await waitFor(() => capturedInput, 6000, "Flow approved upload file input");
+                            }
                             await pause(150);
                         } finally {
                             HTMLInputElement.prototype.click = originalInputClick;
@@ -1278,8 +1460,22 @@ async function handleSubmitFlowRequest(data, socket) {
                         fileInput.dispatchEvent(new Event("input", { bubbles: true }));
                         fileInput.dispatchEvent(new Event("change", { bubbles: true }));
 
+                        const uploadSearch = picker.querySelector('input[type="text"]');
+                        if (uploadSearch) {
+                            setInputValue(uploadSearch, fileName);
+                            await pause(500);
+                        }
                         const uploadResult = await waitFor(
                             () => {
+                                const rightsDialog = Array.from(document.querySelectorAll('[role="dialog"], mat-dialog-container'))
+                                    .find(element => isVisible(element) && /이 이미지를 사용할 권리|rights to use this image/i.test(normalizedText(element.textContent)));
+                                if (rightsDialog) {
+                                    if (upload.rightsConfirmed !== true) throw new Error("Flow image rights confirmation is required for this reference image");
+                                    const agree = Array.from(rightsDialog.querySelectorAll("button"))
+                                        .find(button => isVisible(button) && /^(동의|agree|i agree)$/i.test(normalizedText(button.textContent)));
+                                    if (agree && !agree.disabled) clickElement(agree);
+                                    return null;
+                                }
                                 if (!isVisible(picker)) return { attached: true, option: null };
                                 const options = Array.from(
                                     picker.querySelectorAll('button.asset-item[role="option"]')
@@ -1288,12 +1484,7 @@ async function handleSubmitFlowRequest(data, socket) {
                                     normalizedText(option.textContent).includes(fileName)
                                 );
                                 if (byName) return { attached: false, option: byName };
-                                const fresh = options.find(option => {
-                                    const image = option.querySelector("img");
-                                    const source = String(image && (image.currentSrc || image.src) || "").trim();
-                                    return source && !baselineAssets.has(source);
-                                });
-                                return fresh ? { attached: false, option: fresh } : null;
+                                return null;
                             },
                             45000,
                             `Flow native upload ${fileName}`
@@ -1317,6 +1508,59 @@ async function handleSubmitFlowRequest(data, socket) {
                         await pause(500);
                     };
 
+                    const findGenerationApproval = () => {
+                        const candidates = document.querySelectorAll('button, [role="radio"], input[type="radio"]');
+                        for (const candidate of candidates) {
+                            if (candidate.disabled || candidate.getAttribute("aria-disabled") === "true"
+                                || candidate.checked || candidate.getAttribute("aria-checked") === "true") continue;
+                            const associatedLabel = candidate.labels && candidate.labels[0];
+                            const target = isVisible(candidate) ? candidate : associatedLabel;
+                            if (!target || !isVisible(target)) continue;
+                            const label = (associatedLabel || candidate).cloneNode(true);
+                            label.querySelectorAll('mat-icon, i, svg, [aria-hidden="true"]').forEach(icon => icon.remove());
+                            const text = normalizedText(candidate.getAttribute("aria-label") || label.textContent).toLowerCase();
+                            // Video permission is one generation only. Never select always-approve.
+                            if (isVideo ? /^(approve|승인)$/.test(text)
+                                : /^(approve|confirm|create|generate|yes,? create|yes,? generate|승인|확인|생성|만들기)$/.test(text)) return target;
+                        }
+                        return null;
+                    };
+
+                    const directive = [
+                        isVideo ? `Create exactly one 8-second video${requestedInputs.length ? " using the attached product reference as the actual first frame and image input; inspect that image and preserve its exact appearance rather than choosing another project asset" : ""}. ${prompt}` : `Make me exactly one picture of ${prompt}`,
+                        requestedAspect ? `in a ${requestedAspect} aspect ratio` : "",
+                        requestedModel ? `using ${requestedModel}` : "",
+                    ].filter(Boolean).join(" ") + ".";
+                    const composer = await waitFor(
+                        () => Array.from(document.querySelectorAll('[contenteditable="true"]'))
+                            .find(isVisible),
+                        8000,
+                        "Flow prompt composer"
+                    );
+                    reportProgress("composer_ready");
+                    composer.focus();
+                    let inserted = false;
+                    if (typeof document.execCommand === "function") {
+                        const selection = getSelection();
+                        const range = document.createRange();
+                        range.selectNodeContents(composer);
+                        selection.removeAllRanges();
+                        selection.addRange(range);
+                        document.execCommand("delete", false, null);
+                        inserted = document.execCommand("insertText", false, directive);
+                    }
+                    if (!inserted) {
+                        const paragraph = document.createElement("p");
+                        paragraph.textContent = directive;
+                        composer.replaceChildren(paragraph);
+                        composer.dispatchEvent(new InputEvent("input", {
+                            bubbles: true,
+                            inputType: "insertText",
+                            data: directive,
+                        }));
+                    }
+
+                    // Finish clearing old text BEFORE attaching rich-text media references.
                     for (const upload of inputUploads) {
                         await attachNativeUpload(upload);
                     }
@@ -1351,41 +1595,8 @@ async function handleSubmitFlowRequest(data, socket) {
                     await pause(700);
                     const secondBaseline = currentMediaAssets();
                     const baselineIds = new Set([...firstBaseline.keys(), ...secondBaseline.keys()]);
-                    const baselineFailureCount = countFailureSignals();
-
-                    const directive = [
-                        `Make me exactly one picture of ${prompt}`,
-                        requestedAspect ? `in a ${requestedAspect} aspect ratio` : "",
-                        requestedModel ? `using ${requestedModel}` : "",
-                    ].filter(Boolean).join(" ") + ".";
-                    const composer = await waitFor(
-                        () => Array.from(document.querySelectorAll('[contenteditable="true"]'))
-                            .find(isVisible),
-                        8000,
-                        "Flow prompt composer"
-                    );
-                    reportProgress("composer_ready");
-                    composer.focus();
-                    let inserted = false;
-                    if (typeof document.execCommand === "function") {
-                        const selection = getSelection();
-                        const range = document.createRange();
-                        range.selectNodeContents(composer);
-                        selection.removeAllRanges();
-                        selection.addRange(range);
-                        document.execCommand("delete", false, null);
-                        inserted = document.execCommand("insertText", false, directive);
-                    }
-                    if (!inserted) {
-                        const paragraph = document.createElement("p");
-                        paragraph.textContent = directive;
-                        composer.replaceChildren(paragraph);
-                        composer.dispatchEvent(new InputEvent("input", {
-                            bubbles: true,
-                            inputType: "insertText",
-                            data: directive,
-                        }));
-                    }
+                    const baselineFailureCount = isVideo ? 0 : countFailureSignals();
+                    const videoFailureBaseline = isVideo ? readVideoFailures() : null;
 
                     const submitButton = await waitFor(
                         () => {
@@ -1401,21 +1612,19 @@ async function handleSubmitFlowRequest(data, socket) {
                     clickElement(submitButton);
                     reportProgress("submitted");
 
-                    const uiTimeoutMs = Math.min(240000, Math.max(180000, timeoutMs));
+                    const uiTimeoutMs = isVideo ? Math.min(360000, Math.max(240000, timeoutMs)) : Math.min(240000, Math.max(180000, timeoutMs));
                     const deadline = Date.now() + uiTimeoutMs;
                     let stableIds = "";
                     let stablePolls = 0;
+                    let imageFailurePolls = 0;
                     let confirmationClicked = false;
+                    window.__FLOW2API_IMAGE_CANDIDATES__ = null;
+                    window.__FLOW2API_IMAGE_VERDICT__ = null;
                     while (Date.now() < deadline) {
                         await pause(700);
                         reportProgress("generating");
                         if (!confirmationClicked) {
-                            const confirmation = Array.from(document.querySelectorAll("button"))
-                                .find(button => {
-                                    if (!isVisible(button) || button.disabled) return false;
-                                    const text = normalizedText(button.textContent).toLowerCase();
-                                    return /^(confirm|create|generate|yes,? create|yes,? generate|확인|생성|만들기)$/.test(text);
-                                });
+                            const confirmation = findGenerationApproval();
                             if (confirmation) {
                                 clickElement(confirmation);
                                 confirmationClicked = true;
@@ -1425,16 +1634,57 @@ async function handleSubmitFlowRequest(data, socket) {
                         const assets = currentMediaAssets();
                         const fresh = Array.from(assets.values())
                             .filter(asset => !baselineIds.has(asset.identity));
-                        if (fresh.length) {
+                        if (fresh.length && (isVideo || !imageGenerationIsActive())) {
                             const ids = fresh.map(asset => asset.identity).sort().join(",");
                             stablePolls = ids === stableIds ? stablePolls + 1 : 1;
                             stableIds = ids;
                             if (stablePolls >= 3) {
-                                reportProgress("image_ready");
+                                let validatedImage = null;
+                                if (!isVideo) {
+                                    const verdict = window.__FLOW2API_IMAGE_VERDICT__;
+                                    if (verdict?.request_id === requestId) {
+                                        if (verdict.status === "error") throw new Error("Flow reference result validation failed; no image was accepted");
+                                        if (verdict.status === "reference") baselineIds.add(verdict.identity);
+                                        if (verdict.status === "accepted") validatedImage = fresh.find(asset => asset.identity === verdict.identity && asset.url === verdict.url);
+                                    }
+                                    window.__FLOW2API_IMAGE_CANDIDATES__ = {
+                                        request_id: requestId,
+                                        assets: fresh.filter(asset => !baselineIds.has(asset.identity)).slice(0, 16),
+                                    };
+                                    if (!validatedImage) continue;
+                                }
+                                reportProgress(isVideo ? "video_ready" : "image_ready");
+                                if (isVideo) {
+                                    const asset = fresh[0];
+                                    const response = await fetch(asset.url, { credentials: "include" });
+                                    if (!response.ok) throw new Error(`Generated video download failed (${response.status})`);
+                                    const bytes = new Uint8Array(await response.arrayBuffer());
+                                    if (bytes.length < 12 || bytes.length > 10 * 1024 * 1024
+                                        || String.fromCharCode(...bytes.subarray(4, 8)) !== "ftyp") {
+                                        throw new Error("Generated video is not a supported MP4 or exceeds 10MB");
+                                    }
+                                    let binary = "";
+                                    for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+                                        binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+                                    }
+                                    return {
+                                        http_status: 200,
+                                        response_text: JSON.stringify({
+                                            media: [{
+                                                name: asset.mediaId || `flow-ui-${crypto.randomUUID()}`,
+                                                status: "MEDIA_GENERATION_STATUS_SUCCESSFUL",
+                                                video: { generatedVideo: { encodedVideo: btoa(binary), aspectRatio: rawRequest.aspectRatio, model: rawRequest.videoModelKey, duration: `${asset.duration}s` } },
+                                            }],
+                                            flow2apiTransport: "flow_google_video_ui",
+                                        }),
+                                        response_headers: { "content-type": "application/json" },
+                                        fingerprint: browserFingerprint(),
+                                    };
+                                }
                                 return {
                                     http_status: 200,
                                     response_text: JSON.stringify({
-                                        media: fresh.slice(0, 1).map(asset => ({
+                                        media: [validatedImage].map(asset => ({
                                             name: asset.mediaId || "",
                                             image: {
                                                 generatedImage: {
@@ -1453,9 +1703,31 @@ async function handleSubmitFlowRequest(data, socket) {
                                     fingerprint: browserFingerprint(),
                                 };
                             }
+                        } else {
+                            stableIds = "";
+                            stablePolls = 0;
+                            if (!isVideo) window.__FLOW2API_IMAGE_CANDIDATES__ = null;
                         }
-                        if (countFailureSignals() > baselineFailureCount) {
-                            throw new Error("Flow agent reported that it could not generate the image");
+                        if (isVideo) {
+                            const failure = newVideoFailure(videoFailureBaseline, readVideoFailures());
+                            if (failure) {
+                                const error = new Error(failure.message);
+                                error.flowVideoFailure = failure;
+                                throw error;
+                            }
+                        } else {
+                            imageFailurePolls = nextImageFailurePollCount(
+                                countFailureSignals() > baselineFailureCount,
+                                imageGenerationIsActive(),
+                                imageFailurePolls,
+                            );
+                            // Flow can briefly add failure-like agent prose while it is
+                            // still retrying internally. Only treat it as terminal after
+                            // the active generation control has disappeared and the same
+                            // signal remains visible across several polls.
+                            if (imageFailurePolls >= 5) {
+                                throw new Error("Flow agent reported that it could not generate the image");
+                            }
                         }
                     }
                     throw new Error("Timed out waiting for the image generated by the Flow UI");
@@ -1463,12 +1735,40 @@ async function handleSubmitFlowRequest(data, socket) {
 
                 const parsedRequestUrl = new URL(requestUrl);
                 if (
-                    action === "IMAGE_GENERATION"
-                    && /\/flowMedia:batchGenerateImages$/.test(parsedRequestUrl.pathname)
+                    (action === "IMAGE_GENERATION"
+                    && /\/flowMedia:batchGenerateImages$/.test(parsedRequestUrl.pathname))
+                    || (action === "VIDEO_GENERATION"
+                    && /\/video:batchAsyncGenerateVideo(?:StartImage|Text)$/.test(parsedRequestUrl.pathname))
                 ) {
                     window.__FLOW2API_BROWSER_SUBMIT_ACTIVE__ = true;
                     try {
                         return await submitImageThroughCurrentFlowUi(requestBody || {});
+                    } catch (error) {
+                        // Chrome may serialize rejected injected promises as an empty
+                        // result. Return the actual UI failure inside the page instead.
+                        if (error.flowVideoFailure) {
+                            return {
+                                http_status: 502,
+                                response_text: JSON.stringify({ error: error.flowVideoFailure }),
+                                response_headers: { "content-type": "application/json" },
+                                fingerprint: browserFingerprint(),
+                            };
+                        }
+                        const visible = element => Boolean(element.getBoundingClientRect().width && element.getBoundingClientRect().height);
+                        const dialogs = Array.from(document.querySelectorAll('[role="dialog"], mat-dialog-container'))
+                            .filter(visible).map(element => String(element.textContent || "").replace(/\s+/g, " ").trim().slice(0, 400));
+                        const buttons = Array.from(document.querySelectorAll("button"))
+                            .filter(visible).map(element => String(element.textContent || element.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim())
+                            .filter(Boolean).slice(-16);
+                        const pageText = String(document.body && document.body.innerText || "")
+                            .replace(/\s+/g, " ").trim().slice(0, 1200);
+                        const projectUnavailable = /프로젝트를 찾을 수 없|project not found|couldn't find this project|cannot find this project/i.test(pageText);
+                        return {
+                            http_status: 502,
+                            response_text: JSON.stringify({ error: { message: String(error.message || error) + "; UI: " + JSON.stringify({ dialogs, buttons, projectUnavailable }) } }),
+                            response_headers: { "content-type": "application/json" },
+                            fingerprint: browserFingerprint(),
+                        };
                     } finally {
                         window.__FLOW2API_BROWSER_SUBMIT_ACTIVE__ = false;
                     }
@@ -1575,6 +1875,8 @@ async function handleSubmitFlowRequest(data, socket) {
                                 return {
                                     phase: String(progress.phase || "active").slice(0, 64),
                                     updated_at: Number(progress.updated_at || 0),
+                                    imageCandidates: window.__FLOW2API_IMAGE_CANDIDATES__?.request_id === requestId
+                                        ? window.__FLOW2API_IMAGE_CANDIDATES__.assets : [],
                                 };
                             },
                             args: [String(data.req_id || "")],
@@ -1584,6 +1886,33 @@ async function handleSubmitFlowRequest(data, socket) {
                         if (updatedAt > lastProgressUpdatedAt) {
                             lastProgressUpdatedAt = updatedAt;
                             sendFlowSubmitProgress(data, socket, progress.phase);
+                        }
+                        if (imageValidator && !imageValidationRunning && !imageValidationClosed
+                            && Array.isArray(progress?.imageCandidates) && progress.imageCandidates.length) {
+                            imageValidationRunning = true;
+                            // Downloads/decoding can outlast the watchdog interval. Keep
+                            // progress polling independent of this bounded validation task.
+                            void (async () => {
+                                for (const candidate of progress.imageCandidates.slice(0, 16)) {
+                                    if (imageValidationClosed) return;
+                                    const verdict = await imageValidator.check(candidate);
+                                    if (imageValidationClosed) return;
+                                    await chrome.scripting.executeScript({
+                                        target: { tabId: newTabId },
+                                        world: "MAIN",
+                                        func: (requestId, value) => {
+                                            if (window.__FLOW2API_BROWSER_SUBMIT_PROGRESS__?.request_id === requestId) {
+                                                window.__FLOW2API_IMAGE_VERDICT__ = { request_id: requestId, ...value };
+                                            }
+                                        },
+                                        args: [String(data.req_id || ""), verdict],
+                                    });
+                                    if (verdict.status !== "reference") break;
+                                }
+                            })().catch(() => {
+                                // Navigation/teardown closes the request; the hard deadline
+                                // still bounds a live page that cannot receive the verdict.
+                            }).finally(() => { imageValidationRunning = false; });
                         }
                     } catch (error) {
                         // A navigation or destroyed execution context intentionally
@@ -1608,6 +1937,7 @@ async function handleSubmitFlowRequest(data, socket) {
             });
             results = await Promise.race([executionPromise, hardTimeoutPromise]);
         } finally {
+            imageValidationClosed = true;
             if (progressMonitor) clearInterval(progressMonitor);
             if (hardTimeoutHandle) clearTimeout(hardTimeoutHandle);
             if (!usesCurrentFlowUi) {
@@ -1627,8 +1957,20 @@ async function handleSubmitFlowRequest(data, socket) {
             throw new Error("Flow browser submit returned no HTTP response");
         }
         let responseText = result.response_text || "";
+        if (
+            usesCurrentFlowUi
+            && result.http_status >= 400
+            && flowUiNeedsUserAction(responseText)
+        ) {
+            preserveTabForUserAction = true;
+            try {
+                await chrome.tabs.update(newTabId, { active: true });
+            } catch (focusError) {
+                console.warn("[Flow2API] Could not reveal the Flow tab requiring user action:", focusError);
+            }
+        }
         if (result.http_status >= 200 && result.http_status < 300) {
-            responseText = await embedCurrentFlowImages(responseText);
+            responseText = await embedCurrentFlowImages(responseText, imageValidator?.accepted);
         }
         sendSocketMessage({
             req_id: data.req_id,
@@ -1649,7 +1991,7 @@ async function handleSubmitFlowRequest(data, socket) {
             console.error("[Flow2API] Could not return Flow submit error:", socketError);
         }
     } finally {
-        if (newTabId) {
+        if (newTabId && !preserveTabForUserAction) {
             try {
                 await chrome.tabs.remove(newTabId);
                 console.log("[Flow2API] Closed temporary Flow submit tab.");
