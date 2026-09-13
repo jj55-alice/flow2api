@@ -559,6 +559,30 @@ class Config:
             return 95.0
 
     @property
+    def extension_image_result_timeout_seconds(self) -> float:
+        """生成按钮停止后等待新图片出现在 Flow 页面上的最长时间。"""
+        value = self._config.get("captcha", {}).get(
+            "extension_image_result_timeout_seconds",
+            30.0,
+        )
+        try:
+            return max(5.0, min(120.0, float(value)))
+        except Exception:
+            return 30.0
+
+    @property
+    def extension_image_total_timeout_seconds(self) -> float:
+        """扩展图片生成与账号切换的总时间预算，需低于常见 300 秒网关限制。"""
+        value = self._config.get("captcha", {}).get(
+            "extension_image_total_timeout_seconds",
+            270.0,
+        )
+        try:
+            return max(60.0, min(285.0, float(value)))
+        except Exception:
+            return 270.0
+
+    @property
     def extension_stall_cooldown_seconds(self) -> int:
         """卡死的扩展账号在重新参与图片调度前的冷却时间。"""
         value = self._config.get("captcha", {}).get("extension_stall_cooldown_seconds", 120)

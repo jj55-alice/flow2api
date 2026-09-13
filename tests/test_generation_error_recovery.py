@@ -1,7 +1,8 @@
+import asyncio
 import json
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.core.config import config
 from src.services.browser_captcha_extension import ExtensionCaptchaError
@@ -30,6 +31,28 @@ class GenerationErrorRecoveryTests(unittest.TestCase):
         self.assertTrue(
             self.handler._should_count_token_error("HTTP 401 UNAUTHENTICATED")
         )
+
+
+class ImageTotalBudgetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_extension_image_generation_stops_before_client_gateway_timeout(self):
+        handler = object.__new__(GenerationHandler)
+
+        async def stuck_generation():
+            await asyncio.sleep(1)
+            yield {"unexpected": True}
+
+        with patch("src.services.generation_handler.config") as mocked_config:
+            mocked_config.extension_image_total_timeout_seconds = 0.01
+            with self.assertRaises(ExtensionCaptchaError) as caught:
+                _ = [
+                    chunk
+                    async for chunk in handler._bounded_extension_image_generation(
+                        stuck_generation()
+                    )
+                ]
+
+        self.assertEqual(caught.exception.code, "extension_flow_timeout")
+        self.assertIn("total limit", str(caught.exception))
 
 
 class FlowUiDiagnosticsTests(unittest.TestCase):

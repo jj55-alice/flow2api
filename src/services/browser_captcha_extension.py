@@ -776,9 +776,15 @@ class ExtensionCaptchaService:
             hard_remaining = hard_deadline - now
             heartbeat_timeout = max(stall_timeout, preparation_timeout) if last_phase == "ui_preparing" else stall_timeout
             stall_remaining = heartbeat_timeout - (now - last_activity_at)
+            phase_timeout = float(max_phase_duration)
+            if last_phase == "waiting_for_result" and phase_timeout > 0:
+                phase_timeout = min(
+                    phase_timeout,
+                    config.extension_image_result_timeout_seconds,
+                )
             phase_remaining = (
-                float(max_phase_duration) - (now - phase_started_at)
-                if max_phase_duration > 0
+                phase_timeout - (now - phase_started_at)
+                if phase_timeout > 0
                 else hard_remaining
             )
             if hard_remaining <= 0:
@@ -789,7 +795,7 @@ class ExtensionCaptchaService:
             if phase_remaining <= 0:
                 raise ExtensionCaptchaError(
                     f"Chrome extension Flow phase '{last_phase}' did not change for "
-                    f"{float(max_phase_duration):.1f}s",
+                    f"{phase_timeout:.1f}s",
                     code="extension_flow_stalled",
                 )
             if stall_remaining <= 0:

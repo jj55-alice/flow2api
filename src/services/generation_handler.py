@@ -1553,14 +1553,17 @@ class GenerationHandler:
             generation_pipeline_started_at = time.time()
             if generation_type == "image":
                 debug_logger.log_info(f"[GENERATION] 开始图片生成流程...")
-                async for chunk in self._handle_image_generation(
+                image_chunks = self._handle_image_generation(
                     token, project_id, model_config, model, prompt, images, stream,
                     perf_trace=perf_trace,
                     generation_result=generation_result,
                     response_state=response_state,
                     request_log_state=request_log_state,
                     pending_token_state=pending_token_state
-                ):
+                )
+                if config.captcha_method == "extension":
+                    image_chunks = self._bounded_extension_image_generation(image_chunks)
+                async for chunk in image_chunks:
                     yield chunk
                 token = pending_token_state.get("token") or token
                 token_attempt_started_at = (
@@ -1849,6 +1852,22 @@ class GenerationHandler:
             return 503, "captcha_token_unavailable"
         return 500, "generation_failed"
 
+    async def _bounded_extension_image_generation(
+        self,
+        chunks: AsyncGenerator,
+    ) -> AsyncGenerator:
+        """Keep the complete browser failover chain inside client gateway limits."""
+        timeout = config.extension_image_total_timeout_seconds
+        try:
+            async with asyncio.timeout(timeout):
+                async for chunk in chunks:
+                    yield chunk
+        except asyncio.TimeoutError as exc:
+            raise ExtensionCaptchaError(
+                f"Chrome extension image generation exceeded the {timeout:.0f}s total limit",
+                code="extension_flow_timeout",
+            ) from exc
+
     async def _handle_image_generation(
         self,
         token,
@@ -1868,6 +1887,8 @@ class GenerationHandler:
 
         if response_state is None:
             response_state = self._create_response_state()
+
+        transport_started_at = time.monotonic()
 
         image_trace: Optional[Dict[str, Any]] = None
         if isinstance(perf_trace, dict):
@@ -2015,6 +2036,18 @@ class GenerationHandler:
                             or slow_failure_count < max_route_attempts
                         )
                     )
+                    if can_fail_over and error_code in slow_failure_codes:
+                        remaining_budget = (
+                            config.extension_image_total_timeout_seconds
+                            - (time.monotonic() - transport_started_at)
+                        )
+                        retry_budget = (
+                            config.extension_image_phase_timeout_seconds
+                            + config.extension_image_result_timeout_seconds
+                            + 15.0
+                        )
+                        if remaining_budget < retry_budget:
+                            can_fail_over = False
                     if not can_fail_over:
                         raise
 

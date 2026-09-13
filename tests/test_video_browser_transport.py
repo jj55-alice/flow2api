@@ -139,6 +139,21 @@ class NativeVideoUploadTimeoutTests(unittest.IsolatedAsyncioTestCase):
     await service._wait_for_flow_submit_result(future=future,req_id='r1',timeout=180,supports_progress=True,max_phase_duration=120)
   self.assertEqual(caught.exception.code,'extension_flow_stalled')
 
+ async def test_image_waiting_for_result_uses_shorter_phase_limit(self):
+  import asyncio
+  from src.services.browser_captcha_extension import ExtensionCaptchaService, ExtensionCaptchaError
+  service=ExtensionCaptchaService(None)
+  service._pending_flow_activity['r1']=(100,'waiting_for_result',100)
+  future=asyncio.get_running_loop().create_future()
+  with patch('src.services.browser_captcha_extension.config') as config, patch('src.services.browser_captcha_extension.time') as clock:
+   clock.monotonic.side_effect=[131,131]
+   config.extension_progress_stall_timeout_seconds=60
+   config.extension_image_result_timeout_seconds=30
+   with self.assertRaises(ExtensionCaptchaError) as caught:
+    await service._wait_for_flow_submit_result(future=future,req_id='r1',timeout=180,supports_progress=True,max_phase_duration=95)
+  self.assertEqual(caught.exception.code,'extension_flow_stalled')
+  self.assertIn('30.0s',str(caught.exception))
+
 class VideoOnboardingTests(unittest.TestCase):
  def test_onboarding_is_reported_without_accepting_or_blocking_image_connections(self):
   from src.services.browser_captcha_extension import ExtensionCaptchaService, ExtensionCaptchaError
