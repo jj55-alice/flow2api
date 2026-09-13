@@ -343,6 +343,38 @@ function buildFlowPageUrl(projectId = "") {
         : FLOW_ROOT_URL;
 }
 
+function flowProjectIdFromUrl(rawUrl) {
+    try {
+        const parsed = new URL(String(rawUrl || ""));
+        if (parsed.origin !== FLOW_ROOT_URL) return "";
+        const match = parsed.pathname.match(/(?:^|\/)project\/([^/?#]+)/);
+        const projectId = match ? decodeURIComponent(match[1]) : "";
+        return /^[A-Za-z0-9_-]{8,128}$/.test(projectId) ? projectId : "";
+    } catch (_) {
+        return "";
+    }
+}
+
+function findOpenFlowProjectTab() {
+    return new Promise((resolve) => {
+        chrome.tabs.query({ url: `${FLOW_ROOT_URL}/*` }, (tabs) => {
+            if (chrome.runtime.lastError || !Array.isArray(tabs)) {
+                resolve(null);
+                return;
+            }
+            const projectTabs = tabs
+                .filter(tab => Number.isInteger(tab.id) && flowProjectIdFromUrl(tab.url))
+                .sort((left, right) => {
+                    if (Boolean(left.active) !== Boolean(right.active)) {
+                        return left.active ? -1 : 1;
+                    }
+                    return Number(right.lastAccessed || 0) - Number(left.lastAccessed || 0);
+                });
+            resolve(projectTabs[0] || null);
+        });
+    });
+}
+
 function ensureReconnectAlarm() {
     chrome.alarms.create(RECONNECT_ALARM_NAME, {
         periodInMinutes: RECONNECT_ALARM_PERIOD_MINUTES
@@ -750,25 +782,38 @@ async function embedCurrentFlowImages(responseText, acceptedImages = new Map()) 
 }
 
 async function handleGetSessionCookie(data, socket) {
-    let newTabId = null;
+    let authTabId = null;
+    let closeAuthTab = false;
     try {
         const projectId = String(data.project_id || "").trim();
+        let observedProjectId = projectId;
         const authCaptureStartedAt = Date.now();
         let pageAuthContext = { auth_user: "0", api_key: "" };
-        if (projectId) {
+
+        if (!projectId) {
+            const openProjectTab = await findOpenFlowProjectTab();
+            if (openProjectTab) {
+                authTabId = openProjectTab.id;
+                observedProjectId = flowProjectIdFromUrl(openProjectTab.url);
+            }
+        }
+
+        if (!authTabId) {
             const newTab = await chrome.tabs.create({
                 url: buildFlowPageUrl(projectId),
                 active: false,
             });
-            newTabId = newTab.id;
-            await waitForTabReady(newTabId);
-            pageAuthContext = await readFlowPageAuthContext(newTabId);
+            authTabId = newTab.id;
+            closeAuthTab = true;
         }
+        await waitForTabReady(authTabId);
+        pageAuthContext = await readFlowPageAuthContext(authTabId);
 
-        let requestAuthorization = projectId
-            ? await waitForRecentFlowRequestAuthorization(authCaptureStartedAt, 3000)
-            : null;
-        if (!requestAuthorization && !projectId) {
+        let requestAuthorization = await waitForRecentFlowRequestAuthorization(
+            authCaptureStartedAt,
+            3000
+        );
+        if (!requestAuthorization) {
             requestAuthorization = await getRecentFlowRequestAuthorization();
         }
         const observedBearer = accessTokenFromAuthorization(
@@ -777,21 +822,21 @@ async function handleGetSessionCookie(data, socket) {
         let capturedAuth = observedBearer
             ? { access_token: observedBearer, captured_at: requestAuthorization.seen_at }
             : (!requestAuthorization ? await getRecentFlowAccessToken() : null);
-        if (!capturedAuth && !requestAuthorization && projectId) {
+        if (!capturedAuth && !requestAuthorization && authTabId) {
             capturedAuth = await waitForRecentFlowAccessToken(1000);
         }
-        const cookieAuthorization = !capturedAuth && newTabId
+        const cookieAuthorization = !capturedAuth && authTabId
             ? (
                 requestAuthorization && requestAuthorization.authorization ||
                 await buildGoogleCookieAuthorization(FLOW_ROOT_URL)
             )
             : "";
-        const browserAuth = !capturedAuth && newTabId
+        const browserAuth = !capturedAuth && authTabId
             ? await (async () => {
-                ignoredFlowAuthorizationTabIds.add(newTabId);
+                ignoredFlowAuthorizationTabIds.add(authTabId);
                 try {
                     return await probeBrowserFlowAuthentication(
-                        newTabId,
+                        authTabId,
                         cookieAuthorization,
                         requestAuthorization && requestAuthorization.auth_user
                             || pageAuthContext.auth_user,
@@ -799,7 +844,7 @@ async function handleGetSessionCookie(data, socket) {
                             || pageAuthContext.api_key
                     );
                 } finally {
-                    ignoredFlowAuthorizationTabIds.delete(newTabId);
+                    ignoredFlowAuthorizationTabIds.delete(authTabId);
                 }
             })()
             : null;
@@ -823,6 +868,7 @@ async function handleGetSessionCookie(data, socket) {
                 observed_auth_scheme: String(authObservation.auth_scheme || "none").slice(0, 32),
                 observed_auth_at: Number(authObservation.seen_at || 0) || null,
                 observed_api_key: Boolean(authObservation.api_key || pageAuthContext.api_key),
+                project_id: observedProjectId,
                 credits: browserAuthValid ? browserAuth.credits : null,
                 user_paygate_tier: browserAuthValid ? browserAuth.user_paygate_tier : "",
             }, socket);
@@ -835,6 +881,7 @@ async function handleGetSessionCookie(data, socket) {
                 observed_auth_scheme: String(authObservation.auth_scheme || "none").slice(0, 32),
                 observed_auth_at: Number(authObservation.seen_at || 0) || null,
                 observed_api_key: Boolean(authObservation.api_key || pageAuthContext.api_key),
+                project_id: observedProjectId,
             }, socket);
         }
     } catch (err) {
@@ -844,9 +891,9 @@ async function handleGetSessionCookie(data, socket) {
             error: err.message || "세션 쿠키 읽기 실패"
         }, socket);
     } finally {
-        if (newTabId) {
+        if (authTabId && closeAuthTab) {
             try {
-                await chrome.tabs.remove(newTabId);
+                await chrome.tabs.remove(authTabId);
             } catch (e) {
                 console.log("[Flow2API] Error closing auth refresh tab:", e);
             }

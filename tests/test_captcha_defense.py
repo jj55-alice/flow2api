@@ -483,7 +483,13 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_current_flow_access_token_can_be_read_for_mapped_profile(self):
         service = ExtensionCaptchaService(db=_RouteDbStub())
-        websocket = _ImmediateExtensionSocket(service)
+        websocket = _ImmediateExtensionSocket(service, credential_result={
+            "status": "success",
+            "session_token": "labs-session-token",
+            "access_token": "opaque-flow-token_" + ("captured" * 8),
+            "access_token_captured_at": 123456789,
+            "project_id": "observed-project-123",
+        })
         service.active_connections.append(
             ExtensionConnection(
                 websocket=websocket,
@@ -500,6 +506,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(credentials["access_token"].startswith("opaque-flow-token_"))
         self.assertEqual(credentials["session_token"], "labs-session-token")
         self.assertEqual(credentials["extension_version"], "1.3.0")
+        self.assertEqual(credentials["project_id"], "observed-project-123")
 
     async def test_current_sid_probe_400_counts_as_authenticated(self):
         service = ExtensionCaptchaService(db=_RouteDbStub())

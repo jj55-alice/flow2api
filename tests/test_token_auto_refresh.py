@@ -11,6 +11,7 @@ from src.services.token_manager import TokenManager
 class _RefreshDbStub:
     def __init__(self, tokens):
         self.tokens = tokens
+        self.projects = []
         self.updates = []
         self.consecutive_error_counts = {token.id: 0 for token in tokens}
         self.reset_error_calls = []
@@ -39,6 +40,20 @@ class _RefreshDbStub:
         if token:
             for key, value in updates.items():
                 setattr(token, key, value)
+
+    async def get_project_by_id(self, project_id):
+        return next(
+            (project for project in self.projects if project.project_id == project_id),
+            None,
+        )
+
+    async def add_project(self, project):
+        project.id = len(self.projects) + 1
+        self.projects.append(project)
+        return project.id
+
+    async def get_projects_by_token(self, token_id):
+        return [project for project in self.projects if project.token_id == token_id]
 
     async def increment_token_stats(self, token_id, stat_type):
         if stat_type == "error":
@@ -288,6 +303,39 @@ class ExtensionAtAutoRefreshTests(unittest.IsolatedAsyncioTestCase):
             project_id="project-1",
             timeout=35,
         )
+
+    async def test_browser_session_sync_adopts_open_project_when_mapping_is_missing(self):
+        token = self._token(1, datetime.now(timezone.utc) - timedelta(hours=2))
+        token.current_project_id = None
+        token.current_project_name = None
+        token.extension_route_key = "google-1"
+        token.browser_session_sync_pending = True
+        token.is_active = False
+        db = _RefreshDbStub([token])
+        manager = TokenManager(db, flow_client=SimpleNamespace())
+        extension_service = SimpleNamespace(
+            get_browser_credentials=AsyncMock(return_value={
+                "extension_version": "1.3.25",
+                "browser_auth_valid": True,
+                "browser_auth_status": 200,
+                "observed_api_key": True,
+                "project_id": "observed-project-123",
+            }),
+        )
+
+        with patch(
+            "src.services.browser_captcha_extension.ExtensionCaptchaService.get_instance",
+            new=AsyncMock(return_value=extension_service),
+        ):
+            synchronized = await manager.sync_extension_browser_session(1)
+
+        self.assertTrue(synchronized)
+        self.assertEqual(token.current_project_id, "observed-project-123")
+        self.assertEqual(token.current_project_name, "Flow browser project P1")
+        self.assertEqual(len(db.projects), 1)
+        self.assertEqual(db.projects[0].token_id, token.id)
+        self.assertTrue(token.is_active)
+        self.assertFalse(token.browser_session_sync_pending)
 
     async def test_browser_session_sync_does_not_reactivate_429_ban(self):
         token = self._token(1, datetime.now(timezone.utc) + timedelta(hours=2))

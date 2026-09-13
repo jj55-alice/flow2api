@@ -1197,8 +1197,20 @@ async def refresh_at(
     debug_logger.log_info(f"[API] 手动刷新 AT 请求: token_id={token_id}, captcha_method={config.captcha_method}")
     
     try:
-        # 调用token_manager的内部刷新方法（包含 ST 自动刷新逻辑）
-        success = await token_manager._refresh_at(token_id)
+        # A pending extension profile needs the full browser-session sync so a
+        # successful manual refresh also reactivates the account and clears the
+        # pending flag.
+        current_token = await token_manager.get_token(token_id)
+        if (
+            config.captcha_method == "extension"
+            and current_token is not None
+            and current_token.browser_enabled
+            and current_token.browser_session_sync_pending
+        ):
+            success = await token_manager.sync_extension_browser_session(token_id)
+        else:
+            # 调用token_manager的内部刷新方法（包含 ST 自动刷新逻辑）
+            success = await token_manager._refresh_at(token_id)
 
         if success:
             # 获取更新后的token信息
