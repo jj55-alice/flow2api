@@ -17,16 +17,22 @@ test('a slow image validator cannot block progress heartbeats or start duplicate
     if (request.args.length === 2) {writes.push(request.args[1]); return [];}
     return [{result:{phase:'generating',updated_at:Date.now()+events.length,imageCandidates:[{identity:'body',url:'https://flow.google.com/asb/body'}]}}];
   }}};
-  const create = new Function('chrome','imageValidator','sendFlowSubmitProgress', `
+  const create = new Function('chrome','imageValidator','sendFlowSubmitProgress','sendActiveFlowSubmitHeartbeat','activeFlowSubmitBridges', `
     let newTabId=1, progressPollRunning=false, imageValidationRunning=false, imageValidationClosed=false, lastProgressUpdatedAt=0;
     const data={req_id:'request-1'}, socket={};
     ${body}
     return {pollProgress, close:()=>{imageValidationClosed=true;}, running:()=>imageValidationRunning};
   `);
-  const runner = create(chrome,imageValidator,(_data,_socket,phase)=>events.push(phase));
+  const runner = create(
+    chrome,
+    imageValidator,
+    (_data,_socket,phase)=>events.push(phase),
+    ()=>events.push('extension_active'),
+    new Map([[1, {lastPhase:'generating'}]]),
+  );
   await Promise.race([runner.pollProgress(), new Promise((_,reject)=>setTimeout(()=>reject(new Error('Heartbeat waited for image validation')),100))]);
   await runner.pollProgress();
-  assert.equal(events.length,2);
+  assert.deepEqual(events, ['extension_active','generating','extension_active','generating']);
   assert.equal(checks,1);
   assert(runner.running());
   runner.close();

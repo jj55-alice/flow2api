@@ -95,10 +95,9 @@ class ExtensionReconnectContractTests(unittest.TestCase):
             "credentialRequestQueue = credentialRequestQueue.then(() => handleGetSessionCookie(data, socket))",
             background,
         )
-        self.assertIn(
-            "generationRequestQueue = generationRequestQueue.then(() => handleSubmitFlowRequest(data, socket))",
-            background,
-        )
+        self.assertIn("generationRequestQueue = generationRequestQueue", background)
+        self.assertIn("return handleSubmitFlowRequest(data, socket)", background)
+        self.assertIn("queuedProgressMonitor", background)
 
     def test_current_flow_image_generation_uses_ui_transport(self):
         background = (REPO_ROOT / "extension" / "background.js").read_text()
@@ -132,6 +131,13 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn('source: "flow2api-submit-progress"', background)
         self.assertIn("activeFlowSubmitBridges", background)
         self.assertIn("forwardFlowSubmitProgress(message, sender)", background)
+        self.assertIn('sendFlowSubmitProgress(data, socket, "extension_queued")', background)
+        self.assertIn("sendActiveFlowSubmitHeartbeat(newTabId)", background)
+        self.assertLess(
+            background.index("sendActiveFlowSubmitHeartbeat(newTabId)"),
+            background.index("if (progressPollRunning) return", background.index("sendActiveFlowSubmitHeartbeat(newTabId)")),
+        )
+        self.assertIn("uiExecutionTimeoutMs + FLOW_SUBMIT_HARD_TIMEOUT_PADDING_MS", background)
         self.assertIn('type: "flow_submit_progress_bridge"', bridge)
         self.assertIn("event.source !== window", bridge)
         self.assertIn("event.origin !== location.origin", bridge)

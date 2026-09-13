@@ -534,9 +534,23 @@ async function connectWS() {
             }
 
             if (data.type === "submit_flow_request") {
-                generationRequestQueue = generationRequestQueue.then(() => handleSubmitFlowRequest(data, socket)).catch(err => {
-                    console.error("[Flow2API] Flow submit queue error:", err);
-                });
+                // A request can wait behind another generation in this profile.
+                // Keep the server-side watchdog alive until this request owns the
+                // extension queue; otherwise it is falsely failed as "dispatched".
+                sendFlowSubmitProgress(data, socket, "extension_queued");
+                const queuedProgressMonitor = setInterval(() => {
+                    sendFlowSubmitProgress(data, socket, "extension_queued");
+                }, FLOW_PROGRESS_POLL_INTERVAL_MS);
+                generationRequestQueue = generationRequestQueue
+                    .then(() => {
+                        clearInterval(queuedProgressMonitor);
+                        sendFlowSubmitProgress(data, socket, "extension_starting");
+                        return handleSubmitFlowRequest(data, socket);
+                    })
+                    .catch(err => {
+                        clearInterval(queuedProgressMonitor);
+                        console.error("[Flow2API] Flow submit queue error:", err);
+                    });
             }
         };
 
@@ -866,7 +880,18 @@ function forwardFlowSubmitProgress(message, sender) {
     }
 
     active.lastUpdatedAt = updatedAt;
+    active.lastPhase = phase;
     sendFlowSubmitProgress(active.data, active.socket, phase);
+}
+
+function sendActiveFlowSubmitHeartbeat(tabId) {
+    const active = activeFlowSubmitBridges.get(Number(tabId));
+    if (!active) return;
+    sendFlowSubmitProgress(
+        active.data,
+        active.socket,
+        active.lastPhase || "extension_active"
+    );
 }
 
 function flowUiNeedsUserAction(responseText) {
@@ -921,10 +946,12 @@ async function handleSubmitFlowRequest(data, socket) {
             data,
             socket,
             lastUpdatedAt: 0,
+            lastPhase: "opening_tab",
         });
 
         await waitForTabReady(newTabId);
         await sleep(1200);
+        activeFlowSubmitBridges.get(newTabId).lastPhase = "tab_ready";
         sendFlowSubmitProgress(data, socket, "tab_ready");
 
         const pageAuthContext = await readFlowPageAuthContext(newTabId);
@@ -956,6 +983,7 @@ async function handleSubmitFlowRequest(data, socket) {
             ignoredFlowAuthorizationTabIds.add(newTabId);
         }
         try {
+            activeFlowSubmitBridges.get(newTabId).lastPhase = "script_dispatched";
             const executionPromise = chrome.scripting.executeScript({
                 target: { tabId: newTabId },
                 world: "MAIN",
@@ -1909,7 +1937,13 @@ async function handleSubmitFlowRequest(data, socket) {
             });
             if (usesCurrentFlowUi) {
                 const pollProgress = async () => {
-                    if (!newTabId || progressPollRunning) return;
+                    if (!newTabId) return;
+                    // This heartbeat deliberately runs before the executeScript
+                    // re-entry guard. Chrome can serialize a progress probe behind
+                    // the long-running MAIN-world generation script, but the
+                    // extension worker itself is still alive and owns the request.
+                    sendActiveFlowSubmitHeartbeat(newTabId);
+                    if (progressPollRunning) return;
                     progressPollRunning = true;
                     try {
                         const snapshots = await chrome.scripting.executeScript({
@@ -1931,6 +1965,8 @@ async function handleSubmitFlowRequest(data, socket) {
                         const updatedAt = Number(progress && progress.updated_at || 0);
                         if (updatedAt > lastProgressUpdatedAt) {
                             lastProgressUpdatedAt = updatedAt;
+                            const active = activeFlowSubmitBridges.get(newTabId);
+                            if (active) active.lastPhase = progress.phase;
                             sendFlowSubmitProgress(data, socket, progress.phase);
                         }
                         if (imageValidator && !imageValidationRunning && !imageValidationClosed
@@ -1971,9 +2007,15 @@ async function handleSubmitFlowRequest(data, socket) {
                 progressMonitor = setInterval(pollProgress, FLOW_PROGRESS_POLL_INTERVAL_MS);
                 void pollProgress();
             }
+            const requestedTimeoutMs = Math.max(5000, Number(data.timeout_ms || 60000));
+            const uiExecutionTimeoutMs = usesCurrentFlowUi
+                ? String(data.action || "").toUpperCase() === "VIDEO_GENERATION"
+                    ? Math.min(360000, Math.max(240000, requestedTimeoutMs))
+                    : Math.min(240000, Math.max(180000, requestedTimeoutMs))
+                : requestedTimeoutMs;
             const hardTimeoutMs = Math.max(
                 45000,
-                Number(data.timeout_ms || 60000) + FLOW_SUBMIT_HARD_TIMEOUT_PADDING_MS
+                uiExecutionTimeoutMs + FLOW_SUBMIT_HARD_TIMEOUT_PADDING_MS
             );
             const hardTimeoutPromise = new Promise((_, reject) => {
                 hardTimeoutHandle = setTimeout(

@@ -40,8 +40,8 @@ class FlowUiDiagnosticsTests(unittest.TestCase):
             ExtensionCaptchaService._require_image_ui_version("1.3.20")
         self.assertEqual(caught.exception.code, "extension_reload_required")
         with self.assertRaises(ExtensionCaptchaError):
-            ExtensionCaptchaService._require_image_ui_version("1.3.22")
-        ExtensionCaptchaService._require_image_ui_version("1.3.23")
+            ExtensionCaptchaService._require_image_ui_version("1.3.23")
+        ExtensionCaptchaService._require_image_ui_version("1.3.24")
 
     def test_missing_project_has_a_specific_recovery_code(self):
         from src.services.browser_captcha_extension import ExtensionCaptchaService
