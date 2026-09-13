@@ -1889,6 +1889,7 @@ class GenerationHandler:
             attempted_token_ids: set[int] = set()
             recovered_project_token_ids: set[int] = set()
             failover_count = 0
+            slow_failure_count = 0
             max_route_attempts = max(
                 1,
                 int(config.extension_image_transport_generation_retries or 1),
@@ -1991,6 +1992,13 @@ class GenerationHandler:
                             token_id=token.id,
                         )
                         continue
+                    slow_failure_codes = {
+                        "extension_flow_stalled",
+                        "extension_flow_timeout",
+                        "flow_image_agent_reported_failure",
+                    }
+                    if error_code in slow_failure_codes:
+                        slow_failure_count += 1
                     can_fail_over = (
                         config.captcha_method == "extension"
                         and error_code in {
@@ -2002,7 +2010,10 @@ class GenerationHandler:
                             "extension_user_action_required",
                             "flow_image_agent_reported_failure",
                         }
-                        and failover_count < max_route_attempts - 1
+                        and (
+                            error_code not in slow_failure_codes
+                            or slow_failure_count < max_route_attempts
+                        )
                     )
                     if not can_fail_over:
                         raise
@@ -2023,7 +2034,7 @@ class GenerationHandler:
                         pending_token_state["active"] = False
 
                     replacement_error = generation_error
-                    while failover_count < max_route_attempts - 1:
+                    while True:
                         next_token = await self.load_balancer.select_token(
                             for_image_generation=True,
                             model=api_model,
@@ -2080,9 +2091,6 @@ class GenerationHandler:
                                     for_image_generation=True,
                                 )
                                 pending_token_state["active"] = False
-                    else:
-                        raise replacement_error
-
                     if stream:
                         yield self._create_stream_chunk(
                             "⚠️ 브라우저 응답이 멈춰 다른 계정으로 전환합니다...\n"

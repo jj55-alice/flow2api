@@ -152,7 +152,7 @@ class ExtensionReconnectContractTests(unittest.TestCase):
 
         self.assertGreaterEqual(
             tuple(int(part) for part in manifest["version"].split(".")),
-            (1, 3, 26),
+            (1, 3, 27),
         )
         self.assertIn('data.type === "cancel_flow_request"', background)
         self.assertIn("cancelFlowSubmitRequest(data)", background)
@@ -165,6 +165,13 @@ class ExtensionReconnectContractTests(unittest.TestCase):
 
         self.assertIn("동의(?:함)?", background)
         self.assertIn('reportProgress("approval_confirmed")', background)
+
+    def test_completed_generation_does_not_treat_enabled_start_button_as_active(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        self.assertIn('button.getAttribute("aria-disabled") === "true"', background)
+        self.assertIn('(disabled && /initiating image generation|이미지 생성 시작/.test(label))', background)
+        self.assertIn('generationActive ? "generation_active" : "waiting_for_result"', background)
 
     def test_user_action_tab_is_revealed_and_preserved(self):
         background = (REPO_ROOT / "extension" / "background.js").read_text()

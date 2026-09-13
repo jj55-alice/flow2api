@@ -1359,8 +1359,10 @@ async function handleSubmitFlowRequest(data, socket) {
                             ].filter(Boolean).join(" ")).toLowerCase();
                             const icons = Array.from(button.querySelectorAll("mat-icon, i"))
                                 .map(icon => normalizedText(icon.textContent).toLowerCase());
+                            const disabled = button.disabled || button.getAttribute("aria-disabled") === "true";
                             return icons.includes("stop")
-                                || /initiating image generation|generating (?:an )?image|이미지 생성 (?:시작|중)|이미지를 생성 중/.test(label);
+                                || /generating (?:an )?image|이미지 생성 중|이미지를 생성 중/.test(label)
+                                || (disabled && /initiating image generation|이미지 생성 시작/.test(label));
                         });
 
                     const nextImageFailurePollCount = (hasNewFailure, generationActive, previousCount) => (
@@ -1783,7 +1785,6 @@ async function handleSubmitFlowRequest(data, socket) {
                     window.__FLOW2API_IMAGE_VERDICT__ = null;
                     while (Date.now() < deadline) {
                         await pause(700);
-                        reportProgress("generating");
                         if (!confirmationClicked) {
                             const confirmation = findGenerationApproval();
                             if (confirmation) {
@@ -1792,11 +1793,13 @@ async function handleSubmitFlowRequest(data, socket) {
                                 reportProgress("approval_confirmed");
                             }
                         }
+                        const generationActive = imageGenerationIsActive();
+                        reportProgress(generationActive ? "generation_active" : "waiting_for_result");
 
                         const assets = currentMediaAssets();
                         const fresh = Array.from(assets.values())
                             .filter(asset => !baselineIds.has(asset.identity));
-                        if (fresh.length && (isVideo || !imageGenerationIsActive())) {
+                        if (fresh.length && (isVideo || !generationActive)) {
                             const ids = fresh.map(asset => asset.identity).sort().join(",");
                             stablePolls = ids === stableIds ? stablePolls + 1 : 1;
                             stableIds = ids;
@@ -1880,7 +1883,7 @@ async function handleSubmitFlowRequest(data, socket) {
                         } else {
                             imageFailurePolls = nextImageFailurePollCount(
                                 countFailureSignals() > baselineFailureCount,
-                                imageGenerationIsActive(),
+                                generationActive,
                                 imageFailurePolls,
                             );
                             // Flow can briefly add failure-like agent prose while it is

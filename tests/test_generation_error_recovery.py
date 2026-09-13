@@ -354,7 +354,7 @@ class ImageAccountFailoverTests(unittest.IsolatedAsyncioTestCase):
         original_captcha = dict(captcha_config)
         cache_config["enabled"] = False
         captcha_config["captcha_method"] = "extension"
-        captcha_config["extension_transport_generation_retries"] = 3
+        captcha_config["extension_transport_generation_retries"] = 2
         try:
             chunks = [
                 chunk
