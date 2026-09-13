@@ -276,7 +276,7 @@ class ImageAccountFailoverTests(unittest.IsolatedAsyncioTestCase):
         )
         load_balancer.select_token.assert_not_awaited()
 
-    async def test_timed_out_extension_route_switches_to_another_account_once(self):
+    async def test_timed_out_route_skips_replacement_with_broken_project(self):
         first = SimpleNamespace(
             id=1,
             at="at-1",
@@ -291,6 +291,13 @@ class ImageAccountFailoverTests(unittest.IsolatedAsyncioTestCase):
             user_paygate_tier="PAYGATE_TIER_NOT_PAID",
             image_concurrency=-1,
         )
+        third = SimpleNamespace(
+            id=3,
+            at="at-3",
+            email="third@example.com",
+            user_paygate_tier="PAYGATE_TIER_NOT_PAID",
+            image_concurrency=-1,
+        )
         timed_out = ExtensionCaptchaError(
             "Flow browser submit hard timeout",
             code="extension_flow_timeout",
@@ -301,7 +308,7 @@ class ImageAccountFailoverTests(unittest.IsolatedAsyncioTestCase):
                 (
                     {
                         "media": [{
-                            "name": "media-2",
+                            "name": "media-3",
                             "image": {
                                 "generatedImage": {
                                     "fifeUrl": "https://example.com/generated.jpg",
@@ -309,7 +316,7 @@ class ImageAccountFailoverTests(unittest.IsolatedAsyncioTestCase):
                             },
                         }],
                     },
-                    "session-2",
+                    "session-3",
                     {"generation_attempts": [{}]},
                 ),
             ]),
@@ -319,10 +326,13 @@ class ImageAccountFailoverTests(unittest.IsolatedAsyncioTestCase):
         load_balancer = SimpleNamespace(
             record_extension_transport_failure=AsyncMock(),
             release_pending=AsyncMock(),
-            select_token=AsyncMock(return_value=second),
+            select_token=AsyncMock(side_effect=[second, third]),
         )
         token_manager = SimpleNamespace(
-            ensure_project_exists=AsyncMock(return_value="project-2"),
+            ensure_project_exists=AsyncMock(side_effect=[
+                ValueError("Failed to prepare project pool: HTTP Error 401"),
+                "project-3",
+            ]),
         )
         handler = object.__new__(GenerationHandler)
         handler.flow_client = flow_client
@@ -344,7 +354,7 @@ class ImageAccountFailoverTests(unittest.IsolatedAsyncioTestCase):
         original_captcha = dict(captcha_config)
         cache_config["enabled"] = False
         captcha_config["captcha_method"] = "extension"
-        captcha_config["extension_transport_generation_retries"] = 2
+        captcha_config["extension_transport_generation_retries"] = 3
         try:
             chunks = [
                 chunk
@@ -372,25 +382,36 @@ class ImageAccountFailoverTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(generation_result["success"])
         self.assertTrue(chunks)
-        self.assertIs(pending_state["token"], second)
+        self.assertIs(pending_state["token"], third)
         self.assertEqual(flow_client.generate_image.await_count, 2)
         self.assertEqual(
             [call.kwargs["token_id"] for call in flow_client.generate_image.await_args_list],
+            [1, 3],
+        )
+        self.assertEqual(
+            [call.args[0] for call in token_manager.ensure_project_exists.await_args_list],
+            [2, 3],
+        )
+        self.assertEqual(
+            [call.args[0] for call in load_balancer.record_extension_transport_failure.await_args_list],
             [1, 2],
         )
-        load_balancer.record_extension_transport_failure.assert_awaited_once_with(1)
-        load_balancer.release_pending.assert_awaited_once_with(
-            1,
-            for_image_generation=True,
+        self.assertEqual(
+            [call.args[0] for call in load_balancer.release_pending.await_args_list],
+            [1, 2],
         )
-        self.assertEqual(load_balancer.select_token.await_args.kwargs["exclude_token_ids"], {1})
-        self.assertTrue(
-            load_balancer.select_token.await_args.kwargs["enforce_concurrency_filter"]
+        self.assertEqual(
+            [call.kwargs["exclude_token_ids"] for call in load_balancer.select_token.await_args_list],
+            [{1}, {1, 2}],
         )
+        self.assertTrue(all(
+            call.kwargs["enforce_concurrency_filter"]
+            for call in load_balancer.select_token.await_args_list
+        ))
         flow_client.prefill_remote_browser_pool.assert_awaited_once_with(
-            project_id="project-2",
+            project_id="project-3",
             action="IMAGE_GENERATION",
-            token_id=2,
+            token_id=3,
         )
 
 

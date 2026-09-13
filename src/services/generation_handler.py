@@ -2022,42 +2022,67 @@ class GenerationHandler:
                         )
                         pending_token_state["active"] = False
 
-                    next_token = await self.load_balancer.select_token(
-                        for_image_generation=True,
-                        model=api_model,
-                        reserve=False,
-                        enforce_concurrency_filter=True,
-                        track_pending=True,
-                        exclude_token_ids=set(attempted_token_ids),
-                    )
-                    if next_token is None:
-                        raise
+                    replacement_error = generation_error
+                    while failover_count < max_route_attempts - 1:
+                        next_token = await self.load_balancer.select_token(
+                            for_image_generation=True,
+                            model=api_model,
+                            reserve=False,
+                            enforce_concurrency_filter=True,
+                            track_pending=True,
+                            exclude_token_ids=set(attempted_token_ids),
+                        )
+                        if next_token is None:
+                            raise replacement_error
 
-                    failover_count += 1
-                    token = next_token
-                    token_attempt_started_at = time.time()
-                    if pending_token_state is not None:
-                        pending_token_state.update({
-                            "active": True,
-                            "token": token,
-                            "attempt_started_at": token_attempt_started_at,
-                        })
-                    project_id = await self.token_manager.ensure_project_exists(token.id)
-                    normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
-                    if hasattr(self.flow_client, "clear_request_fingerprint"):
-                        self.flow_client.clear_request_fingerprint()
-                    await self._update_request_log_progress(
-                        request_log_state,
-                        token_id=token.id,
-                        status_text="switching_image_account",
-                        progress=32,
-                        response_extra={"failover_count": failover_count},
-                    )
-                    await self.flow_client.prefill_remote_browser_pool(
-                        project_id=project_id,
-                        action="IMAGE_GENERATION",
-                        token_id=token.id,
-                    )
+                        failover_count += 1
+                        token = next_token
+                        attempted_token_ids.add(token.id)
+                        token_attempt_started_at = time.time()
+                        if pending_token_state is not None:
+                            pending_token_state.update({
+                                "active": True,
+                                "token": token,
+                                "attempt_started_at": token_attempt_started_at,
+                            })
+                        try:
+                            project_id = await self.token_manager.ensure_project_exists(token.id)
+                            normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
+                            if hasattr(self.flow_client, "clear_request_fingerprint"):
+                                self.flow_client.clear_request_fingerprint()
+                            await self._update_request_log_progress(
+                                request_log_state,
+                                token_id=token.id,
+                                status_text="switching_image_account",
+                                progress=32,
+                                response_extra={"failover_count": failover_count},
+                            )
+                            await self.flow_client.prefill_remote_browser_pool(
+                                project_id=project_id,
+                                action="IMAGE_GENERATION",
+                                token_id=token.id,
+                            )
+                            break
+                        except Exception as project_error:
+                            replacement_error = project_error
+                            await self.load_balancer.record_extension_transport_failure(token.id)
+                            if image_trace is not None:
+                                image_trace.setdefault("failovers", []).append({
+                                    "from_token_id": token.id,
+                                    "reason": "project_preparation_failed",
+                                    "failed_after_ms": int(
+                                        (time.time() - token_attempt_started_at) * 1000
+                                    ),
+                                })
+                            if pending_token_state and pending_token_state.get("active"):
+                                await self.load_balancer.release_pending(
+                                    token.id,
+                                    for_image_generation=True,
+                                )
+                                pending_token_state["active"] = False
+                    else:
+                        raise replacement_error
+
                     if stream:
                         yield self._create_stream_chunk(
                             "⚠️ 브라우저 응답이 멈춰 다른 계정으로 전환합니다...\n"
