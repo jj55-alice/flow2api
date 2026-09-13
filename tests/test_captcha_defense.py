@@ -404,7 +404,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.3.22",
+                extension_version="1.3.23",
             )
         )
         generation_lock = service._route_locks.setdefault("google-1", asyncio.Lock())
@@ -435,7 +435,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.3.22",
+                extension_version="1.3.23",
             )
         )
 
@@ -461,7 +461,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.3.22",
+                extension_version="1.3.23",
             )
         )
 
@@ -553,7 +553,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.3.22",
+                extension_version="1.3.23",
             )
         )
 
@@ -584,7 +584,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(
                 websocket=websocket,
                 route_key="google-1",
-                extension_version="1.3.22",
+                extension_version="1.3.23",
             )
         )
 
@@ -631,7 +631,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             ExtensionConnection(websocket=websocket, route_key="google-1")
         )
 
-        with self.assertRaisesRegex(ExtensionCaptchaError, "1.3.22"):
+        with self.assertRaisesRegex(ExtensionCaptchaError, "1.3.23"):
             await service.submit_flow_request(
                 project_id="project-a",
                 action="IMAGE_GENERATION",
@@ -645,7 +645,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
                 timeout=15,
             )
 
-    async def test_current_flow_image_submit_requires_version_1_3_22(self):
+    async def test_current_flow_image_submit_requires_version_1_3_23(self):
         service = ExtensionCaptchaService(db=_RouteDbStub())
         websocket = _ImmediateExtensionSocket(service)
         service.active_connections.append(
@@ -656,7 +656,7 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        with self.assertRaisesRegex(ExtensionCaptchaError, "1.3.22") as raised:
+        with self.assertRaisesRegex(ExtensionCaptchaError, "1.3.23") as raised:
             await service.submit_flow_request(
                 project_id="project-a",
                 action="IMAGE_GENERATION",

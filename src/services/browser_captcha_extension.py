@@ -803,9 +803,9 @@ class ExtensionCaptchaService:
             version = tuple(int(part) for part in str(extension_version or "").split(".")[:3])
         except ValueError:
             version = ()
-        if (version + (0, 0, 0))[:3] < (1, 3, 22):
+        if (version + (0, 0, 0))[:3] < (1, 3, 23):
             raise ExtensionCaptchaError(
-                "Flow image generation needs Chrome extension 1.3.22+ to reject reference images as results. Reload the updated Flow2API extension.",
+                "Flow image generation needs Chrome extension 1.3.23+ for reliable progress reporting and result validation. Reload the updated Flow2API extension.",
                 code="extension_reload_required",
             )
 

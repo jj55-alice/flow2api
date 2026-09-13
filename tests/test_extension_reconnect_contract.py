@@ -123,11 +123,18 @@ class ExtensionReconnectContractTests(unittest.TestCase):
 
     def test_current_flow_submit_reports_liveness_to_the_server(self):
         background = (REPO_ROOT / "extension" / "background.js").read_text()
+        bridge = (REPO_ROOT / "extension" / "auth_bridge.js").read_text()
 
         self.assertIn('type: "flow_submit_progress"', background)
         self.assertIn("__FLOW2API_BROWSER_SUBMIT_PROGRESS__", background)
         self.assertIn("FLOW_PROGRESS_POLL_INTERVAL_MS", background)
         self.assertIn("FLOW_SUBMIT_HARD_TIMEOUT_PADDING_MS", background)
+        self.assertIn('source: "flow2api-submit-progress"', background)
+        self.assertIn("activeFlowSubmitBridges", background)
+        self.assertIn("forwardFlowSubmitProgress(message, sender)", background)
+        self.assertIn('type: "flow_submit_progress_bridge"', bridge)
+        self.assertIn("event.source !== window", bridge)
+        self.assertIn("event.origin !== location.origin", bridge)
 
     def test_user_action_tab_is_revealed_and_preserved(self):
         background = (REPO_ROOT / "extension" / "background.js").read_text()

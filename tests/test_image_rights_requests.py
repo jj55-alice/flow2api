@@ -31,6 +31,29 @@ class ConsentTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('rightsConfirmed', client._staged_ui_uploads['no'])
         self.assertNotIn('rightsConfirmed', client._staged_ui_uploads['later'])
 
+    def test_server_wide_consent_requires_explicit_manifest_opt_in(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as folder:
+            client = FlowClient(None)
+            client._image_rights_path = Path(folder) / 'consents.json'
+            client._image_rights_path.write_text(json.dumps({
+                'version': 1,
+                'allowAll': True,
+                'images': [],
+            }))
+            client._stage_ui_upload('new', 'new.png', 'image/png', ENCODED)
+            self.assertTrue(client._staged_ui_uploads['new']['rightsConfirmed'])
+            self.assertFalse(client._has_image_rights_consent('not-base64'))
+
+            client._image_rights_path.write_text(json.dumps({
+                'version': 1,
+                'allowAll': False,
+                'images': [],
+            }))
+            self.assertFalse(client._has_image_rights_consent(ENCODED))
+
     async def test_parallel_requests_do_not_share_consent(self):
         async def check(allowed):
             with image_rights_scope([DIGEST] if allowed else []):

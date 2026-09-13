@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Flow2API Captcha Worker",
-  "version": "1.3.22",
+  "version": "1.3.23",
   "description": "Solve reCAPTCHA and submit Flow requests in the mapped Chrome profile for Flow2API.",
   "permissions": [
     "storage",

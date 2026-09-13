@@ -5,6 +5,7 @@ let reconnectTimeout = null;
 let heartbeatInterval = null;
 let routeEnabled = true;
 const ignoredFlowAuthorizationTabIds = new Set();
+const activeFlowSubmitBridges = new Map();
 
 const RECONNECT_ALARM_NAME = "flow2api-reconnect";
 const RECONNECT_ALARM_PERIOD_MINUTES = 0.5;
@@ -847,6 +848,27 @@ function sendFlowSubmitProgress(data, socket, phase) {
     }, socket);
 }
 
+function forwardFlowSubmitProgress(message, sender) {
+    const tabId = Number(sender && sender.tab && sender.tab.id);
+    const active = activeFlowSubmitBridges.get(tabId);
+    if (!active) return;
+
+    const requestId = String(message && message.request_id || "").trim();
+    const phase = String(message && message.phase || "").trim();
+    const updatedAt = Number(message && message.updated_at || 0);
+    if (
+        requestId !== active.requestId ||
+        !/^[^\x00-\x1F\x7F]{1,64}$/.test(phase) ||
+        !Number.isFinite(updatedAt) ||
+        updatedAt <= active.lastUpdatedAt
+    ) {
+        return;
+    }
+
+    active.lastUpdatedAt = updatedAt;
+    sendFlowSubmitProgress(active.data, active.socket, phase);
+}
+
 function flowUiNeedsUserAction(responseText) {
     try {
         const payload = JSON.parse(String(responseText || ""));
@@ -894,6 +916,12 @@ async function handleSubmitFlowRequest(data, socket) {
         sendFlowSubmitProgress(data, socket, "opening_tab");
         const newTab = await chrome.tabs.create({ url: flowPageUrl, active: String(data.action || "").toUpperCase() === "VIDEO_GENERATION" });
         newTabId = newTab.id;
+        activeFlowSubmitBridges.set(newTabId, {
+            requestId: String(data.req_id || ""),
+            data,
+            socket,
+            lastUpdatedAt: 0,
+        });
 
         await waitForTabReady(newTabId);
         await sleep(1200);
@@ -943,12 +971,30 @@ async function handleSubmitFlowRequest(data, socket) {
                 requestId
             ) => {
                 const websiteKey = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV";
+                let lastProgressSignalAt = 0;
+                let lastProgressSignalPhase = "";
                 const reportProgress = phase => {
+                    const normalizedPhase = String(phase || "active").slice(0, 64);
+                    const updatedAt = Date.now();
                     window.__FLOW2API_BROWSER_SUBMIT_PROGRESS__ = {
                         request_id: requestId,
-                        phase: String(phase || "active").slice(0, 64),
-                        updated_at: Date.now(),
+                        phase: normalizedPhase,
+                        updated_at: updatedAt,
                     };
+                    if (
+                        normalizedPhase !== lastProgressSignalPhase ||
+                        updatedAt - lastProgressSignalAt >= 2000
+                    ) {
+                        lastProgressSignalAt = updatedAt;
+                        lastProgressSignalPhase = normalizedPhase;
+                        window.postMessage({
+                            source: "flow2api-submit-progress",
+                            type: "flow_submit_progress",
+                            request_id: requestId,
+                            phase: normalizedPhase,
+                            updated_at: updatedAt,
+                        }, location.origin);
+                    }
                 };
                 reportProgress("script_started");
                 const browserFingerprint = () => {
@@ -1991,6 +2037,7 @@ async function handleSubmitFlowRequest(data, socket) {
             console.error("[Flow2API] Could not return Flow submit error:", socketError);
         }
     } finally {
+        if (newTabId) activeFlowSubmitBridges.delete(newTabId);
         if (newTabId && !preserveTabForUserAction) {
             try {
                 await chrome.tabs.remove(newTabId);
@@ -2168,6 +2215,8 @@ chrome.runtime.onMessage.addListener((message, sender) => {
         ).catch((error) => {
             console.log("[Flow2API] Could not retain Flow request authorization:", error);
         });
+    } else if (message.type === "flow_submit_progress_bridge") {
+        forwardFlowSubmitProgress(message, sender);
     }
 });
 

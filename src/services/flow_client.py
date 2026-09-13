@@ -135,7 +135,7 @@ class FlowClient:
             self._uploaded_media_file_names.pop(next(iter(self._uploaded_media_file_names)))
 
     def _has_image_rights_consent(self, image_base64: str) -> bool:
-        """Consent applies only to image bytes explicitly approved by the user."""
+        """Resolve request-scoped, exact-image, or server-wide user consent."""
         if has_request_image_consent(image_base64):
             return True
         try:
@@ -146,7 +146,15 @@ class FlowClient:
             manifest = json.loads(raw)
             if manifest.get("version") != 1:
                 return False
-            digest = hashlib.sha256(base64.b64decode(image_base64, validate=True)).hexdigest()
+            image_bytes = base64.b64decode(image_base64, validate=True)
+            if not image_bytes:
+                return False
+            # This opt-in is stored outside the code and must only be enabled
+            # after the server owner explicitly confirms rights for every
+            # reference image submitted through this installation.
+            if manifest.get("allowAll") is True:
+                return True
+            digest = hashlib.sha256(image_bytes).hexdigest()
             return any(isinstance(item, dict) and item.get("allowed") is True and item.get("sha256") == digest
                        for item in manifest.get("images", []))
         except (OSError, ValueError, TypeError, AttributeError):

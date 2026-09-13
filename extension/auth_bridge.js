@@ -1,15 +1,42 @@
 (() => {
     const MESSAGE_SOURCE = "flow2api-auth-capture";
+    const PROGRESS_MESSAGE_SOURCE = "flow2api-submit-progress";
 
     window.addEventListener("message", (event) => {
         if (
             event.source !== window ||
             event.origin !== location.origin ||
-            !event.data ||
-            event.data.source !== MESSAGE_SOURCE
+            !event.data
         ) {
             return;
         }
+
+        if (event.data.source === PROGRESS_MESSAGE_SOURCE) {
+            const requestId = String(event.data.request_id || "").trim();
+            const phase = String(event.data.phase || "").trim();
+            const updatedAt = Number(event.data.updated_at || 0);
+            if (
+                event.data.type !== "flow_submit_progress" ||
+                !requestId ||
+                requestId.length > 256 ||
+                !/^[^\x00-\x1F\x7F]{1,64}$/.test(phase) ||
+                !Number.isFinite(updatedAt) ||
+                updatedAt <= 0
+            ) {
+                return;
+            }
+            chrome.runtime.sendMessage({
+                type: "flow_submit_progress_bridge",
+                request_id: requestId,
+                phase,
+                updated_at: updatedAt,
+            }, () => {
+                void chrome.runtime.lastError;
+            });
+            return;
+        }
+
+        if (event.data.source !== MESSAGE_SOURCE) return;
 
         if (event.data.type === "flow_request_authorization") {
             const authorization = String(event.data.authorization || "").trim();
