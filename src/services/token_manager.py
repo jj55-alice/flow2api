@@ -150,8 +150,7 @@ class TokenManager:
         """Persist a project already open in the mapped Flow browser profile."""
         normalized_project_id = str(project_id or "").strip()
         if (
-            token.current_project_id
-            or not 8 <= len(normalized_project_id) <= 128
+            not 8 <= len(normalized_project_id) <= 128
             or any(
                 not (character.isalnum() or character in "_-")
                 for character in normalized_project_id
@@ -166,6 +165,20 @@ class TokenManager:
                     f"[BROWSER_SYNC] Token {token_id}: observed Flow project is mapped to another token"
                 )
                 return
+
+            current_project_id = str(token.current_project_id or "").strip()
+            if current_project_id:
+                current_project = await self.db.get_project_by_id(current_project_id)
+                if (
+                    current_project is not None
+                    and current_project.token_id == token_id
+                    and current_project.is_active
+                ):
+                    return
+
+            if project is not None and not project.is_active:
+                await self.db.delete_project(normalized_project_id)
+                project = None
 
             project_name = (
                 str(getattr(project, "project_name", "") or "").strip()
@@ -1500,12 +1513,30 @@ class TokenManager:
                     try:
                         new_project = await self._create_project_for_token(token, len(projects) + 1)
                     except Exception as create_error:
-                        if config.captcha_method == "extension" and projects:
-                            debug_logger.log_warning(
-                                f"[PROJECT] Token {token_id}: could not top up the project pool; "
-                                f"using {len(projects)} browser-observed project(s) - {create_error}"
-                            )
-                            break
+                        if config.captcha_method == "extension":
+                            if not projects:
+                                # A stale legacy session may be unable to create
+                                # projects even while the mapped Flow tab remains
+                                # authenticated. Force one browser sync so its
+                                # open project can be adopted for this request.
+                                await self.db.update_token(
+                                    token_id,
+                                    browser_session_sync_pending=True,
+                                )
+                                if await self.sync_extension_browser_session(token_id):
+                                    token = await self.db.get_token(token_id) or token
+                                    projects = [
+                                        project
+                                        for project in await self.db.get_projects_by_token(token_id)
+                                        if project.is_active
+                                    ]
+                                    projects = self._sort_projects(projects)
+                            if projects:
+                                debug_logger.log_warning(
+                                    f"[PROJECT] Token {token_id}: could not top up the project pool; "
+                                    f"using {len(projects)} browser-observed project(s) - {create_error}"
+                                )
+                                break
                         raise
                     projects.append(new_project)
                     projects = self._sort_projects(projects)

@@ -70,6 +70,40 @@ class TokenProjectRecoveryTests(unittest.IsolatedAsyncioTestCase):
             current_project_name="Flow browser project P1",
         )
 
+    async def test_extension_recovers_empty_pool_from_current_browser_project(self):
+        token = SimpleNamespace(id=9, current_project_id="stale-project")
+        project = SimpleNamespace(
+            id=1,
+            project_id="observed-project",
+            project_name="Flow browser project P1",
+            is_active=True,
+        )
+        db = SimpleNamespace(
+            get_token=AsyncMock(return_value=token),
+            get_projects_by_token=AsyncMock(side_effect=[[], [project]]),
+            update_token=AsyncMock(),
+        )
+        manager = object.__new__(TokenManager)
+        manager.db = db
+        manager._project_locks = {}
+        manager._project_lock_guard = asyncio.Lock()
+        manager._create_project_for_token = AsyncMock(
+            side_effect=RuntimeError("legacy session expired")
+        )
+        manager.sync_extension_browser_session = AsyncMock(return_value=True)
+
+        with patch("src.services.token_manager.config") as runtime_config:
+            runtime_config.captcha_method = "extension"
+            runtime_config.personal_project_pool_size = 4
+            project_id = await manager.ensure_project_exists(9)
+
+        self.assertEqual(project_id, "observed-project")
+        manager.sync_extension_browser_session.assert_awaited_once_with(9)
+        self.assertEqual(
+            db.update_token.await_args_list[0].kwargs,
+            {"browser_session_sync_pending": True},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

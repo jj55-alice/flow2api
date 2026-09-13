@@ -337,6 +337,34 @@ class ExtensionAtAutoRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(token.is_active)
         self.assertFalse(token.browser_session_sync_pending)
 
+    async def test_browser_session_sync_replaces_stale_project_pointer(self):
+        token = self._token(1, datetime.now(timezone.utc) - timedelta(hours=2))
+        token.current_project_id = "stale-project"
+        token.current_project_name = "Stale project"
+        token.extension_route_key = "google-1"
+        token.browser_session_sync_pending = True
+        db = _RefreshDbStub([token])
+        manager = TokenManager(db, flow_client=SimpleNamespace())
+        extension_service = SimpleNamespace(
+            get_browser_credentials=AsyncMock(return_value={
+                "extension_version": "1.3.25",
+                "browser_auth_valid": True,
+                "browser_auth_status": 200,
+                "observed_api_key": True,
+                "project_id": "observed-project-123",
+            }),
+        )
+
+        with patch(
+            "src.services.browser_captcha_extension.ExtensionCaptchaService.get_instance",
+            new=AsyncMock(return_value=extension_service),
+        ):
+            synchronized = await manager.sync_extension_browser_session(1)
+
+        self.assertTrue(synchronized)
+        self.assertEqual(token.current_project_id, "observed-project-123")
+        self.assertEqual(len(db.projects), 1)
+
     async def test_browser_session_sync_does_not_reactivate_429_ban(self):
         token = self._token(1, datetime.now(timezone.utc) + timedelta(hours=2))
         token.current_project_id = "project-1"
