@@ -773,6 +773,13 @@ class ExtensionCaptchaService:
                 error.upstream_message = str(error_info.get("upstream_message") or "")[:500]
                 raise error
             message = str((payload.get("error") or {}).get("message") or "")
+            if "Flow agent reported that it could not generate the image" in message:
+                error = ExtensionCaptchaError(
+                    "Flow agent could not generate the image on this browser route",
+                    code="flow_image_agent_reported_failure",
+                )
+                error.http_status = 502
+                raise error
             diagnostics = json.loads(message.rsplit("; UI: ", 1)[1])
             buttons = set(diagnostics.get("buttons") or [])
             dialogs = " ".join(diagnostics.get("dialogs") or [])

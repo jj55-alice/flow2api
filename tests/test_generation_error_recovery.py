@@ -81,6 +81,29 @@ class FlowUiDiagnosticsTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "extension_user_action_required")
         self.assertIn("google-h", service._video_ui_blocked_routes)
 
+    def test_generic_image_agent_failure_is_retryable_on_another_route(self):
+        from src.services.browser_captcha_extension import ExtensionCaptchaService
+
+        service = ExtensionCaptchaService(None)
+        response = json.dumps({
+            "error": {
+                "message": (
+                    "Flow agent reported that it could not generate the image; UI: "
+                    + json.dumps({
+                        "dialogs": [],
+                        "buttons": ["thumb_up", "thumb_down"],
+                        "projectUnavailable": False,
+                    })
+                ),
+            },
+        })
+
+        with self.assertRaises(ExtensionCaptchaError) as caught:
+            service._check_flow_ui_result("google-h", response)
+
+        self.assertEqual(caught.exception.code, "flow_image_agent_reported_failure")
+        self.assertEqual(caught.exception.http_status, 502)
+
 
 class ImageAccountFailoverTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_flow_project_resets_pool_and_retries_same_account(self):

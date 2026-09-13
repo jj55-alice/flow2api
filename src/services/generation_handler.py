@@ -1928,6 +1928,7 @@ class GenerationHandler:
                             "extension_flow_timeout",
                             "extension_flow_transport_failed",
                             "extension_user_action_required",
+                            "flow_image_agent_reported_failure",
                         }
                         and failover_count < max_route_attempts - 1
                     )
