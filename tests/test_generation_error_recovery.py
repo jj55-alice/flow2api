@@ -106,6 +106,85 @@ class FlowUiDiagnosticsTests(unittest.TestCase):
 
 
 class ImageAccountFailoverTests(unittest.IsolatedAsyncioTestCase):
+    async def test_project_preparation_failure_switches_image_account(self):
+        first = SimpleNamespace(
+            id=1,
+            at="at-1",
+            email="first@example.com",
+            user_paygate_tier="PAYGATE_TIER_NOT_PAID",
+            image_concurrency=-1,
+        )
+        second = SimpleNamespace(
+            id=2,
+            at="at-2",
+            email="second@example.com",
+            user_paygate_tier="PAYGATE_TIER_NOT_PAID",
+            image_concurrency=-1,
+        )
+        load_balancer = SimpleNamespace(
+            select_token=AsyncMock(side_effect=[first, second]),
+            record_extension_transport_failure=AsyncMock(),
+            release_pending=AsyncMock(),
+            record_captcha_success=AsyncMock(),
+            record_extension_transport_success=AsyncMock(),
+        )
+        token_manager = SimpleNamespace(
+            ensure_valid_token=AsyncMock(side_effect=[first, second]),
+            ensure_project_exists=AsyncMock(side_effect=[
+                ValueError("Failed to prepare project pool: HTTP Error 401"),
+                "project-2",
+            ]),
+            record_usage=AsyncMock(),
+            record_success=AsyncMock(),
+        )
+        flow_client = SimpleNamespace(
+            clear_request_fingerprint=MagicMock(),
+            prefill_remote_browser_pool=AsyncMock(),
+        )
+        handler = object.__new__(GenerationHandler)
+        handler.flow_client = flow_client
+        handler.load_balancer = load_balancer
+        handler.token_manager = token_manager
+        handler._update_request_log_progress = AsyncMock()
+        handler._log_request = AsyncMock(return_value=None)
+
+        async def complete_image(*args, **kwargs):
+            kwargs["generation_result"]["success"] = True
+            yield {"ok": True}
+
+        handler._handle_image_generation = complete_image
+
+        captcha_config = config._config.setdefault("captcha", {})
+        original_captcha = dict(captcha_config)
+        captcha_config["captcha_method"] = "extension"
+        captcha_config["extension_transport_generation_retries"] = 3
+        try:
+            chunks = [
+                chunk
+                async for chunk in handler.handle_generation(
+                    "gemini-3.1-flash-image-three-four",
+                    "test prompt",
+                )
+            ]
+        finally:
+            captcha_config.clear()
+            captcha_config.update(original_captcha)
+
+        self.assertTrue(chunks)
+        self.assertEqual(
+            [call.args[0] for call in token_manager.ensure_project_exists.await_args_list],
+            [1, 2],
+        )
+        load_balancer.record_extension_transport_failure.assert_awaited_once_with(1)
+        load_balancer.release_pending.assert_any_await(
+            1,
+            for_image_generation=True,
+        )
+        self.assertEqual(
+            load_balancer.select_token.await_args_list[1].kwargs["exclude_token_ids"],
+            {1},
+        )
+
     async def test_missing_flow_project_resets_pool_and_retries_same_account(self):
         token = SimpleNamespace(
             id=9,
@@ -305,6 +384,9 @@ class ImageAccountFailoverTests(unittest.IsolatedAsyncioTestCase):
             for_image_generation=True,
         )
         self.assertEqual(load_balancer.select_token.await_args.kwargs["exclude_token_ids"], {1})
+        self.assertTrue(
+            load_balancer.select_token.await_args.kwargs["enforce_concurrency_filter"]
+        )
         flow_client.prefill_remote_browser_pool.assert_awaited_once_with(
             project_id="project-2",
             action="IMAGE_GENERATION",

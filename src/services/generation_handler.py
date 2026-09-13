@@ -1460,9 +1460,80 @@ class GenerationHandler:
                 yield self._create_error_response(error_msg, status_code=403)
                 return
 
-            ensure_project_started_at = time.time()
-            project_id = await self.token_manager.ensure_project_exists(token.id)
-            perf_trace["ensure_project_ms"] = int((time.time() - ensure_project_started_at) * 1000)
+            project_attempted_token_ids = {token.id}
+            project_failover_count = 0
+            max_project_attempts = max(
+                1,
+                int(config.extension_transport_generation_retries or 1),
+            )
+            while True:
+                ensure_project_started_at = time.time()
+                try:
+                    project_id = await self.token_manager.ensure_project_exists(token.id)
+                    perf_trace["ensure_project_ms"] = (
+                        int(perf_trace.get("ensure_project_ms") or 0)
+                        + int((time.time() - ensure_project_started_at) * 1000)
+                    )
+                    break
+                except Exception as project_error:
+                    perf_trace["ensure_project_ms"] = (
+                        int(perf_trace.get("ensure_project_ms") or 0)
+                        + int((time.time() - ensure_project_started_at) * 1000)
+                    )
+                    can_fail_over_project = (
+                        generation_type == "image"
+                        and config.captcha_method == "extension"
+                        and "failed to prepare project pool" in str(project_error).lower()
+                        and project_failover_count < max_project_attempts - 1
+                    )
+                    if not can_fail_over_project:
+                        raise
+
+                    await self.load_balancer.record_extension_transport_failure(token.id)
+                    perf_trace.setdefault("project_failovers", []).append({
+                        "from_token_id": token.id,
+                        "reason": str(project_error)[:240],
+                    })
+                    if pending_token_state.get("active"):
+                        await self.load_balancer.release_pending(
+                            token.id,
+                            for_image_generation=True,
+                        )
+                        pending_token_state["active"] = False
+
+                    next_token = await self.load_balancer.select_token(
+                        for_image_generation=True,
+                        model=model,
+                        reserve=False,
+                        enforce_concurrency_filter=False,
+                        track_pending=True,
+                        exclude_token_ids=set(project_attempted_token_ids),
+                    )
+                    if next_token is None:
+                        raise
+
+                    project_failover_count += 1
+                    token = next_token
+                    project_attempted_token_ids.add(token.id)
+                    token_attempt_started_at = time.time()
+                    pending_token_state.update({
+                        "active": True,
+                        "token": token,
+                        "attempt_started_at": token_attempt_started_at,
+                    })
+                    await self._update_request_log_progress(
+                        request_log_state,
+                        token_id=token.id,
+                        status_text="switching_project_account",
+                        progress=18,
+                        response_extra={"project_failover_count": project_failover_count},
+                    )
+                    refreshed_token = await self.token_manager.ensure_valid_token(token)
+                    if refreshed_token is None:
+                        raise RuntimeError("Replacement token AT is invalid or could not be refreshed")
+                    token = refreshed_token
+                    pending_token_state["token"] = token
+
             debug_logger.log_info(f"[GENERATION] Project ID: {project_id}")
             await self._update_request_log_progress(
                 request_log_state,
@@ -1923,6 +1994,7 @@ class GenerationHandler:
                     can_fail_over = (
                         config.captcha_method == "extension"
                         and error_code in {
+                            "extension_route_busy",
                             "extension_disconnected",
                             "extension_flow_stalled",
                             "extension_flow_timeout",
@@ -1954,7 +2026,7 @@ class GenerationHandler:
                         for_image_generation=True,
                         model=api_model,
                         reserve=False,
-                        enforce_concurrency_filter=False,
+                        enforce_concurrency_filter=True,
                         track_pending=True,
                         exclude_token_ids=set(attempted_token_ids),
                     )

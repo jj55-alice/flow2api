@@ -1334,6 +1334,7 @@ class FlowClient:
                     http_attempt_info["error"] = str(e)[:240]
                     attempt_trace.setdefault("http_attempts", []).append(http_attempt_info)
                 if getattr(e, "code", "") in {
+                    "extension_route_busy",
                     "extension_disconnected",
                     "extension_flow_stalled",
                     "extension_flow_timeout",

@@ -510,20 +510,20 @@ class Config:
     @property
     def extension_route_queue_timeout_seconds(self) -> float:
         """扩展路由繁忙时允许单个请求排队的最长时间。"""
-        value = self._config.get("captcha", {}).get("extension_route_queue_timeout_seconds", 30.0)
+        value = self._config.get("captcha", {}).get("extension_route_queue_timeout_seconds", 5.0)
         try:
             return max(0.01, min(300.0, float(value)))
         except Exception:
-            return 30.0
+            return 5.0
 
     @property
     def extension_transport_generation_retries(self) -> int:
         """扩展浏览器传输异常时单次生成允许的总尝试次数。"""
-        value = self._config.get("captcha", {}).get("extension_transport_generation_retries", 3)
+        value = self._config.get("captcha", {}).get("extension_transport_generation_retries", 4)
         try:
-            return max(1, min(3, int(value)))
+            return max(1, min(6, int(value)))
         except Exception:
-            return 3
+            return 4
 
     @property
     def extension_progress_stall_timeout_seconds(self) -> float:
