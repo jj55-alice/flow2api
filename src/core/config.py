@@ -563,12 +563,12 @@ class Config:
         """生成按钮停止后等待新图片出现在 Flow 页面上的最长时间。"""
         value = self._config.get("captcha", {}).get(
             "extension_image_result_timeout_seconds",
-            30.0,
+            75.0,
         )
         try:
             return max(5.0, min(120.0, float(value)))
         except Exception:
-            return 30.0
+            return 75.0
 
     @property
     def extension_image_total_timeout_seconds(self) -> float:
