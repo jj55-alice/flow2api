@@ -146,6 +146,26 @@ class ExtensionReconnectContractTests(unittest.TestCase):
         self.assertIn("event.source !== window", bridge)
         self.assertIn("event.origin !== location.origin", bridge)
 
+    def test_timed_out_flow_submit_can_be_cancelled(self):
+        manifest = json.loads((REPO_ROOT / "extension" / "manifest.json").read_text())
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        self.assertGreaterEqual(
+            tuple(int(part) for part in manifest["version"].split(".")),
+            (1, 3, 26),
+        )
+        self.assertIn('data.type === "cancel_flow_request"', background)
+        self.assertIn("cancelFlowSubmitRequest(data)", background)
+        self.assertIn("cancelledFlowSubmitRequestIds", background)
+        self.assertIn("queuedFlowSubmitMonitors", background)
+        self.assertIn("await chrome.tabs.remove(tabIds)", background)
+
+    def test_current_flow_consent_accepts_korean_agree_label(self):
+        background = (REPO_ROOT / "extension" / "background.js").read_text()
+
+        self.assertIn("동의(?:함)?", background)
+        self.assertIn('reportProgress("approval_confirmed")', background)
+
     def test_user_action_tab_is_revealed_and_preserved(self):
         background = (REPO_ROOT / "extension" / "background.js").read_text()
 

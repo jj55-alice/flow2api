@@ -6,6 +6,8 @@ let heartbeatInterval = null;
 let routeEnabled = true;
 const ignoredFlowAuthorizationTabIds = new Set();
 const activeFlowSubmitBridges = new Map();
+const cancelledFlowSubmitRequestIds = new Set();
+const queuedFlowSubmitMonitors = new Map();
 
 const RECONNECT_ALARM_NAME = "flow2api-reconnect";
 const RECONNECT_ALARM_PERIOD_MINUTES = 0.5;
@@ -573,16 +575,26 @@ async function connectWS() {
                 const queuedProgressMonitor = setInterval(() => {
                     sendFlowSubmitProgress(data, socket, "extension_queued");
                 }, FLOW_PROGRESS_POLL_INTERVAL_MS);
+                queuedFlowSubmitMonitors.set(String(data.req_id || ""), queuedProgressMonitor);
                 generationRequestQueue = generationRequestQueue
                     .then(() => {
                         clearInterval(queuedProgressMonitor);
+                        queuedFlowSubmitMonitors.delete(String(data.req_id || ""));
+                        if (cancelledFlowSubmitRequestIds.delete(String(data.req_id || ""))) {
+                            return undefined;
+                        }
                         sendFlowSubmitProgress(data, socket, "extension_starting");
                         return handleSubmitFlowRequest(data, socket);
                     })
                     .catch(err => {
                         clearInterval(queuedProgressMonitor);
+                        queuedFlowSubmitMonitors.delete(String(data.req_id || ""));
                         console.error("[Flow2API] Flow submit queue error:", err);
                     });
+            }
+
+            if (data.type === "cancel_flow_request") {
+                await cancelFlowSubmitRequest(data);
             }
         };
 
@@ -939,6 +951,29 @@ function sendActiveFlowSubmitHeartbeat(tabId) {
         active.socket,
         active.lastPhase || "extension_active"
     );
+}
+
+async function cancelFlowSubmitRequest(data) {
+    const requestId = String(data && data.req_id || "").trim();
+    if (!requestId) return;
+
+    cancelledFlowSubmitRequestIds.add(requestId);
+    const queuedMonitor = queuedFlowSubmitMonitors.get(requestId);
+    if (queuedMonitor) clearInterval(queuedMonitor);
+    queuedFlowSubmitMonitors.delete(requestId);
+
+    const tabIds = [];
+    for (const [tabId, active] of activeFlowSubmitBridges.entries()) {
+        if (active.requestId === requestId) tabIds.push(Number(tabId));
+    }
+    if (!tabIds.length) return;
+
+    try {
+        await chrome.tabs.remove(tabIds);
+        console.log("[Flow2API] Cancelled timed-out Flow submit tab.");
+    } catch (error) {
+        console.log("[Flow2API] Could not close cancelled Flow submit tab:", error);
+    }
 }
 
 function flowUiNeedsUserAction(responseText) {
@@ -1541,7 +1576,7 @@ async function handleSubmitFlowRequest(data, socket) {
                                     throw new Error("Flow image rights confirmation is required for this reference image");
                                 }
                                 const agree = Array.from(uploadGate.dialog.querySelectorAll("button"))
-                                    .find(button => isVisible(button) && /^(동의|agree|i agree)$/i.test(normalizedText(button.textContent)));
+                                    .find(button => isVisible(button) && /^(동의(?:함)?|agree|i agree)$/i.test(normalizedText(button.textContent)));
                                 if (!agree) throw new Error("Flow image rights confirmation button is unavailable");
                                 clickElement(agree);
                                 await waitFor(() => capturedInput, 6000, "Flow approved upload file input");
@@ -1593,7 +1628,7 @@ async function handleSubmitFlowRequest(data, socket) {
                                 if (rightsDialog) {
                                     if (upload.rightsConfirmed !== true) throw new Error("Flow image rights confirmation is required for this reference image");
                                     const agree = Array.from(rightsDialog.querySelectorAll("button"))
-                                        .find(button => isVisible(button) && /^(동의|agree|i agree)$/i.test(normalizedText(button.textContent)));
+                                        .find(button => isVisible(button) && /^(동의(?:함)?|agree|i agree)$/i.test(normalizedText(button.textContent)));
                                     if (agree && !agree.disabled) clickElement(agree);
                                     return null;
                                 }
@@ -1630,6 +1665,10 @@ async function handleSubmitFlowRequest(data, socket) {
                     };
 
                     const findGenerationApproval = () => {
+                        const canConfirmImageRights = Boolean(
+                            inputUploads.length
+                            && inputUploads.every(upload => upload.rightsConfirmed === true)
+                        );
                         const candidates = document.querySelectorAll('button, [role="radio"], input[type="radio"]');
                         for (const candidate of candidates) {
                             if (candidate.disabled || candidate.getAttribute("aria-disabled") === "true"
@@ -1642,7 +1681,8 @@ async function handleSubmitFlowRequest(data, socket) {
                             const text = normalizedText(candidate.getAttribute("aria-label") || label.textContent).toLowerCase();
                             // Video permission is one generation only. Never select always-approve.
                             if (isVideo ? /^(approve|승인)$/.test(text)
-                                : /^(approve|confirm|create|generate|yes,? create|yes,? generate|승인|확인|생성|만들기)$/.test(text)) return target;
+                                : /^(approve|confirm|create|generate|yes,? create|yes,? generate|승인|확인|생성|만들기)$/.test(text)
+                                    || (canConfirmImageRights && /^(i agree|agree|allow|동의(?:함)?|허용)$/.test(text))) return target;
                         }
                         return null;
                     };
@@ -1749,6 +1789,7 @@ async function handleSubmitFlowRequest(data, socket) {
                             if (confirmation) {
                                 clickElement(confirmation);
                                 confirmationClicked = true;
+                                reportProgress("approval_confirmed");
                             }
                         }
 
@@ -2126,6 +2167,7 @@ async function handleSubmitFlowRequest(data, socket) {
             console.error("[Flow2API] Could not return Flow submit error:", socketError);
         }
     } finally {
+        cancelledFlowSubmitRequestIds.delete(String(data.req_id || ""));
         if (newTabId) activeFlowSubmitBridges.delete(newTabId);
         if (newTabId && !preserveTabForUserAction) {
             try {

@@ -1891,7 +1891,7 @@ class GenerationHandler:
             failover_count = 0
             max_route_attempts = max(
                 1,
-                int(config.extension_transport_generation_retries or 1),
+                int(config.extension_image_transport_generation_retries or 1),
             )
             while True:
                 attempted_token_ids.add(token.id)

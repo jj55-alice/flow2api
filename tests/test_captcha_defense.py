@@ -134,9 +134,13 @@ class _ProgressExtensionSocket(_ImmediateExtensionSocket):
     def __init__(self, service, *, send_progress=True):
         super().__init__(service)
         self.send_progress = send_progress
+        self.cancelled_flow_requests = []
 
     async def send_text(self, data):
         payload = json.loads(data)
+        if payload.get("type") == "cancel_flow_request":
+            self.cancelled_flow_requests.append(payload["req_id"])
+            return
         if payload.get("type") != "submit_flow_request":
             await super().send_text(data)
             return
@@ -480,6 +484,34 @@ class ExtensionRouteThrottleTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(raised.exception.code, "extension_flow_stalled")
+
+    async def test_stalled_flow_submit_cancels_supported_extension_work(self):
+        service = ExtensionCaptchaService(db=_RouteDbStub())
+        websocket = _ProgressExtensionSocket(service, send_progress=False)
+        service.active_connections.append(
+            ExtensionConnection(
+                websocket=websocket,
+                route_key="google-1",
+                extension_version="1.3.26",
+            )
+        )
+
+        with self.assertRaises(ExtensionCaptchaError) as raised:
+            await service.submit_flow_request(
+                project_id="project-a",
+                action="IMAGE_GENERATION",
+                token_id=1,
+                url=(
+                    "https://aisandbox-pa.googleapis.com/v1/projects/project-a/"
+                    "flowMedia:batchGenerateImages"
+                ),
+                at_token="access-token",
+                json_data={},
+                timeout=15,
+            )
+
+        self.assertEqual(raised.exception.code, "extension_flow_stalled")
+        self.assertEqual(len(websocket.cancelled_flow_requests), 1)
 
     async def test_current_flow_access_token_can_be_read_for_mapped_profile(self):
         service = ExtensionCaptchaService(db=_RouteDbStub())

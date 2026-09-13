@@ -526,6 +526,18 @@ class Config:
             return 4
 
     @property
+    def extension_image_transport_generation_retries(self) -> int:
+        """图片 UI 传输的总账号尝试次数；默认限制为两个以适配客户端超时。"""
+        captcha = self._config.get("captcha", {})
+        value = captcha.get("extension_image_transport_generation_retries")
+        if value is None:
+            value = captcha.get("extension_transport_generation_retries", 2)
+        try:
+            return max(1, min(6, int(value)))
+        except Exception:
+            return 2
+
+    @property
     def extension_progress_stall_timeout_seconds(self) -> float:
         """扩展未报告页面进度多久后判定当前 Flow 标签页卡死。"""
         value = self._config.get("captcha", {}).get("extension_progress_stall_timeout_seconds", 30.0)
@@ -539,12 +551,12 @@ class Config:
         """图片请求停留在同一 Flow 页面阶段多久后切换浏览器账号。"""
         value = self._config.get("captcha", {}).get(
             "extension_image_phase_timeout_seconds",
-            60.0,
+            95.0,
         )
         try:
             return max(30.0, min(240.0, float(value)))
         except Exception:
-            return 60.0
+            return 95.0
 
     @property
     def extension_stall_cooldown_seconds(self) -> int:

@@ -324,6 +324,33 @@ class ExtensionCaptchaService:
             return False
         return (version_parts + (0, 0, 0))[:3] >= (1, 3, 13)
 
+    @staticmethod
+    def _supports_flow_cancel(extension_version: str) -> bool:
+        try:
+            version_parts = tuple(
+                int(part) for part in str(extension_version or "").split(".")[:3]
+            )
+        except (TypeError, ValueError):
+            return False
+        return (version_parts + (0, 0, 0))[:3] >= (1, 3, 26)
+
+    async def _cancel_flow_submit(
+        self,
+        conn: ExtensionConnection,
+        req_id: str,
+    ) -> None:
+        if not self._supports_flow_cancel(conn.extension_version):
+            return
+        try:
+            await conn.websocket.send_text(json.dumps({
+                "type": "cancel_flow_request",
+                "req_id": req_id,
+            }))
+        except Exception as exc:
+            debug_logger.log_warning(
+                f"[Extension Captcha] Could not cancel Flow submit {req_id}: {exc}"
+            )
+
     @classmethod
     def _browser_auth_was_accepted(
         cls,
@@ -964,6 +991,7 @@ class ExtensionCaptchaService:
             req_id = f"req_{uuid.uuid4().hex}"
             future = asyncio.get_running_loop().create_future()
             self.pending_requests[req_id] = (future, conn.websocket)
+            result_received = False
             try:
                 async with self._global_dispatch_lock:
                     global_interval = config.extension_global_min_interval_seconds
@@ -1004,6 +1032,7 @@ class ExtensionCaptchaService:
                         else 0
                     ),
                 )
+                result_received = True
 
                 if result.get("status") != "success":
                     error_message = str(result.get("error") or "Chrome extension Flow submit failed")
@@ -1048,6 +1077,8 @@ class ExtensionCaptchaService:
                     code="extension_flow_timeout",
                 ) from exc
             finally:
+                if not result_received:
+                    await self._cancel_flow_submit(conn, req_id)
                 self.pending_requests.pop(req_id, None)
                 self._pending_flow_activity.pop(req_id, None)
                 if not future.done():
