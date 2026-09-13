@@ -43,7 +43,9 @@ class ExtensionCaptchaService:
         self.active_connections: list[ExtensionConnection] = []
         self.pending_requests: dict[str, tuple[asyncio.Future, WebSocket]] = {}
         self._video_ui_blocked_routes: dict[str, str] = {}
-        self._pending_flow_activity: dict[str, tuple[float, str]] = {}
+        # Last heartbeat, current phase, and when that phase started. Repeated
+        # heartbeats prove the worker is alive, but not that Flow is advancing.
+        self._pending_flow_activity: dict[str, tuple[float, str, float]] = {}
         # A Chrome profile represents one Google account. Serialize requests
         # per route and space them out so a burst cannot open many hidden Flow
         # tabs for the same account at once.
@@ -469,7 +471,12 @@ class ExtensionCaptchaService:
                     )
                     return
                 phase = str(payload.get("phase") or "active").strip()[:64] or "active"
-                self._pending_flow_activity[req_id] = (time.monotonic(), phase)
+                now = time.monotonic()
+                previous = self._pending_flow_activity.get(req_id)
+                phase_started_at = now
+                if previous and previous[1] == phase:
+                    phase_started_at = previous[2] if len(previous) > 2 else previous[0]
+                self._pending_flow_activity[req_id] = (now, phase, phase_started_at)
                 return
 
             if req_id and req_id in self.pending_requests:
@@ -714,6 +721,7 @@ class ExtensionCaptchaService:
         timeout: int,
         supports_progress: bool,
         preparation_timeout: float = 0,
+        max_phase_duration: float = 0,
     ) -> Dict[str, Any]:
         """Wait for a browser result while distinguishing slow work from a dead tab."""
         hard_timeout = max(60.0, float(timeout) + 45.0)
@@ -725,21 +733,37 @@ class ExtensionCaptchaService:
         stall_timeout = config.extension_progress_stall_timeout_seconds
         # Preserve an early heartbeat that may arrive while send_text() is
         # still yielding control back to the event loop.
-        self._pending_flow_activity.setdefault(req_id, (started_at, "dispatched"))
+        self._pending_flow_activity.setdefault(
+            req_id,
+            (started_at, "dispatched", started_at),
+        )
 
         while True:
             now = time.monotonic()
-            last_activity_at, last_phase = self._pending_flow_activity.get(
+            activity = self._pending_flow_activity.get(
                 req_id,
-                (started_at, "dispatched"),
+                (started_at, "dispatched", started_at),
             )
+            last_activity_at, last_phase = activity[:2]
+            phase_started_at = activity[2] if len(activity) > 2 else last_activity_at
             hard_remaining = hard_deadline - now
-            phase_timeout = max(stall_timeout, preparation_timeout) if last_phase == "ui_preparing" else stall_timeout
-            stall_remaining = phase_timeout - (now - last_activity_at)
+            heartbeat_timeout = max(stall_timeout, preparation_timeout) if last_phase == "ui_preparing" else stall_timeout
+            stall_remaining = heartbeat_timeout - (now - last_activity_at)
+            phase_remaining = (
+                float(max_phase_duration) - (now - phase_started_at)
+                if max_phase_duration > 0
+                else hard_remaining
+            )
             if hard_remaining <= 0:
                 raise ExtensionCaptchaError(
                     f"Chrome extension Flow submit exceeded the {hard_timeout:.0f}s hard limit",
                     code="extension_flow_timeout",
+                )
+            if phase_remaining <= 0:
+                raise ExtensionCaptchaError(
+                    f"Chrome extension Flow phase '{last_phase}' did not change for "
+                    f"{float(max_phase_duration):.1f}s",
+                    code="extension_flow_stalled",
                 )
             if stall_remaining <= 0:
                 raise ExtensionCaptchaError(
@@ -751,7 +775,7 @@ class ExtensionCaptchaService:
             try:
                 return await asyncio.wait_for(
                     asyncio.shield(future),
-                    timeout=min(hard_remaining, stall_remaining),
+                    timeout=min(hard_remaining, stall_remaining, phase_remaining),
                 )
             except asyncio.TimeoutError:
                 if future.done():
@@ -974,6 +998,11 @@ class ExtensionCaptchaService:
                     timeout=timeout,
                     supports_progress=supports_progress,
                     preparation_timeout=90 if native_video else 0,
+                    max_phase_duration=(
+                        config.extension_image_phase_timeout_seconds
+                        if native_image
+                        else 0
+                    ),
                 )
 
                 if result.get("status") != "success":
