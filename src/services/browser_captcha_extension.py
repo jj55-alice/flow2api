@@ -778,10 +778,7 @@ class ExtensionCaptchaService:
             stall_remaining = heartbeat_timeout - (now - last_activity_at)
             phase_timeout = float(max_phase_duration)
             if last_phase == "waiting_for_result" and phase_timeout > 0:
-                phase_timeout = min(
-                    phase_timeout,
-                    config.extension_image_result_timeout_seconds,
-                )
+                phase_timeout = config.extension_image_result_timeout_seconds
             phase_remaining = (
                 phase_timeout - (now - phase_started_at)
                 if phase_timeout > 0
