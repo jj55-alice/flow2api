@@ -174,7 +174,7 @@ class ImageAccountFailoverTests(unittest.IsolatedAsyncioTestCase):
         )
         load_balancer.select_token.assert_not_awaited()
 
-    async def test_stalled_extension_route_switches_to_another_account_once(self):
+    async def test_timed_out_extension_route_switches_to_another_account_once(self):
         first = SimpleNamespace(
             id=1,
             at="at-1",
@@ -189,13 +189,13 @@ class ImageAccountFailoverTests(unittest.IsolatedAsyncioTestCase):
             user_paygate_tier="PAYGATE_TIER_NOT_PAID",
             image_concurrency=-1,
         )
-        stalled = ExtensionCaptchaError(
-            "Flow browser progress stalled",
-            code="extension_flow_stalled",
+        timed_out = ExtensionCaptchaError(
+            "Flow browser submit hard timeout",
+            code="extension_flow_timeout",
         )
         flow_client = SimpleNamespace(
             generate_image=AsyncMock(side_effect=[
-                stalled,
+                timed_out,
                 (
                     {
                         "media": [{

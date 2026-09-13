@@ -1925,6 +1925,7 @@ class GenerationHandler:
                         and error_code in {
                             "extension_disconnected",
                             "extension_flow_stalled",
+                            "extension_flow_timeout",
                             "extension_flow_transport_failed",
                             "extension_user_action_required",
                         }
